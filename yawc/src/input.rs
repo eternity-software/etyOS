@@ -28,15 +28,23 @@ fn edges_to_cursor(edges: ResizeEdge) -> CursorIcon {
     let left = edges.contains(ResizeEdge::LEFT);
     let right = edges.contains(ResizeEdge::RIGHT);
     match (top, bottom, left, right) {
-        (true, false, true, false) => CursorIcon::NwResize,
-        (true, false, false, true) => CursorIcon::NeResize,
-        (false, true, true, false) => CursorIcon::SwResize,
-        (false, true, false, true) => CursorIcon::SeResize,
-        (true, false, false, false) => CursorIcon::NResize,
-        (false, true, false, false) => CursorIcon::SResize,
-        (false, false, true, false) => CursorIcon::WResize,
-        (false, false, false, true) => CursorIcon::EResize,
+        (true, false, true, false) => CursorIcon::NwseResize,
+        (false, true, false, true) => CursorIcon::NwseResize,
+        (true, false, false, true) => CursorIcon::NeswResize,
+        (false, true, true, false) => CursorIcon::NeswResize,
+        (true, false, false, false) => CursorIcon::RowResize,
+        (false, true, false, false) => CursorIcon::RowResize,
+        (false, false, true, false) => CursorIcon::ColResize,
+        (false, false, false, true) => CursorIcon::ColResize,
         _ => CursorIcon::Default,
+    }
+}
+
+fn cursor_for_decoration_hit(hit: Option<crate::window::DecorationHit>) -> CursorIcon {
+    match hit.map(|hit| hit.action) {
+        Some(DecorationAction::Resize(edges)) => edges_to_cursor(edges),
+        Some(DecorationAction::Move) => CursorIcon::Move,
+        Some(DecorationAction::Close) | None => CursorIcon::Default,
     }
 }
 
@@ -69,7 +77,12 @@ impl Yawc {
                     event.position_transformed(output_geometry.size) + output_geometry.loc.to_f64();
                 let serial = SERIAL_COUNTER.next_serial();
                 let pointer = self.seat.get_pointer().unwrap();
-                let under = self.surface_under(location);
+                let decoration_hit = self.windows.decoration_hit_at(&self.space, location);
+                let under = if decoration_hit.is_some() {
+                    None
+                } else {
+                    self.surface_under(location)
+                };
 
                 pointer.motion(
                     self,
@@ -83,14 +96,7 @@ impl Yawc {
                 pointer.frame(self);
 
                 if !pointer.is_grabbed() {
-                    self.pending_cursor = match self.windows.decoration_hit_at(&self.space, location) {
-                        Some(hit) => match hit.action {
-                            DecorationAction::Resize(edges) => edges_to_cursor(edges),
-                            DecorationAction::Move => CursorIcon::Move,
-                            DecorationAction::Close => CursorIcon::Default,
-                        },
-                        None => CursorIcon::Default,
-                    };
+                    self.pending_cursor = cursor_for_decoration_hit(decoration_hit);
                 }
             }
             InputEvent::PointerButton { event, .. } => {
@@ -140,6 +146,7 @@ impl Yawc {
                                 );
                             }
                             crate::window::DecorationAction::Resize(edges) => {
+                                self.pending_cursor = edges_to_cursor(edges);
                                 let start_data = PointerGrabStartData {
                                     focus: None,
                                     button,
@@ -191,6 +198,13 @@ impl Yawc {
                     },
                 );
                 pointer.frame(self);
+
+                if !pointer.is_grabbed() {
+                    self.pending_cursor = cursor_for_decoration_hit(
+                        self.windows
+                            .decoration_hit_at(&self.space, pointer.current_location()),
+                    );
+                }
             }
             InputEvent::PointerAxis { event, .. } => {
                 let source = event.source();
