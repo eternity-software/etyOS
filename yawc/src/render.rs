@@ -107,10 +107,7 @@ void main() {
         return;
     }
 
-    vec2 sample_coords = vec2(
-        v_coords.x,
-        src_origin.y + src_size.y - (v_coords.y - src_origin.y)
-    );
+    vec2 sample_coords = vec2(v_coords.x, 1.0 - v_coords.y);
     vec4 color = vec4(0.0);
     float total = 0.0;
     const float sigma = 4.0;
