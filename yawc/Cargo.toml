@@ -1,0 +1,12 @@
+[package]
+name = "yawc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitflags = "2.10.0"
+image = { version = "0.25.8", default-features = false, features = ["png", "jpeg"] }
+rusttype = "0.9.3"
+smithay = { version = "0.7.0", default-features = false, features = ["backend_winit", "desktop", "wayland_frontend"] }
+tracing = { version = "0.1.41", features = ["max_level_trace", "release_max_level_debug"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

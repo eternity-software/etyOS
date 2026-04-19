@@ -1,0 +1,290 @@
+use smithay::{
+    desktop::{Space, Window},
+    reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
+    reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
+    utils::{Logical, Point, Rectangle},
+};
+
+use crate::shell::xdg::WindowMetadata;
+
+pub const TITLEBAR_HEIGHT: i32 = 40;
+pub const BORDER_WIDTH: i32 = 10;
+pub const BUTTON_SIZE: i32 = 18;
+pub const BUTTON_PADDING: i32 = 12;
+pub const FRAME_RADIUS: i32 = 18;
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct ResizeEdge: u32 {
+        const TOP = 0b0001;
+        const BOTTOM = 0b0010;
+        const LEFT = 0b0100;
+        const RIGHT = 0b1000;
+        const TOP_LEFT = Self::TOP.bits() | Self::LEFT.bits();
+        const TOP_RIGHT = Self::TOP.bits() | Self::RIGHT.bits();
+        const BOTTOM_LEFT = Self::BOTTOM.bits() | Self::LEFT.bits();
+        const BOTTOM_RIGHT = Self::BOTTOM.bits() | Self::RIGHT.bits();
+    }
+}
+
+impl From<xdg_toplevel::ResizeEdge> for ResizeEdge {
+    fn from(value: xdg_toplevel::ResizeEdge) -> Self {
+        Self::from_bits(value as u32).unwrap()
+    }
+}
+
+#[derive(Clone)]
+pub struct TrackedWindow {
+    pub window: Window,
+    pub active: bool,
+    pub title: String,
+    pub app_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct WindowFrame {
+    pub window: Window,
+    pub frame: Rectangle<i32, Logical>,
+    pub header: Rectangle<i32, Logical>,
+    pub close_button: Rectangle<i32, Logical>,
+    pub active: bool,
+    pub title: String,
+    pub app_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct DecorationHit {
+    pub window: Window,
+    pub action: DecorationAction,
+}
+
+#[derive(Clone, Copy)]
+pub enum DecorationAction {
+    Move,
+    Resize(ResizeEdge),
+    Close,
+}
+
+#[derive(Default)]
+pub struct WindowStore {
+    windows: Vec<TrackedWindow>,
+}
+
+impl WindowStore {
+    pub fn insert(&mut self, window: Window) -> Point<i32, Logical> {
+        let index = self.windows.len() as i32;
+        let frame_location = Point::from((48 + 48 * index, 48 + 48 * index));
+        let location = frame_to_content_location(frame_location);
+
+        self.windows.push(TrackedWindow {
+            window,
+            active: false,
+            title: "Untitled".to_string(),
+            app_id: None,
+        });
+
+        location
+    }
+
+    pub fn len(&self) -> usize {
+        self.windows.len()
+    }
+
+    pub fn activate(&mut self, surface: &WlSurface) {
+        for tracked in &mut self.windows {
+            let is_active = tracked
+                .window
+                .toplevel()
+                .map(|toplevel| toplevel.wl_surface() == surface)
+                .unwrap_or(false);
+
+            tracked.active = is_active;
+            tracked.window.set_activated(is_active);
+        }
+    }
+
+    pub fn clear_focus(&mut self) {
+        for tracked in &mut self.windows {
+            tracked.active = false;
+            tracked.window.set_activated(false);
+        }
+    }
+
+    pub fn prune_dead(&mut self) {
+        self.windows.retain(|tracked| {
+            tracked
+                .window
+                .toplevel()
+                .map(|toplevel| toplevel.wl_surface().is_alive())
+                .unwrap_or(false)
+        });
+    }
+
+    pub fn set_metadata(&mut self, surface: &WlSurface, metadata: WindowMetadata) {
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.title = metadata.title;
+            tracked.app_id = metadata.app_id;
+        }
+    }
+
+    pub fn remove(&mut self, surface: &WlSurface) {
+        self.windows
+            .retain(|tracked| !same_surface(tracked, surface));
+    }
+
+    pub fn frames(&self, space: &Space<Window>) -> Vec<WindowFrame> {
+        let mut frames = Vec::new();
+
+        for window in space.elements() {
+            let Some(surface) = window
+                .toplevel()
+                .map(|toplevel| toplevel.wl_surface().clone())
+            else {
+                continue;
+            };
+            let Some(tracked) = self.find(&surface) else {
+                continue;
+            };
+            let Some(content_geometry) = space.element_geometry(window) else {
+                continue;
+            };
+            frames.push(WindowFrame {
+                window: window.clone(),
+                frame: frame_geometry(content_geometry),
+                header: header_geometry(content_geometry),
+                close_button: close_button_geometry(content_geometry),
+                active: tracked.active,
+                title: tracked.title.clone(),
+                app_id: tracked.app_id.clone(),
+            });
+        }
+
+        frames
+    }
+
+    pub fn decoration_hit_at(
+        &self,
+        space: &Space<Window>,
+        position: Point<f64, Logical>,
+    ) -> Option<DecorationHit> {
+        let mut stack = self.frames(space);
+
+        for frame in stack.drain(..).rev() {
+            if !contains(frame.frame, position) {
+                continue;
+            }
+
+            if let Some(edges) = resize_edge_for(frame.frame, position) {
+                return Some(DecorationHit {
+                    window: frame.window,
+                    action: DecorationAction::Resize(edges),
+                });
+            }
+
+            if contains(frame.close_button, position) {
+                return Some(DecorationHit {
+                    window: frame.window,
+                    action: DecorationAction::Close,
+                });
+            }
+
+            if contains(frame.header, position) {
+                return Some(DecorationHit {
+                    window: frame.window,
+                    action: DecorationAction::Move,
+                });
+            }
+        }
+
+        None
+    }
+
+    fn find_mut(&mut self, surface: &WlSurface) -> Option<&mut TrackedWindow> {
+        self.windows
+            .iter_mut()
+            .find(|tracked| same_surface(tracked, surface))
+    }
+
+    fn find(&self, surface: &WlSurface) -> Option<&TrackedWindow> {
+        self.windows
+            .iter()
+            .find(|tracked| same_surface(tracked, surface))
+    }
+}
+
+fn same_surface(tracked: &TrackedWindow, surface: &WlSurface) -> bool {
+    tracked
+        .window
+        .toplevel()
+        .map(|toplevel| toplevel.wl_surface() == surface)
+        .unwrap_or(false)
+}
+
+fn frame_to_content_location(frame: Point<i32, Logical>) -> Point<i32, Logical> {
+    (frame.x, frame.y + TITLEBAR_HEIGHT).into()
+}
+
+fn frame_geometry(content_geometry: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (
+            content_geometry.loc.x,
+            content_geometry.loc.y - TITLEBAR_HEIGHT,
+        )
+            .into(),
+        (
+            content_geometry.size.w,
+            content_geometry.size.h + TITLEBAR_HEIGHT,
+        )
+            .into(),
+    )
+}
+
+fn header_geometry(content_geometry: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    let frame = frame_geometry(content_geometry);
+    Rectangle::new(frame.loc, (frame.size.w, TITLEBAR_HEIGHT).into())
+}
+
+fn close_button_geometry(content_geometry: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    let header = header_geometry(content_geometry);
+    Rectangle::new(
+        (
+            header.loc.x + header.size.w - BUTTON_PADDING - BUTTON_SIZE,
+            header.loc.y + (TITLEBAR_HEIGHT - BUTTON_SIZE) / 2,
+        )
+            .into(),
+        (BUTTON_SIZE, BUTTON_SIZE).into(),
+    )
+}
+
+fn contains(rect: Rectangle<i32, Logical>, position: Point<f64, Logical>) -> bool {
+    position.x >= rect.loc.x as f64
+        && position.x < (rect.loc.x + rect.size.w) as f64
+        && position.y >= rect.loc.y as f64
+        && position.y < (rect.loc.y + rect.size.h) as f64
+}
+
+fn resize_edge_for(
+    frame: Rectangle<i32, Logical>,
+    position: Point<f64, Logical>,
+) -> Option<ResizeEdge> {
+    let left = position.x <= (frame.loc.x + BORDER_WIDTH) as f64;
+    let right = position.x >= (frame.loc.x + frame.size.w - BORDER_WIDTH) as f64;
+    let top = position.y <= (frame.loc.y + BORDER_WIDTH) as f64;
+    let bottom = position.y >= (frame.loc.y + frame.size.h - BORDER_WIDTH) as f64;
+
+    let mut edges = ResizeEdge::empty();
+    if left {
+        edges |= ResizeEdge::LEFT;
+    }
+    if right {
+        edges |= ResizeEdge::RIGHT;
+    }
+    if top {
+        edges |= ResizeEdge::TOP;
+    }
+    if bottom {
+        edges |= ResizeEdge::BOTTOM;
+    }
+
+    (!edges.is_empty()).then_some(edges)
+}
