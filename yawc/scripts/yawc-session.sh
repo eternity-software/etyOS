@@ -1,0 +1,97 @@
+#!/bin/sh
+set -eu
+
+YAWC_BINARY="${YAWC_BINARY:-/usr/local/bin/yawc}"
+YAWC_REPO_DIR="${YAWC_REPO_DIR:-}"
+
+if [ "${YAWC_SESSION_LOG_ACTIVE:-0}" != "1" ]; then
+  state_home="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}"
+  log_dir="${YAWC_LOG_DIR:-$state_home/yawc}"
+  mkdir -p "$log_dir"
+  log_file="${YAWC_SESSION_LOG:-$log_dir/session.log}"
+  : > "$log_file"
+  export YAWC_SESSION_LOG_ACTIVE=1
+  export YAWC_SESSION_LOG="$log_file"
+  exec >> "$log_file" 2>&1
+fi
+
+echo "YAWC session log: ${YAWC_SESSION_LOG:-}"
+echo "Starting YAWC session at $(date -Is 2>/dev/null || date)"
+
+export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}"
+
+add_library_dir() {
+  if [ -d "$1" ]; then
+    LD_LIBRARY_PATH="$1${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH
+  fi
+}
+
+if [ -n "$YAWC_REPO_DIR" ]; then
+  add_library_dir "$YAWC_REPO_DIR/.local-lib"
+  add_library_dir "$YAWC_REPO_DIR/.sysroot/root/usr/lib/x86_64-linux-gnu"
+fi
+
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] \
+  && [ "${YAWC_DBUS_WRAPPED:-0}" != "1" ] \
+  && command -v dbus-run-session >/dev/null 2>&1
+then
+  export YAWC_DBUS_WRAPPED=1
+  exec dbus-run-session "$0"
+fi
+
+find_startup_command() {
+  if [ -n "${YAWC_STARTUP_COMMAND:-}" ]; then
+    printf '%s\n' "$YAWC_STARTUP_COMMAND"
+    return 0
+  fi
+
+  for candidate in \
+    foot \
+    weston-terminal \
+    kgx \
+    alacritty \
+    wezterm \
+    kitty \
+    konsole \
+    gnome-terminal \
+    xfce4-terminal \
+    qterminal
+  do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+if [ ! -x "$YAWC_BINARY" ]; then
+  echo "error: YAWC binary is not executable: $YAWC_BINARY" >&2
+  exit 1
+fi
+
+startup_command="$(find_startup_command || true)"
+echo "YAWC startup command: ${startup_command:-<none>}"
+
+export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-etyDE:YAWC}"
+export XDG_SESSION_DESKTOP="${XDG_SESSION_DESKTOP:-yawc}"
+export DESKTOP_SESSION="${DESKTOP_SESSION:-yawc}"
+
+export GDK_BACKEND="${GDK_BACKEND:-wayland}"
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-wayland}"
+export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-wayland}"
+export CLUTTER_BACKEND="${CLUTTER_BACKEND:-wayland}"
+export MOZ_ENABLE_WAYLAND="${MOZ_ENABLE_WAYLAND:-1}"
+
+export LIBSEAT_BACKEND="${YAWC_LIBSEAT_BACKEND:-logind}"
+export SMITHAY_USE_LEGACY="${YAWC_DRM_LEGACY:-0}"
+export RUST_LOG="${RUST_LOG:-info,yawc=debug}"
+
+if [ -n "$startup_command" ]; then
+  exec "$YAWC_BINARY" --tty-udev --command "$startup_command"
+fi
+
+exec "$YAWC_BINARY" --tty-udev

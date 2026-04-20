@@ -1,2 +1,6 @@
 target/
 .local-lib/
+.sysroot/
+error.txt
+scripts/error.txt
+logs/

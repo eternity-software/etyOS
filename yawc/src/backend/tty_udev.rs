@@ -1,0 +1,774 @@
+use std::{
+    cell::RefCell,
+    path::PathBuf,
+    rc::Rc,
+    time::{Duration, Instant},
+};
+
+use smithay::{
+    backend::{
+        allocator::{
+            gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
+            Fourcc,
+        },
+        drm::{
+            compositor::FrameFlags,
+            exporter::gbm::GbmFramebufferExporter,
+            output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
+            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, Planes,
+        },
+        egl::context::ContextPriority,
+        input::{InputEvent, KeyState, KeyboardKeyEvent},
+        libinput::{LibinputInputBackend, LibinputSessionInterface},
+        renderer::{
+            element::surface::WaylandSurfaceRenderElement,
+            element::{
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                solid::{SolidColorBuffer, SolidColorRenderElement},
+                Element, Id, Kind, RenderElement, UnderlyingStorage,
+            },
+            gles::GlesRenderer,
+            multigpu::{gbm::GbmGlesBackend, GpuManager, MultiRenderer},
+            utils::{CommitCounter, DamageSet, OpaqueRegions},
+            Color32F, ImportDma, ImportMemWl, RendererSuper,
+        },
+        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
+        udev::{UdevBackend, UdevEvent},
+    },
+    desktop::{space::SpaceRenderElements, Space, Window},
+    reexports::{
+        calloop::{
+            timer::{TimeoutAction, Timer},
+            EventLoop,
+        },
+        drm::control::{connector, crtc, Device as ControlDevice},
+        input::{DeviceCapability, Libinput},
+        rustix::fs::OFlags,
+    },
+    utils::{
+        Buffer, DeviceFd, Logical, Physical, Point, Rectangle, Scale as RendererScale, Size,
+        Transform,
+    },
+};
+use tracing::{error, info, warn};
+
+use crate::{
+    render::{RenderState, YawcRenderElements},
+    window::WindowFrame,
+    CalloopData,
+};
+
+type TtyRenderBackend = GbmGlesBackend<GlesRenderer, DrmDeviceFd>;
+type TtyRenderer<'a> = MultiRenderer<'a, 'a, TtyRenderBackend, TtyRenderBackend>;
+type TtyOutputManager = DrmOutputManager<
+    GbmAllocator<DrmDeviceFd>,
+    GbmFramebufferExporter<DrmDeviceFd>,
+    (),
+    DrmDeviceFd,
+>;
+type TtyOutput =
+    DrmOutput<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
+
+smithay::backend::renderer::element::render_elements! {
+    TtyRenderElements<='a, TtyRenderer<'a>>;
+    Yawc=TtyYawcElement,
+    Space=SpaceRenderElements<TtyRenderer<'a>, WaylandSurfaceRenderElement<TtyRenderer<'a>>>,
+    Memory=MemoryRenderBufferRenderElement<TtyRenderer<'a>>,
+    Solid=SolidColorRenderElement,
+}
+
+struct TtyYawcElement(YawcRenderElements);
+
+impl From<YawcRenderElements> for TtyYawcElement {
+    fn from(element: YawcRenderElements) -> Self {
+        Self(element)
+    }
+}
+
+impl Element for TtyYawcElement {
+    fn id(&self) -> &Id {
+        self.0.id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.0.current_commit()
+    }
+
+    fn location(&self, scale: RendererScale<f64>) -> Point<i32, Physical> {
+        self.0.location(scale)
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.0.src()
+    }
+
+    fn transform(&self) -> Transform {
+        self.0.transform()
+    }
+
+    fn geometry(&self, scale: RendererScale<f64>) -> Rectangle<i32, Physical> {
+        self.0.geometry(scale)
+    }
+
+    fn damage_since(
+        &self,
+        scale: RendererScale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.0.damage_since(scale, commit)
+    }
+
+    fn opaque_regions(&self, scale: RendererScale<f64>) -> OpaqueRegions<i32, Physical> {
+        self.0.opaque_regions(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.0.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.0.kind()
+    }
+}
+
+impl<'a> RenderElement<TtyRenderer<'a>> for TtyYawcElement {
+    fn draw(
+        &self,
+        frame: &mut <TtyRenderer<'a> as RendererSuper>::Frame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), <TtyRenderer<'a> as RendererSuper>::Error> {
+        self.0
+            .draw(frame.as_mut(), src, dst, damage, opaque_regions)
+            .map_err(Into::into)
+    }
+
+    fn underlying_storage(&self, _renderer: &mut TtyRenderer<'a>) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
+struct TtyRuntime {
+    node: DrmNode,
+    drm_output_manager: TtyOutputManager,
+    drm_output: TtyOutput,
+    gpus: GpuManager<TtyRenderBackend>,
+    render_state: RenderState,
+    background: SolidColorBuffer,
+    cursor: MemoryRenderBuffer,
+    refresh_interval: Duration,
+    active: bool,
+    frame_pending: bool,
+    last_frame_queued: Option<Instant>,
+    missed_vblank_warned: bool,
+    reset_buffers_each_frame: bool,
+    ctrl_down: bool,
+    alt_down: bool,
+}
+
+impl TtyRuntime {
+    fn render(&mut self, data: &mut CalloopData) {
+        if !self.active {
+            return;
+        }
+
+        if self.frame_pending {
+            let missed_vblank = self
+                .last_frame_queued
+                .map(|queued_at| queued_at.elapsed() > Duration::from_millis(250))
+                .unwrap_or(true);
+
+            if !missed_vblank {
+                return;
+            }
+
+            if !self.missed_vblank_warned {
+                warn!("forcing tty render after missed drm vblank");
+                self.missed_vblank_warned = true;
+            }
+
+            if let Err(error) = self.drm_output.frame_submitted() {
+                warn!(?error, "failed to recover from missed drm vblank");
+            }
+            self.frame_pending = false;
+            self.last_frame_queued = None;
+        }
+
+        let mut renderer = match self.gpus.single_renderer(&self.node) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                error!(?error, "failed to acquire tty renderer");
+                data.state.loop_signal.stop();
+                return;
+            }
+        };
+
+        let pointer_location = data
+            .state
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location());
+        let frames = data.state.windows.frames(&data.state.space);
+        let elements = render_elements(
+            &mut renderer,
+            &mut self.render_state,
+            &data.state.space,
+            &frames,
+            &self.background,
+            &self.cursor,
+            pointer_location,
+        );
+
+        if self.reset_buffers_each_frame {
+            self.drm_output.reset_buffers();
+        }
+
+        match self.drm_output.render_frame(
+            &mut renderer,
+            &elements,
+            [0.06, 0.09, 0.11, 1.0],
+            // The early standalone backend should be predictable before it is clever:
+            // force a fully composited frame instead of allowing direct scanout planes.
+            FrameFlags::empty(),
+        ) {
+            Ok(result) => {
+                if !result.is_empty {
+                    if let Err(error) = self.drm_output.queue_frame(()) {
+                        warn!(?error, "failed to queue drm frame");
+                    } else {
+                        self.frame_pending = true;
+                        self.last_frame_queued = Some(Instant::now());
+                        self.missed_vblank_warned = false;
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(?error, "tty render_frame failed");
+            }
+        }
+
+        let output = self.render_state.output().clone();
+        data.state.space.elements().for_each(|window| {
+            window.send_frame(
+                &output,
+                data.state.start_time.elapsed(),
+                Some(Duration::ZERO),
+                |_, _| Some(output.clone()),
+            );
+        });
+
+        data.state.space.refresh();
+        data.state.prune_windows();
+        data.state.popups.cleanup();
+        let _ = data.display_handle.flush_clients();
+    }
+
+    fn handle_vblank(&mut self) {
+        self.frame_pending = false;
+        self.last_frame_queued = None;
+        self.missed_vblank_warned = false;
+        if let Err(error) = self.drm_output.frame_submitted() {
+            warn!(?error, "failed to mark drm frame as submitted");
+        }
+    }
+
+    fn handle_keyboard_shortcut(
+        &mut self,
+        key_code: u32,
+        key_state: KeyState,
+        session: &mut LibSeatSession,
+        data: &mut CalloopData,
+    ) -> bool {
+        let pressed = key_state == KeyState::Pressed;
+
+        match key_code {
+            37 | 105 => {
+                self.ctrl_down = pressed;
+                return false;
+            }
+            64 | 108 => {
+                self.alt_down = pressed;
+                return false;
+            }
+            _ => {}
+        }
+
+        if !pressed || !self.ctrl_down || !self.alt_down {
+            return false;
+        }
+
+        if let Some(vt) = function_key_to_vt(key_code) {
+            info!(vt, "switching vt from emergency keyboard shortcut");
+            if let Err(error) = session.change_vt(vt) {
+                warn!(?error, vt, "failed to switch vt");
+            }
+            return true;
+        }
+
+        // Ctrl+Alt+Backspace or Ctrl+Alt+Esc: emergency compositor stop.
+        if matches!(key_code, 22 | 9) {
+            warn!("stopping compositor from emergency keyboard shortcut");
+            data.state.loop_signal.stop();
+            return true;
+        }
+
+        false
+    }
+}
+
+pub fn init(
+    event_loop: &mut EventLoop<CalloopData>,
+    data: &mut CalloopData,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut session, notifier) = LibSeatSession::new()
+        .map_err(|error| format!("failed to initialize libseat session: {error}"))?;
+    let seat_name = session.seat();
+    let initial_active = session.is_active();
+
+    info!(
+        seat = %seat_name,
+        active = initial_active,
+        "initialized libseat session for tty/udev backend"
+    );
+
+    let udev_backend = UdevBackend::new(&seat_name)
+        .map_err(|error| format!("failed to initialize udev backend: {error}"))?;
+    let device_path = select_drm_device(&udev_backend)?;
+    let node = DrmNode::from_path(&device_path)
+        .map_err(|error| format!("failed to resolve drm node from {:?}: {error}", device_path))?;
+    info!(path = ?device_path, ?node, "selected drm device for tty backend");
+
+    let opened_fd = session
+        .open(
+            &device_path,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY,
+        )
+        .map_err(|error| format!("failed to open drm device {:?}: {error:?}", device_path))?;
+    let device_fd = DrmDeviceFd::new(DeviceFd::from(opened_fd));
+    let (drm_device, drm_notifier) = DrmDevice::new(device_fd.clone(), true)
+        .map_err(|error| format!("failed to initialize drm device: {error}"))?;
+
+    let gbm = GbmDevice::new(device_fd.clone())
+        .map_err(|error| format!("failed to create gbm device: {error}"))?;
+    let allocator_flags = GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING;
+    info!(
+        ?allocator_flags,
+        "using gbm allocator flags for tty primary buffers"
+    );
+    let allocator = GbmAllocator::new(gbm.clone(), allocator_flags);
+    let exporter = GbmFramebufferExporter::new(gbm.clone(), None);
+
+    let mut gpus = GpuManager::new(GbmGlesBackend::with_context_priority(ContextPriority::High))
+        .map_err(|error| format!("failed to initialize gpu manager: {error}"))?;
+    gpus.as_mut()
+        .add_node(node, gbm.clone())
+        .map_err(|error| format!("failed to add gbm node to gpu manager: {error}"))?;
+
+    let mut renderer = gpus
+        .single_renderer(&node)
+        .map_err(|error| format!("failed to create renderer for tty backend: {error}"))?;
+    data.state.shm_state.update_formats(renderer.shm_formats());
+
+    let mut drm_output_manager = TtyOutputManager::new(
+        drm_device,
+        allocator,
+        exporter,
+        Some(gbm),
+        [
+            Fourcc::Xrgb8888,
+            Fourcc::Xbgr8888,
+            Fourcc::Argb8888,
+            Fourcc::Abgr8888,
+        ],
+        renderer.dmabuf_formats(),
+    );
+
+    let (connector_info, crtc, mode) = select_connector_and_mode(drm_output_manager.device())?;
+    let output_size = Size::<i32, Physical>::from((mode.size().0 as i32, mode.size().1 as i32));
+    let background = SolidColorBuffer::new(
+        Size::<i32, Logical>::from((output_size.w, output_size.h)),
+        Color32F::from([0.10, 0.13, 0.16, 1.0]),
+    );
+    let cursor = cursor_buffer();
+    let refresh_hz = mode.vrefresh().max(1);
+    let refresh_millihz = (refresh_hz as i32).saturating_mul(1000);
+    info!(
+        width = output_size.w,
+        height = output_size.h,
+        refresh_hz,
+        "selected drm mode for tty output"
+    );
+    let render_state = RenderState::new_standalone(
+        &data.display_handle,
+        &mut data.state.space,
+        output_size,
+        refresh_millihz,
+    );
+    let output = render_state.output().clone();
+    let available_planes = drm_output_manager
+        .device()
+        .planes(&crtc)
+        .map_err(|error| format!("failed to query drm planes: {error}"))?;
+    let safe_planes = Planes {
+        primary: available_planes.primary,
+        cursor: Vec::new(),
+        overlay: Vec::new(),
+    };
+    let render_elements: DrmOutputRenderElements<
+        _,
+        SpaceRenderElements<_, WaylandSurfaceRenderElement<_>>,
+    > = Default::default();
+    let drm_output = drm_output_manager
+        .initialize_output(
+            crtc,
+            mode,
+            &[connector_info.handle()],
+            &output,
+            Some(safe_planes),
+            &mut renderer,
+            &render_elements,
+        )
+        .map_err(|error| format!("failed to initialize drm output: {error}"))?;
+
+    let refresh_interval = Duration::from_nanos(1_000_000_000 / refresh_hz.max(1) as u64);
+    let reset_buffers_each_frame = std::env::var("YAWC_DRM_RESET_BUFFERS_EACH_FRAME")
+        .map(|value| value != "0")
+        .unwrap_or(false);
+    if reset_buffers_each_frame {
+        warn!("resetting drm buffers before each frame as a damage-corruption workaround");
+    }
+
+    let runtime = Rc::new(RefCell::new(TtyRuntime {
+        node,
+        drm_output_manager,
+        drm_output,
+        gpus,
+        render_state,
+        background,
+        cursor,
+        refresh_interval,
+        active: true,
+        frame_pending: false,
+        last_frame_queued: None,
+        missed_vblank_warned: false,
+        reset_buffers_each_frame,
+        ctrl_down: false,
+        alt_down: false,
+    }));
+
+    {
+        let runtime = Rc::clone(&runtime);
+        event_loop.handle().insert_source(
+            drm_notifier,
+            move |event, metadata, data| match event {
+                DrmEvent::VBlank(_) => {
+                    runtime.borrow_mut().handle_vblank();
+                    if metadata.is_none() {
+                        warn!("drm vblank arrived without metadata");
+                    }
+                    data.state.send_pending_configures();
+                }
+                DrmEvent::Error(error) => {
+                    error!(?error, "drm device notifier reported an error");
+                }
+            },
+        )?;
+    }
+
+    {
+        let runtime = Rc::clone(&runtime);
+        event_loop
+            .handle()
+            .insert_source(Timer::immediate(), move |_, _, data| {
+                runtime.borrow_mut().render(data);
+                TimeoutAction::ToDuration(runtime.borrow().refresh_interval)
+            })?;
+    }
+
+    event_loop
+        .handle()
+        .insert_source(udev_backend, |event, _, _data| match event {
+            UdevEvent::Added { device_id, path } => {
+                info!(?device_id, ?path, "detected drm device");
+            }
+            UdevEvent::Changed { device_id } => {
+                info!(?device_id, "drm device changed");
+            }
+            UdevEvent::Removed { device_id } => {
+                warn!(?device_id, "drm device removed");
+            }
+        })?;
+
+    let mut libinput_context =
+        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
+    libinput_context
+        .udev_assign_seat(&seat_name)
+        .map_err(|_| format!("failed to assign libinput seat {seat_name}"))?;
+
+    let session_for_input = Rc::new(RefCell::new(session.clone()));
+    let libinput_backend = LibinputInputBackend::new(libinput_context.clone());
+    let runtime_for_input = Rc::clone(&runtime);
+    event_loop
+        .handle()
+        .insert_source(libinput_backend, move |event, _, data| {
+            match &event {
+                InputEvent::DeviceAdded { device } => {
+                    if device.has_capability(DeviceCapability::Keyboard) {
+                        info!(name = ?device.name(), "keyboard added");
+                    }
+                }
+                InputEvent::DeviceRemoved { device } => {
+                    if device.has_capability(DeviceCapability::Keyboard) {
+                        info!(name = ?device.name(), "keyboard removed");
+                    }
+                }
+                _ => {}
+            }
+
+            if let InputEvent::Keyboard { event, .. } = &event {
+                let key_code = event.key_code().raw();
+                let key_state = event.state();
+                if runtime_for_input.borrow_mut().handle_keyboard_shortcut(
+                    key_code,
+                    key_state,
+                    &mut session_for_input.borrow_mut(),
+                    data,
+                ) {
+                    return;
+                }
+            }
+
+            data.state.process_input_event(event);
+        })?;
+
+    {
+        let runtime = Rc::clone(&runtime);
+        event_loop
+            .handle()
+            .insert_source(notifier, move |event, _, _data| match event {
+                SessionEvent::PauseSession => {
+                    info!("tty session paused");
+                    libinput_context.suspend();
+                    let mut runtime = runtime.borrow_mut();
+                    runtime.active = false;
+                    runtime.drm_output_manager.pause();
+                }
+                SessionEvent::ActivateSession => {
+                    info!("tty session activated");
+                    if let Err(error) = libinput_context.resume() {
+                        error!(?error, "failed to resume libinput context");
+                    }
+                    let mut runtime = runtime.borrow_mut();
+                    if let Err(error) = runtime.drm_output_manager.activate(true) {
+                        error!(?error, "failed to reactivate drm output manager");
+                    }
+                    runtime.active = true;
+                    runtime.frame_pending = false;
+                    runtime.last_frame_queued = None;
+                    runtime.missed_vblank_warned = false;
+                }
+            })?;
+    }
+
+    std::env::set_var("WAYLAND_DISPLAY", &data.state.socket_name);
+    info!(
+        display = %data.state.socket_name.to_string_lossy(),
+        "exported WAYLAND_DISPLAY for tty clients"
+    );
+
+    Ok(())
+}
+
+fn function_key_to_vt(key_code: u32) -> Option<i32> {
+    // Linux KEY_F1..KEY_F12 are 59..88; Smithay/libinput adds the xkb offset of 8.
+    match key_code {
+        67..=76 => Some((key_code - 66) as i32),
+        95 | 96 => Some((key_code - 83) as i32),
+        _ => None,
+    }
+}
+
+fn render_elements<'a>(
+    renderer: &mut TtyRenderer<'a>,
+    render_state: &mut RenderState,
+    space: &Space<Window>,
+    frames: &[WindowFrame],
+    background: &SolidColorBuffer,
+    cursor: &MemoryRenderBuffer,
+    pointer_location: Option<Point<f64, Logical>>,
+) -> Vec<TtyRenderElements<'a>> {
+    let mut elements = Vec::new();
+
+    if let Some(location) = pointer_location {
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            Point::<f64, Physical>::from((location.x, location.y)),
+            cursor,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        ) {
+            Ok(cursor) => elements.push(TtyRenderElements::from(cursor)),
+            Err(error) => warn!(?error, "failed to upload tty cursor"),
+        }
+    }
+
+    match render_state.tty_scene_elements(renderer.as_mut(), space, frames) {
+        Ok(scene) => elements.extend(
+            scene
+                .into_iter()
+                .map(TtyYawcElement::from)
+                .map(TtyRenderElements::from),
+        ),
+        Err(error) => warn!(?error, "failed to build tty scene elements"),
+    }
+
+    let background = SolidColorRenderElement::from_buffer(
+        background,
+        Point::<i32, Physical>::from((0, 0)),
+        RendererScale::from(1.0_f64),
+        1.0,
+        Kind::Unspecified,
+    );
+    elements.push(TtyRenderElements::from(background));
+
+    elements
+}
+
+fn cursor_buffer() -> MemoryRenderBuffer {
+    let width = 32usize;
+    let height = 32usize;
+    let mut pixels = vec![0u8; width * height * 4];
+    let outline = [
+        (3.0, 2.0),
+        (3.0, 25.0),
+        (9.0, 19.0),
+        (13.0, 30.0),
+        (18.0, 28.0),
+        (14.0, 18.0),
+        (24.0, 18.0),
+    ];
+    let fill = [
+        (6.0, 7.0),
+        (6.0, 19.0),
+        (10.0, 15.0),
+        (14.0, 26.0),
+        (15.0, 25.0),
+        (11.0, 14.0),
+        (18.0, 14.0),
+    ];
+
+    for y in 0..height {
+        for x in 0..width {
+            let px = x as f64 + 0.5;
+            let py = y as f64 + 0.5;
+            let color = if point_in_polygon(px, py, &fill) {
+                Some([248, 250, 252, 255])
+            } else if point_in_polygon(px, py, &outline) {
+                Some([12, 15, 20, 255])
+            } else {
+                None
+            };
+
+            if let Some([r, g, b, a]) = color {
+                let idx = (y * width + x) * 4;
+                pixels[idx] = r;
+                pixels[idx + 1] = g;
+                pixels[idx + 2] = b;
+                pixels[idx + 3] = a;
+            }
+        }
+    }
+
+    MemoryRenderBuffer::from_slice(
+        &pixels,
+        Fourcc::Abgr8888,
+        (width as i32, height as i32),
+        1,
+        Transform::Normal,
+        None,
+    )
+}
+
+fn point_in_polygon(x: f64, y: f64, points: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    let mut previous = points.len() - 1;
+
+    for current in 0..points.len() {
+        let (current_x, current_y) = points[current];
+        let (previous_x, previous_y) = points[previous];
+        let crosses = (current_y > y) != (previous_y > y);
+        if crosses {
+            let intersection_x =
+                (previous_x - current_x) * (y - current_y) / (previous_y - current_y) + current_x;
+            if x < intersection_x {
+                inside = !inside;
+            }
+        }
+        previous = current;
+    }
+
+    inside
+}
+
+fn select_drm_device(udev_backend: &UdevBackend) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Ok(path) = std::env::var("YAWC_DRM_DEVICE") {
+        return Ok(PathBuf::from(path));
+    }
+
+    udev_backend
+        .device_list()
+        .next()
+        .map(|(_, path)| path.to_path_buf())
+        .ok_or_else(|| "no drm device available for tty backend".into())
+}
+
+fn select_connector_and_mode(
+    drm_device: &DrmDevice,
+) -> Result<
+    (
+        connector::Info,
+        crtc::Handle,
+        smithay::reexports::drm::control::Mode,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let resources = drm_device.resource_handles()?;
+    let connector_info = resources
+        .connectors()
+        .iter()
+        .filter_map(|connector| drm_device.get_connector(*connector, true).ok())
+        .find(|info| info.state() == connector::State::Connected && !info.modes().is_empty())
+        .ok_or("no connected drm connector with a valid mode found")?;
+
+    let encoder_handle = connector_info
+        .current_encoder()
+        .or_else(|| connector_info.encoders().first().copied())
+        .ok_or("connected connector has no encoder")?;
+    let encoder_info = drm_device.get_encoder(encoder_handle)?;
+    let crtc = encoder_info
+        .crtc()
+        .or_else(|| {
+            resources
+                .filter_crtcs(encoder_info.possible_crtcs())
+                .first()
+                .copied()
+        })
+        .ok_or("encoder has no usable crtc")?;
+    let mode = select_best_mode(&connector_info).ok_or("connected connector reported no modes")?;
+
+    Ok((connector_info, crtc, mode))
+}
+
+fn select_best_mode(
+    connector_info: &connector::Info,
+) -> Option<smithay::reexports::drm::control::Mode> {
+    connector_info.modes().iter().copied().max_by_key(|mode| {
+        let (width, height) = mode.size();
+        let area = width as u64 * height as u64;
+        (area, mode.vrefresh())
+    })
+}

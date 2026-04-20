@@ -48,7 +48,7 @@ pub fn init(
                 }
                 WinitEvent::Input(event) => {
                     state.process_input_event(event);
-                    backend.window().set_cursor(state.pending_cursor);
+                    backend.window().set_cursor(state.pending_cursor.to_winit());
                 }
                 WinitEvent::Redraw => {
                     if let Err(error) =

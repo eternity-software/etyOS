@@ -3,10 +3,24 @@ name = "yawc"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["winit-backend"]
+winit-backend = ["smithay/backend_winit"]
+tty-udev = [
+  "smithay/backend_egl",
+  "smithay/backend_libinput",
+  "smithay/backend_udev",
+  "smithay/backend_drm",
+  "smithay/backend_gbm",
+  "smithay/backend_session_libseat",
+  "smithay/renderer_gl",
+  "smithay/renderer_multi",
+]
+
 [dependencies]
 bitflags = "2.10.0"
 image = { version = "0.25.8", default-features = false, features = ["png", "jpeg"] }
 rusttype = "0.9.3"
-smithay = { version = "0.7.0", default-features = false, features = ["backend_winit", "desktop", "wayland_frontend"] }
+smithay = { version = "0.7.0", default-features = false, features = ["desktop", "wayland_frontend"] }
 tracing = { version = "0.1.41", features = ["max_level_trace", "release_max_level_debug"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

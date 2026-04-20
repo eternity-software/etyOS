@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=YAWC
+Comment=Wayland compositor for etyOS and etyDE
+Exec=@PREFIX@/bin/yawc-session
+TryExec=@PREFIX@/bin/yawc-session
+Type=Application
+DesktopNames=YAWC;etyDE;

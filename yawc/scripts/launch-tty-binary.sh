@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+BINARY_PATH="$1"
+USER_HOME="$2"
+RUN_AS_USER="$3"
+EXTRA_LD_LIBRARY_PATH="$4"
+shift 4
+
+RUN_AS_UID="$(id -u "$RUN_AS_USER")"
+XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$RUN_AS_UID}"
+LOG_FILE="${YAWC_TTY_LOG:-}"
+
+if [ -n "$LOG_FILE" ]; then
+  exec >> "$LOG_FILE" 2>&1
+fi
+
+exec env \
+  HOME="$USER_HOME" \
+  USER="$RUN_AS_USER" \
+  LOGNAME="$RUN_AS_USER" \
+  XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+  XDG_SESSION_TYPE="wayland" \
+  GDK_BACKEND="wayland" \
+  QT_QPA_PLATFORM="wayland" \
+  SDL_VIDEODRIVER="wayland" \
+  CLUTTER_BACKEND="wayland" \
+  MOZ_ENABLE_WAYLAND="1" \
+  LIBSEAT_BACKEND="${YAWC_LIBSEAT_BACKEND:-logind}" \
+  SMITHAY_USE_LEGACY="${YAWC_DRM_LEGACY:-1}" \
+  YAWC_TTY_LOG="$LOG_FILE" \
+  LD_LIBRARY_PATH="$EXTRA_LD_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  dbus-run-session "$BINARY_PATH" --tty-udev "$@"

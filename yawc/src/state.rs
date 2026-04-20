@@ -10,7 +10,6 @@ use smithay::{
             protocol::wl_surface::WlSurface,
             Display, DisplayHandle,
         },
-        winit::window::CursorIcon,
     },
     utils::{Logical, Point},
     wayland::{
@@ -24,7 +23,7 @@ use smithay::{
 };
 use tracing::info;
 
-use crate::{window::WindowStore, CalloopData};
+use crate::{cursor::CursorShape, window::WindowStore, CalloopData};
 
 pub struct Yawc {
     pub start_time: Instant,
@@ -42,7 +41,7 @@ pub struct Yawc {
     pub data_device_state: DataDeviceState,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
-    pub pending_cursor: CursorIcon,
+    pub pending_cursor: CursorShape,
 }
 
 impl Yawc {
@@ -83,7 +82,7 @@ impl Yawc {
             data_device_state,
             popups,
             seat,
-            pending_cursor: CursorIcon::Default,
+            pending_cursor: CursorShape::Default,
         }
     }
 

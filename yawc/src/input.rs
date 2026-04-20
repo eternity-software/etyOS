@@ -1,7 +1,7 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     input::{
         keyboard::FilterResult,
@@ -9,42 +9,40 @@ use smithay::{
             AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent,
         },
     },
-    reexports::{
-        wayland_server::protocol::wl_surface::WlSurface,
-        winit::window::CursorIcon,
-    },
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Rectangle, SERIAL_COUNTER},
 };
 
 use crate::{
+    cursor::CursorShape,
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
     state::Yawc,
     window::{DecorationAction, ResizeEdge},
 };
 
-fn edges_to_cursor(edges: ResizeEdge) -> CursorIcon {
+fn edges_to_cursor(edges: ResizeEdge) -> CursorShape {
     let top = edges.contains(ResizeEdge::TOP);
     let bottom = edges.contains(ResizeEdge::BOTTOM);
     let left = edges.contains(ResizeEdge::LEFT);
     let right = edges.contains(ResizeEdge::RIGHT);
     match (top, bottom, left, right) {
-        (true, false, true, false) => CursorIcon::NwseResize,
-        (false, true, false, true) => CursorIcon::NwseResize,
-        (true, false, false, true) => CursorIcon::NeswResize,
-        (false, true, true, false) => CursorIcon::NeswResize,
-        (true, false, false, false) => CursorIcon::RowResize,
-        (false, true, false, false) => CursorIcon::RowResize,
-        (false, false, true, false) => CursorIcon::ColResize,
-        (false, false, false, true) => CursorIcon::ColResize,
-        _ => CursorIcon::Default,
+        (true, false, true, false) => CursorShape::NwseResize,
+        (false, true, false, true) => CursorShape::NwseResize,
+        (true, false, false, true) => CursorShape::NeswResize,
+        (false, true, true, false) => CursorShape::NeswResize,
+        (true, false, false, false) => CursorShape::RowResize,
+        (false, true, false, false) => CursorShape::RowResize,
+        (false, false, true, false) => CursorShape::ColResize,
+        (false, false, false, true) => CursorShape::ColResize,
+        _ => CursorShape::Default,
     }
 }
 
-fn cursor_for_decoration_hit(hit: Option<crate::window::DecorationHit>) -> CursorIcon {
+fn cursor_for_decoration_hit(hit: Option<crate::window::DecorationHit>) -> CursorShape {
     match hit.map(|hit| hit.action) {
         Some(DecorationAction::Resize(edges)) => edges_to_cursor(edges),
-        Some(DecorationAction::Move) => CursorIcon::Move,
-        Some(DecorationAction::Close) | None => CursorIcon::Default,
+        Some(DecorationAction::Move) => CursorShape::Move,
+        Some(DecorationAction::Close) | None => CursorShape::Default,
     }
 }
 
@@ -64,7 +62,48 @@ impl Yawc {
                     |_, _, _| FilterResult::Forward,
                 );
             }
-            InputEvent::PointerMotion { .. } => {}
+            InputEvent::PointerMotion { event, .. } => {
+                let Some(output) = self.space.outputs().next() else {
+                    return;
+                };
+                let Some(output_geometry) = self.space.output_geometry(output) else {
+                    return;
+                };
+
+                let pointer = self.seat.get_pointer().unwrap();
+                let mut location = pointer.current_location() + event.delta();
+                location.x = location.x.clamp(
+                    output_geometry.loc.x as f64,
+                    (output_geometry.loc.x + output_geometry.size.w - 1) as f64,
+                );
+                location.y = location.y.clamp(
+                    output_geometry.loc.y as f64,
+                    (output_geometry.loc.y + output_geometry.size.h - 1) as f64,
+                );
+
+                let serial = SERIAL_COUNTER.next_serial();
+                let decoration_hit = self.windows.decoration_hit_at(&self.space, location);
+                let under = if decoration_hit.is_some() {
+                    None
+                } else {
+                    self.surface_under(location)
+                };
+
+                pointer.motion(
+                    self,
+                    under,
+                    &MotionEvent {
+                        location,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+                pointer.frame(self);
+
+                if !pointer.is_grabbed() {
+                    self.pending_cursor = cursor_for_decoration_hit(decoration_hit);
+                }
+            }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let Some(output) = self.space.outputs().next() else {
                     return;

@@ -13,6 +13,7 @@ pub const RESIZE_HITBOX: i32 = 16;
 pub const CSD_RESIZE_HITBOX: i32 = 8;
 pub const BUTTON_SIZE: i32 = 18;
 pub const BUTTON_PADDING: i32 = 12;
+#[cfg_attr(not(feature = "winit-backend"), allow(dead_code))]
 pub const FRAME_RADIUS: i32 = 18;
 
 bitflags::bitflags! {
@@ -304,7 +305,10 @@ fn client_draws_own_decorations(window: &Window) -> bool {
 }
 
 fn allowed_resize_edges(window: &Window, edges: ResizeEdge) -> Option<ResizeEdge> {
-    let Some(surface) = window.toplevel().map(|toplevel| toplevel.wl_surface().clone()) else {
+    let Some(surface) = window
+        .toplevel()
+        .map(|toplevel| toplevel.wl_surface().clone())
+    else {
         return None;
     };
 
@@ -374,7 +378,11 @@ fn resize_edge_for(
 ) -> Option<ResizeEdge> {
     let hitbox = Rectangle::new(
         (frame.loc.x - hitbox_size, frame.loc.y - hitbox_size).into(),
-        (frame.size.w + hitbox_size * 2, frame.size.h + hitbox_size * 2).into(),
+        (
+            frame.size.w + hitbox_size * 2,
+            frame.size.h + hitbox_size * 2,
+        )
+            .into(),
     );
     if !contains(hitbox, position) {
         return None;

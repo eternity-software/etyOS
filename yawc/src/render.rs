@@ -1,38 +1,33 @@
+#![cfg_attr(not(feature = "winit-backend"), allow(dead_code, unused_imports))]
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::Path,
-    time::Duration,
 };
 
 use image::{imageops::FilterType, DynamicImage, Rgba, RgbaImage};
 use rusttype::{point, Font, Scale};
 use smithay::{
+    backend::renderer::element::AsRenderElements,
     backend::{
         allocator::Fourcc,
         renderer::{
             element::{
-                Element, Id, RenderElement,
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
-                texture::{TextureBuffer, TextureRenderElement},
                 surface::{WaylandSurfaceRenderElement, WaylandSurfaceTexture},
-                Kind,
+                texture::{TextureBuffer, TextureRenderElement},
+                Element, Id, Kind, RenderElement,
             },
             gles::{
-                element::TextureShaderElement, ffi, GlesError, GlesRenderer,
-                GlesTexture,
-                GlesTexProgram, Uniform, UniformName, UniformType,
+                element::TextureShaderElement, ffi, GlesError, GlesRenderer, GlesTexProgram,
+                GlesTexture, Uniform, UniformName, UniformType,
             },
             utils::{CommitCounter, DamageSet, OpaqueRegions},
-            Frame, Offscreen, Renderer, Texture,
+            Frame, Renderer, Texture,
         },
-        winit::WinitGraphicsBackend,
     },
-    backend::renderer::element::AsRenderElements,
-    desktop::{
-        space::SpaceRenderElements,
-        Space, Window,
-    },
+    desktop::{space::SpaceRenderElements, Space, Window},
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::wayland_server::{protocol::wl_surface::WlSurface, DisplayHandle},
     utils::{Logical, Physical, Point, Rectangle, Scale as RendererScale, Size, Transform},
@@ -49,6 +44,7 @@ smithay::backend::renderer::element::render_elements! {
     Space=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
     TextureShader=TextureShaderElement,
+    TitlebarBlur=TitlebarBlurElement,
     RoundedSurface=RoundedSurfaceElement,
 }
 
@@ -209,9 +205,44 @@ impl RenderState {
         space: &mut Space<Window>,
         size: Size<i32, Physical>,
     ) -> Self {
+        Self::new_with_output(
+            display_handle,
+            space,
+            size,
+            60_000,
+            Transform::Flipped180,
+            "Nested Compositor",
+        )
+    }
+
+    #[cfg(feature = "tty-udev")]
+    pub fn new_standalone(
+        display_handle: &DisplayHandle,
+        space: &mut Space<Window>,
+        size: Size<i32, Physical>,
+        refresh: i32,
+    ) -> Self {
+        Self::new_with_output(
+            display_handle,
+            space,
+            size,
+            refresh,
+            Transform::Normal,
+            "TTY Session",
+        )
+    }
+
+    fn new_with_output(
+        display_handle: &DisplayHandle,
+        space: &mut Space<Window>,
+        size: Size<i32, Physical>,
+        refresh: i32,
+        transform: Transform,
+        model: &str,
+    ) -> Self {
         let mode = Mode {
             size,
-            refresh: 60_000,
+            refresh: refresh.max(1),
         };
 
         let output = Output::new(
@@ -220,17 +251,12 @@ impl RenderState {
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
                 make: "YAWC".into(),
-                model: "Nested Compositor".into(),
+                model: model.into(),
             },
         );
         let _ = output.create_global::<Yawc>(display_handle);
 
-        output.change_current_state(
-            Some(mode),
-            Some(Transform::Flipped180),
-            None,
-            Some((0, 0).into()),
-        );
+        output.change_current_state(Some(mode), Some(transform), None, Some((0, 0).into()));
         output.set_preferred(mode);
         space.map_output(&output, (0, 0));
 
@@ -259,6 +285,97 @@ impl RenderState {
         state
     }
 
+    #[cfg(feature = "tty-udev")]
+    pub fn output(&self) -> &Output {
+        &self.output
+    }
+
+    #[cfg(feature = "tty-udev")]
+    pub fn wallpaper_buffer(&self) -> Option<&MemoryRenderBuffer> {
+        self.wallpaper_buffer.as_ref()
+    }
+
+    #[cfg(feature = "tty-udev")]
+    pub fn tty_scene_elements(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        space: &Space<Window>,
+        frames: &[WindowFrame],
+    ) -> Result<Vec<YawcRenderElements>, GlesError> {
+        let mut frame_by_surface = HashMap::new();
+        for frame in frames {
+            if let Some(toplevel) = frame.window.toplevel() {
+                frame_by_surface.insert(toplevel.wl_surface().clone(), frame.clone());
+            }
+        }
+
+        let output_size = self
+            .output
+            .current_mode()
+            .map(|mode| mode.size)
+            .unwrap_or_else(|| Size::from((1, 1)));
+        let titlebar_shader = self.ensure_titlebar_shader(renderer)?.cloned();
+        let mut deco_by_surface = self.decoration_elements(renderer, frames)?;
+        let mut elements = Vec::new();
+
+        for window in space.elements().rev() {
+            let mut window_elements = Vec::new();
+            let frame_meta = window
+                .toplevel()
+                .and_then(|toplevel| frame_by_surface.get(toplevel.wl_surface()));
+
+            if let Some(toplevel) = window.toplevel() {
+                if let Some(deco) = deco_by_surface.remove(toplevel.wl_surface()) {
+                    window_elements.extend(deco);
+                }
+
+                if let (Some(frame_meta), Some(shader), Some(capture)) = (
+                    frame_meta,
+                    titlebar_shader.as_ref(),
+                    frame_meta.and_then(|frame| blur_capture_for_frame(frame, output_size)),
+                ) {
+                    let blur_texture = self.ensure_blur_texture(
+                        renderer,
+                        toplevel.wl_surface(),
+                        capture.capture_w,
+                        capture.capture_h,
+                    )?;
+                    window_elements.push(YawcRenderElements::from(TitlebarBlurElement::new(
+                        blur_texture,
+                        shader.clone(),
+                        frame_meta.frame.loc,
+                        Size::from((frame_meta.frame.size.w, TITLEBAR_HEIGHT)),
+                        capture,
+                    )));
+                }
+            }
+
+            if let Some(loc) = space.element_location(window) {
+                let render_loc = Point::<i32, Logical>::from((
+                    loc.x - window.geometry().loc.x,
+                    loc.y - window.geometry().loc.y,
+                ));
+                let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
+                let surf: Vec<
+                    SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+                > = window.render_elements(renderer, phys_loc, RendererScale::from(1.0_f64), 1.0);
+
+                if let Some(frame_meta) = frame_meta {
+                    window_elements
+                        .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
+                } else {
+                    window_elements.extend(surf.into_iter().map(YawcRenderElements::from));
+                }
+            }
+
+            elements.extend(window_elements);
+        }
+
+        elements.extend(desktop_elements(renderer, self.wallpaper_buffer.as_ref())?);
+
+        Ok(elements)
+    }
+
     pub fn resize(&mut self, size: Size<i32, Physical>) {
         let mode = Mode {
             size,
@@ -273,9 +390,10 @@ impl RenderState {
         self.rebuild_desktop_buffers(size);
     }
 
+    #[cfg(feature = "winit-backend")]
     pub fn render_frame(
         &mut self,
-        backend: &mut WinitGraphicsBackend<GlesRenderer>,
+        backend: &mut smithay::backend::winit::WinitGraphicsBackend<GlesRenderer>,
         state: &mut Yawc,
         display_handle: &mut DisplayHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -299,10 +417,7 @@ impl RenderState {
             let (renderer, mut framebuffer) = backend.bind()?;
             let windows: Vec<Window> = state.space.elements().cloned().collect();
             let titlebar_shader = self.ensure_titlebar_shader(renderer)?.cloned();
-            let desktop = desktop_elements(
-                renderer,
-                self.wallpaper_buffer.as_ref(),
-            )?;
+            let desktop = desktop_elements(renderer, self.wallpaper_buffer.as_ref())?;
             {
                 let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
                 frame.clear([0.06, 0.09, 0.11, 1.0].into(), &[damage])?;
@@ -312,7 +427,6 @@ impl RenderState {
 
             for window in &windows {
                 let mut step_elements: Vec<YawcRenderElements> = Vec::new();
-                let mut blur_payload = None;
 
                 if let Some(toplevel) = window.toplevel() {
                     if let Some(frame_meta) = frame_by_surface.get(toplevel.wl_surface()) {
@@ -333,7 +447,7 @@ impl RenderState {
                             Transform::Normal,
                             None,
                         );
-                        blur_payload = titlebar_shader.as_ref().map(|shader| {
+                        let blur_payload = titlebar_shader.as_ref().map(|shader| {
                             (
                                 blur_texture,
                                 YawcRenderElements::from(TextureShaderElement::new(
@@ -343,7 +457,11 @@ impl RenderState {
                                         None,
                                         Some(Rectangle::new(
                                             (capture.src_x as f64, capture.src_y as f64).into(),
-                                            (frame_meta.frame.size.w as f64, TITLEBAR_HEIGHT as f64).into(),
+                                            (
+                                                frame_meta.frame.size.w as f64,
+                                                TITLEBAR_HEIGHT as f64,
+                                            )
+                                                .into(),
                                         )),
                                         Some((frame_meta.frame.size.w, TITLEBAR_HEIGHT).into()),
                                         Kind::Unspecified,
@@ -372,15 +490,34 @@ impl RenderState {
                                 loc.x - window.geometry().loc.x,
                                 loc.y - window.geometry().loc.y,
                             ));
-                            let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
-                            let surf: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
-                                window.render_elements(renderer, phys_loc, RendererScale::from(1.0_f64), 1.0);
-                            step_elements.extend(self.client_surface_elements(renderer, frame_meta, surf)?);
+                            let phys_loc =
+                                Point::<i32, Physical>::from((render_loc.x, render_loc.y));
+                            let surf: Vec<
+                                SpaceRenderElements<
+                                    GlesRenderer,
+                                    WaylandSurfaceRenderElement<GlesRenderer>,
+                                >,
+                            > = window.render_elements(
+                                renderer,
+                                phys_loc,
+                                RendererScale::from(1.0_f64),
+                                1.0,
+                            );
+                            step_elements
+                                .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
                         }
 
-                        let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
-                        if let Some((blur_texture, blur_element, blur_frame_meta, capture)) = blur_payload.as_ref() {
-                            self.capture_blur_texture(&mut frame, blur_texture, blur_frame_meta, *capture)?;
+                        let mut frame =
+                            renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                        if let Some((blur_texture, blur_element, blur_frame_meta, capture)) =
+                            blur_payload.as_ref()
+                        {
+                            self.capture_blur_texture(
+                                &mut frame,
+                                blur_texture,
+                                blur_frame_meta,
+                                *capture,
+                            )?;
                             draw_elements(&mut frame, std::slice::from_ref(blur_element))?;
                         }
                         draw_elements(&mut frame, &step_elements)?;
@@ -395,11 +532,21 @@ impl RenderState {
                         loc.y - window.geometry().loc.y,
                     ));
                     let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
-                    let surf: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
-                        window.render_elements(renderer, phys_loc, RendererScale::from(1.0_f64), 1.0);
+                    let surf: Vec<
+                        SpaceRenderElements<
+                            GlesRenderer,
+                            WaylandSurfaceRenderElement<GlesRenderer>,
+                        >,
+                    > = window.render_elements(
+                        renderer,
+                        phys_loc,
+                        RendererScale::from(1.0_f64),
+                        1.0,
+                    );
                     if let Some(toplevel) = window.toplevel() {
                         if let Some(frame_meta) = frame_by_surface.get(toplevel.wl_surface()) {
-                            step_elements.extend(self.client_surface_elements(renderer, frame_meta, surf)?);
+                            step_elements
+                                .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
                         } else {
                             step_elements.extend(surf.into_iter().map(YawcRenderElements::from));
                         }
@@ -423,7 +570,7 @@ impl RenderState {
             window.send_frame(
                 &self.output,
                 state.start_time.elapsed(),
-                Some(Duration::ZERO),
+                Some(std::time::Duration::ZERO),
                 |_, _| Some(self.output.clone()),
             );
         });
@@ -480,19 +627,49 @@ impl RenderState {
             }
         }
 
-        let texture = <GlesRenderer as Offscreen<GlesTexture>>::create_buffer(
-            renderer,
-            Fourcc::Abgr8888,
-            Size::from((width, height)),
-        )?;
-        renderer.with_context(|gl| unsafe {
-            gl.BindTexture(ffi::TEXTURE_2D, texture.tex_id());
+        let tex = renderer.with_context(|gl| unsafe {
+            let mut tex = 0;
+            gl.GenTextures(1, &mut tex);
+            gl.BindTexture(ffi::TEXTURE_2D, tex);
+            gl.TexImage2D(
+                ffi::TEXTURE_2D,
+                0,
+                ffi::RGB8 as i32,
+                width,
+                height,
+                0,
+                ffi::RGB,
+                ffi::UNSIGNED_BYTE,
+                std::ptr::null(),
+            );
             gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
             gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_S,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_T,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
             gl.BindTexture(ffi::TEXTURE_2D, 0);
+            tex
         })?;
+        let texture = unsafe {
+            // NVIDIA rejects copying an opaque DRM framebuffer into an alpha texture
+            // ("Unable to up-convert the component count"), but Smithay's GLES shader
+            // selector only accepts RGBA/BGRA-like texture metadata. The GL object is
+            // RGB8; reporting it as opaque RGBA8 selects the no-alpha sampler path.
+            GlesTexture::from_raw(
+                renderer,
+                Some(ffi::RGBA8),
+                true,
+                tex,
+                Size::from((width, height)),
+            )
+        };
         self.blur_texture_cache
             .insert(surface.clone(), texture.clone());
         Ok(texture)
@@ -553,7 +730,8 @@ impl RenderState {
             used_overlay_keys.insert(overlay_key.clone());
 
             if !self.overlay_cache.contains_key(&overlay_key) {
-                let frame_buffer = overlay_buffer(frame, self.title_font.as_ref(), app_icon.as_ref());
+                let frame_buffer =
+                    overlay_buffer(frame, self.title_font.as_ref(), app_icon.as_ref());
                 self.overlay_cache.insert(overlay_key.clone(), frame_buffer);
             }
             let frame_buffer = self.overlay_cache.get(&overlay_key).unwrap();
@@ -573,7 +751,11 @@ impl RenderState {
                 )?,
             ));
 
-            let Some(surface) = frame.window.toplevel().map(|toplevel| toplevel.wl_surface().clone()) else {
+            let Some(surface) = frame
+                .window
+                .toplevel()
+                .map(|toplevel| toplevel.wl_surface().clone())
+            else {
                 continue;
             };
 
@@ -622,7 +804,8 @@ impl RenderState {
         surfaces: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>,
     ) -> Result<Vec<YawcRenderElements>, GlesError> {
         let shader = self.ensure_client_clip_shader(renderer)?.cloned();
-        let client_loc = point_to_physical((frame.frame.loc.x, frame.frame.loc.y + TITLEBAR_HEIGHT).into());
+        let client_loc =
+            point_to_physical((frame.frame.loc.x, frame.frame.loc.y + TITLEBAR_HEIGHT).into());
         let client_size = Size::<i32, Physical>::from((
             frame.frame.size.w,
             (frame.frame.size.h - TITLEBAR_HEIGHT).max(0),
@@ -654,6 +837,137 @@ impl RenderState {
         let icon = load_app_icon(app_id);
         self.icon_cache.insert(app_id.to_string(), icon.clone());
         icon
+    }
+}
+
+#[derive(Debug)]
+struct TitlebarBlurElement {
+    texture: GlesTexture,
+    program: GlesTexProgram,
+    id: Id,
+    titlebar_loc: Point<i32, Physical>,
+    size: Size<i32, Physical>,
+    capture: BlurCapture,
+}
+
+impl TitlebarBlurElement {
+    #[cfg_attr(not(feature = "tty-udev"), allow(dead_code))]
+    fn new(
+        texture: GlesTexture,
+        program: GlesTexProgram,
+        loc: Point<i32, Logical>,
+        size: Size<i32, Physical>,
+        capture: BlurCapture,
+    ) -> Self {
+        Self {
+            texture,
+            program,
+            id: Id::new(),
+            titlebar_loc: Point::<i32, Physical>::from((loc.x, loc.y)),
+            size,
+            capture,
+        }
+    }
+}
+
+impl Element for TitlebarBlurElement {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        CommitCounter::default()
+    }
+
+    fn geometry(&self, _scale: RendererScale<f64>) -> Rectangle<i32, Physical> {
+        Rectangle::new(self.titlebar_loc, self.size)
+    }
+
+    fn transform(&self) -> Transform {
+        Transform::Normal
+    }
+
+    fn src(&self) -> Rectangle<f64, smithay::utils::Buffer> {
+        Rectangle::new(
+            (self.capture.src_x as f64, self.capture.src_y as f64).into(),
+            (self.size.w as f64, self.size.h as f64).into(),
+        )
+    }
+
+    fn damage_since(
+        &self,
+        _scale: RendererScale<f64>,
+        _commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        DamageSet::from_slice(&[Rectangle::new(
+            Point::from((
+                self.capture.loc.x - self.titlebar_loc.x,
+                self.capture.loc.y - self.titlebar_loc.y,
+            )),
+            self.capture.size(),
+        )])
+    }
+
+    fn opaque_regions(&self, _scale: RendererScale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
+    }
+
+    fn alpha(&self) -> f32 {
+        1.0
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Unspecified
+    }
+
+    fn location(&self, _scale: RendererScale<f64>) -> Point<i32, Physical> {
+        self.titlebar_loc
+    }
+}
+
+impl RenderElement<GlesRenderer> for TitlebarBlurElement {
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+        src: Rectangle<f64, smithay::utils::Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        frame.with_context(|gl| unsafe {
+            gl.BindTexture(ffi::TEXTURE_2D, self.texture.tex_id());
+            gl.CopyTexSubImage2D(
+                ffi::TEXTURE_2D,
+                0,
+                0,
+                0,
+                self.capture.capture_x,
+                self.capture.capture_y_gl,
+                self.capture.capture_w,
+                self.capture.capture_h,
+            );
+            gl.BindTexture(ffi::TEXTURE_2D, 0);
+        })?;
+
+        let uniforms = titlebar_shader_uniforms(
+            self.size.w,
+            self.size.h,
+            self.capture.capture_w,
+            self.capture.capture_h,
+            self.capture.src_x,
+            self.capture.src_y,
+        );
+        frame.render_texture_from_to(
+            &self.texture,
+            src,
+            dst,
+            damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            Some(&self.program),
+            &uniforms,
+        )
     }
 }
 
@@ -743,7 +1057,10 @@ impl RenderElement<GlesRenderer> for RoundedSurfaceElement {
                 let uniforms = vec![
                     Uniform::new(
                         "client_size",
-                        (self.client_size.w.max(1) as f32, self.client_size.h.max(1) as f32),
+                        (
+                            self.client_size.w.max(1) as f32,
+                            self.client_size.h.max(1) as f32,
+                        ),
                     ),
                     Uniform::new(
                         "element_offset",
@@ -794,6 +1111,7 @@ impl DecorationCacheKey {
 
 #[derive(Clone, Copy, Debug)]
 struct BlurCapture {
+    loc: Point<i32, Physical>,
     capture_x: i32,
     capture_y_gl: i32,
     capture_w: i32,
@@ -802,7 +1120,16 @@ struct BlurCapture {
     src_y: i32,
 }
 
-fn blur_capture_for_frame(frame: &WindowFrame, output_size: Size<i32, Physical>) -> Option<BlurCapture> {
+impl BlurCapture {
+    fn size(self) -> Size<i32, Physical> {
+        Size::from((self.capture_w, self.capture_h))
+    }
+}
+
+fn blur_capture_for_frame(
+    frame: &WindowFrame,
+    output_size: Size<i32, Physical>,
+) -> Option<BlurCapture> {
     let titlebar_w = frame.frame.size.w.max(1);
     let titlebar_h = TITLEBAR_HEIGHT.max(1);
 
@@ -818,6 +1145,7 @@ fn blur_capture_for_frame(frame: &WindowFrame, output_size: Size<i32, Physical>)
     }
 
     Some(BlurCapture {
+        loc: Point::from((left, top)),
         capture_x: left,
         capture_y_gl: output_size.h - bottom,
         capture_w,
