@@ -40,15 +40,20 @@ fn edges_to_cursor(edges: ResizeEdge) -> CursorShape {
     }
 }
 
-fn cursor_for_decoration_hit(hit: Option<crate::window::DecorationHit>) -> CursorShape {
+fn cursor_for_decoration_hit(hit: Option<crate::window::DecorationHit>) -> Option<CursorShape> {
     match hit.map(|hit| hit.action) {
-        Some(DecorationAction::Resize(edges)) => edges_to_cursor(edges),
-        Some(DecorationAction::Move) => CursorShape::Move,
+        Some(DecorationAction::Resize(edges)) => Some(edges_to_cursor(edges)),
+        Some(DecorationAction::Move) => Some(CursorShape::Move),
         Some(DecorationAction::Minimize)
         | Some(DecorationAction::ToggleMaximize)
-        | Some(DecorationAction::Close)
-        | None => CursorShape::Default,
+        | Some(DecorationAction::Close) => Some(CursorShape::Default),
+        None => None,
     }
+}
+
+fn set_cursor_override(state: &mut Yawc, cursor: Option<CursorShape>) {
+    state.compositor_cursor = cursor;
+    state.pending_cursor = cursor.unwrap_or(CursorShape::Default);
 }
 
 fn decoration_action_name(action: DecorationAction) -> &'static str {
@@ -153,7 +158,7 @@ impl Yawc {
                 pointer.frame(self);
 
                 if !pointer.is_grabbed() {
-                    self.pending_cursor = cursor_for_decoration_hit(decoration_hit);
+                    set_cursor_override(self, cursor_for_decoration_hit(decoration_hit));
                 }
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
@@ -187,7 +192,7 @@ impl Yawc {
                 pointer.frame(self);
 
                 if !pointer.is_grabbed() {
-                    self.pending_cursor = cursor_for_decoration_hit(decoration_hit);
+                    set_cursor_override(self, cursor_for_decoration_hit(decoration_hit));
                 }
             }
             InputEvent::PointerButton { event, .. } => {
@@ -222,6 +227,7 @@ impl Yawc {
 
                         match hit.action {
                             crate::window::DecorationAction::Move => {
+                                set_cursor_override(self, Some(CursorShape::Move));
                                 if let Some(toplevel) = hit.window.toplevel() {
                                     self.windows.clear_snap(toplevel.wl_surface());
                                 }
@@ -244,7 +250,7 @@ impl Yawc {
                                 );
                             }
                             crate::window::DecorationAction::Resize(edges) => {
-                                self.pending_cursor = edges_to_cursor(edges);
+                                set_cursor_override(self, Some(edges_to_cursor(edges)));
                                 let start_data = PointerGrabStartData {
                                     focus: None,
                                     button,
@@ -308,9 +314,12 @@ impl Yawc {
                 pointer.frame(self);
 
                 if !pointer.is_grabbed() {
-                    self.pending_cursor = cursor_for_decoration_hit(
-                        self.windows
-                            .decoration_hit_at(&self.space, pointer.current_location()),
+                    set_cursor_override(
+                        self,
+                        cursor_for_decoration_hit(
+                            self.windows
+                                .decoration_hit_at(&self.space, pointer.current_location()),
+                        ),
                     );
                 }
             }

@@ -24,3 +24,4 @@ rusttype = "0.9.3"
 smithay = { version = "0.7.0", default-features = false, features = ["desktop", "wayland_frontend"] }
 tracing = { version = "0.1.41", features = ["max_level_trace", "release_max_level_debug"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+xcursor = "0.3.10"

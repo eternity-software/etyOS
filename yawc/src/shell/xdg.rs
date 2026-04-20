@@ -14,7 +14,7 @@ use smithay::{
             Resource,
         },
     },
-    utils::{Rectangle, Serial},
+    utils::{Rectangle, Serial, SERIAL_COUNTER},
     wayland::{
         compositor::{self, with_states},
         shell::xdg::{
@@ -39,11 +39,16 @@ impl XdgShellHandler for Yawc {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let metadata = read_toplevel_metadata(&surface);
         let window = Window::new_wayland_window(surface);
+        let wl_surface = window.toplevel().unwrap().wl_surface().clone();
         let location = self.windows.insert(window.clone());
-        self.windows
-            .set_metadata(window.toplevel().unwrap().wl_surface(), metadata.clone());
+        self.windows.set_metadata(&wl_surface, metadata.clone());
+        self.windows.activate(&wl_surface);
 
-        self.space.map_element(window, location, false);
+        self.space.map_element(window, location, true);
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+        }
+        self.send_pending_configures();
         info!(
             windows = self.windows.len(),
             x = location.x,

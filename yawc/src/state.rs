@@ -2,7 +2,10 @@ use std::{ffi::OsString, sync::Arc, time::Instant};
 
 use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
-    input::{Seat, SeatState},
+    input::{
+        pointer::{CursorIcon, CursorImageStatus},
+        Seat, SeatState,
+    },
     output::Output,
     reexports::{
         calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
@@ -16,6 +19,7 @@ use smithay::{
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
+        cursor_shape::CursorShapeManagerState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::xdg::{decoration::XdgDecorationState, XdgShellState},
@@ -44,11 +48,14 @@ pub struct Yawc {
     pub xdg_decoration_state: XdgDecorationState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
+    pub cursor_shape_state: CursorShapeManagerState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
     pub pending_cursor: CursorShape,
+    pub compositor_cursor: Option<CursorShape>,
+    pub cursor_image: CursorImageStatus,
     pub config: Config,
 }
 
@@ -61,6 +68,7 @@ impl Yawc {
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
+        let cursor_shape_state = CursorShapeManagerState::new::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let popups = PopupManager::default();
@@ -87,11 +95,14 @@ impl Yawc {
             xdg_decoration_state,
             shm_state,
             output_manager_state,
+            cursor_shape_state,
             seat_state,
             data_device_state,
             popups,
             seat,
             pending_cursor: CursorShape::Default,
+            compositor_cursor: None,
+            cursor_image: CursorImageStatus::Named(CursorIcon::Default),
             config,
         }
     }

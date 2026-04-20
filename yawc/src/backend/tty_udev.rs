@@ -1,5 +1,7 @@
 use std::{
     cell::RefCell,
+    collections::HashMap,
+    fs,
     path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
@@ -36,6 +38,7 @@ use smithay::{
         udev::{UdevBackend, UdevEvent},
     },
     desktop::{space::SpaceRenderElements, Space, Window},
+    input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
     reexports::{
         calloop::{
             timer::{TimeoutAction, Timer},
@@ -44,11 +47,13 @@ use smithay::{
         drm::control::{connector, crtc, Device as ControlDevice},
         input::{DeviceCapability, Libinput},
         rustix::fs::OFlags,
+        wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{
         Buffer, DeviceFd, Logical, Physical, Point, Rectangle, Scale as RendererScale, Size,
         Transform,
     },
+    wayland::compositor,
 };
 use tracing::{error, info, warn};
 
@@ -73,6 +78,7 @@ smithay::backend::renderer::element::render_elements! {
     TtyRenderElements<='a, TtyRenderer<'a>>;
     Yawc=TtyYawcElement,
     Space=SpaceRenderElements<TtyRenderer<'a>, WaylandSurfaceRenderElement<TtyRenderer<'a>>>,
+    CursorSurface=WaylandSurfaceRenderElement<TtyRenderer<'a>>,
     Memory=MemoryRenderBufferRenderElement<TtyRenderer<'a>>,
     Solid=SolidColorRenderElement,
 }
@@ -157,7 +163,7 @@ struct TtyRuntime {
     gpus: GpuManager<TtyRenderBackend>,
     render_state: RenderState,
     background: SolidColorBuffer,
-    cursor: MemoryRenderBuffer,
+    cursor_theme: TtyCursorTheme,
     refresh_interval: Duration,
     active: bool,
     frame_pending: bool,
@@ -210,6 +216,11 @@ impl TtyRuntime {
             .seat
             .get_pointer()
             .map(|pointer| pointer.current_location());
+        let cursor_image = data
+            .state
+            .compositor_cursor
+            .map(|shape| CursorImageStatus::Named(shape.to_cursor_icon()))
+            .unwrap_or_else(|| data.state.cursor_image.clone());
         let frames = data.state.windows.frames(&data.state.space);
         let elements = render_elements(
             &mut renderer,
@@ -217,7 +228,8 @@ impl TtyRuntime {
             &data.state.space,
             &frames,
             &self.background,
-            &self.cursor,
+            &mut self.cursor_theme,
+            &cursor_image,
             pointer_location,
         );
 
@@ -391,7 +403,7 @@ pub fn init(
         Size::<i32, Logical>::from((output_size.w, output_size.h)),
         Color32F::from([0.10, 0.13, 0.16, 1.0]),
     );
-    let cursor = cursor_buffer();
+    let cursor_theme = TtyCursorTheme::load();
     let refresh_hz = mode.vrefresh().max(1);
     let refresh_millihz = (refresh_hz as i32).saturating_mul(1000);
     info!(
@@ -447,7 +459,7 @@ pub fn init(
         gpus,
         render_state,
         background,
-        cursor,
+        cursor_theme,
         refresh_interval,
         active: true,
         frame_pending: false,
@@ -596,24 +608,20 @@ fn render_elements<'a>(
     space: &Space<Window>,
     frames: &[WindowFrame],
     background: &SolidColorBuffer,
-    cursor: &MemoryRenderBuffer,
+    cursor_theme: &mut TtyCursorTheme,
+    cursor_image: &CursorImageStatus,
     pointer_location: Option<Point<f64, Logical>>,
 ) -> Vec<TtyRenderElements<'a>> {
     let mut elements = Vec::new();
 
     if let Some(location) = pointer_location {
-        match MemoryRenderBufferRenderElement::from_buffer(
+        push_cursor_element(
             renderer,
-            Point::<f64, Physical>::from((location.x, location.y)),
-            cursor,
-            None,
-            None,
-            None,
-            Kind::Unspecified,
-        ) {
-            Ok(cursor) => elements.push(TtyRenderElements::from(cursor)),
-            Err(error) => warn!(?error, "failed to upload tty cursor"),
-        }
+            &mut elements,
+            cursor_theme,
+            cursor_image,
+            location,
+        );
     }
 
     match render_state.tty_scene_elements(renderer.as_mut(), space, frames) {
@@ -638,7 +646,168 @@ fn render_elements<'a>(
     elements
 }
 
-fn cursor_buffer() -> MemoryRenderBuffer {
+fn push_cursor_element<'a>(
+    renderer: &mut TtyRenderer<'a>,
+    elements: &mut Vec<TtyRenderElements<'a>>,
+    cursor_theme: &mut TtyCursorTheme,
+    cursor_image: &CursorImageStatus,
+    location: Point<f64, Logical>,
+) {
+    match cursor_image {
+        CursorImageStatus::Hidden => {}
+        CursorImageStatus::Named(icon) => {
+            let cursor = cursor_theme.cursor(*icon);
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                Point::<f64, Physical>::from((
+                    location.x - cursor.hotspot.x as f64,
+                    location.y - cursor.hotspot.y as f64,
+                )),
+                &cursor.buffer,
+                None,
+                None,
+                None,
+                Kind::Cursor,
+            ) {
+                Ok(cursor) => elements.push(TtyRenderElements::from(cursor)),
+                Err(error) => warn!(?error, "failed to upload tty cursor"),
+            }
+        }
+        CursorImageStatus::Surface(surface) => {
+            push_cursor_surface_element(renderer, elements, surface, location);
+        }
+    }
+}
+
+fn push_cursor_surface_element<'a>(
+    renderer: &mut TtyRenderer<'a>,
+    elements: &mut Vec<TtyRenderElements<'a>>,
+    surface: &WlSurface,
+    location: Point<f64, Logical>,
+) {
+    let result = compositor::with_states(surface, |states| {
+        let hotspot = states
+            .data_map
+            .get::<CursorImageSurfaceData>()
+            .map(|data| data.lock().unwrap().hotspot)
+            .unwrap_or_default();
+        WaylandSurfaceRenderElement::from_surface(
+            renderer,
+            surface,
+            states,
+            Point::<f64, Physical>::from((
+                location.x - hotspot.x as f64,
+                location.y - hotspot.y as f64,
+            )),
+            1.0,
+            Kind::Cursor,
+        )
+    });
+
+    match result {
+        Ok(Some(cursor)) => elements.push(TtyRenderElements::from(cursor)),
+        Ok(None) => {}
+        Err(error) => warn!(?error, "failed to render client cursor surface"),
+    }
+}
+
+#[derive(Clone)]
+struct TtyCursor {
+    buffer: MemoryRenderBuffer,
+    hotspot: Point<i32, Physical>,
+}
+
+struct TtyCursorTheme {
+    theme: xcursor::CursorTheme,
+    size: u32,
+    fallback: TtyCursor,
+    cache: HashMap<CursorIcon, TtyCursor>,
+}
+
+impl TtyCursorTheme {
+    fn load() -> Self {
+        let theme_name = std::env::var("XCURSOR_THEME")
+            .ok()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        let size = std::env::var("XCURSOR_SIZE")
+            .ok()
+            .and_then(|size| size.parse::<u32>().ok())
+            .filter(|size| *size > 0)
+            .unwrap_or(24);
+
+        info!(theme = %theme_name, size, "loading tty cursor theme");
+
+        Self {
+            theme: xcursor::CursorTheme::load(&theme_name),
+            size,
+            fallback: fallback_cursor(),
+            cache: HashMap::new(),
+        }
+    }
+
+    fn cursor(&mut self, icon: CursorIcon) -> TtyCursor {
+        if let Some(cursor) = self.cache.get(&icon) {
+            return cursor.clone();
+        }
+
+        let cursor = self
+            .load_icon(icon)
+            .unwrap_or_else(|| self.fallback.clone());
+        self.cache.insert(icon, cursor.clone());
+        cursor
+    }
+
+    fn load_icon(&self, icon: CursorIcon) -> Option<TtyCursor> {
+        let names = std::iter::once(icon.name()).chain(icon.alt_names().iter().copied());
+
+        for name in names {
+            let Some(path) = self.theme.load_icon(name) else {
+                continue;
+            };
+            match load_xcursor_file(&path, self.size) {
+                Ok(cursor) => return Some(cursor),
+                Err(error) => warn!(
+                    ?error,
+                    cursor = name,
+                    path = %path.display(),
+                    "failed to load cursor image"
+                ),
+            }
+        }
+
+        warn!(?icon, "cursor theme does not provide shape; using fallback");
+        None
+    }
+}
+
+fn load_xcursor_file(
+    path: &std::path::Path,
+    desired_size: u32,
+) -> Result<TtyCursor, Box<dyn std::error::Error>> {
+    let bytes = fs::read(path)?;
+    let images = xcursor::parser::parse_xcursor(&bytes).ok_or("failed to parse xcursor file")?;
+    let image = images
+        .iter()
+        .min_by_key(|image| image.size.abs_diff(desired_size))
+        .ok_or("xcursor file contained no images")?;
+
+    let buffer = MemoryRenderBuffer::from_slice(
+        &image.pixels_rgba,
+        Fourcc::Abgr8888,
+        (image.width as i32, image.height as i32),
+        1,
+        Transform::Normal,
+        None,
+    );
+
+    Ok(TtyCursor {
+        buffer,
+        hotspot: Point::from((image.xhot as i32, image.yhot as i32)),
+    })
+}
+
+fn fallback_cursor() -> TtyCursor {
     let width = 32usize;
     let height = 32usize;
     let mut pixels = vec![0u8; width * height * 4];
@@ -683,14 +852,19 @@ fn cursor_buffer() -> MemoryRenderBuffer {
         }
     }
 
-    MemoryRenderBuffer::from_slice(
+    let buffer = MemoryRenderBuffer::from_slice(
         &pixels,
         Fourcc::Abgr8888,
         (width as i32, height as i32),
         1,
         Transform::Normal,
         None,
-    )
+    );
+
+    TtyCursor {
+        buffer,
+        hotspot: Point::from((3, 2)),
+    }
 }
 
 fn point_in_polygon(x: f64, y: f64, points: &[(f64, f64)]) -> bool {
