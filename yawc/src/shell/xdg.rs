@@ -77,6 +77,10 @@ impl XdgShellHandler for Yawc {
         let seat = Seat::from_resource(&seat).unwrap();
         let wl_surface = surface.wl_surface();
 
+        if self.windows.is_fullscreen(wl_surface) || self.windows.is_maximized(wl_surface) {
+            return;
+        }
+
         if let Some(start_data) = check_grab(&seat, wl_surface, serial) {
             let pointer = seat.get_pointer().unwrap();
             let window = self
@@ -110,6 +114,10 @@ impl XdgShellHandler for Yawc {
         let seat = Seat::from_resource(&seat).unwrap();
         let wl_surface = surface.wl_surface();
 
+        if self.windows.is_fullscreen(wl_surface) || self.windows.is_maximized(wl_surface) {
+            return;
+        }
+
         if let Some(start_data) = check_grab(&seat, wl_surface, serial) {
             let pointer = seat.get_pointer().unwrap();
             let window = self
@@ -125,6 +133,7 @@ impl XdgShellHandler for Yawc {
                 state.states.set(xdg_toplevel::State::Resizing);
             });
             surface.send_pending_configure();
+            self.windows.set_resizing(wl_surface, true);
 
             let grab = ResizeSurfaceGrab::start(
                 start_data,
@@ -134,6 +143,85 @@ impl XdgShellHandler for Yawc {
             );
             pointer.set_grab(self, grab, serial, Focus::Clear);
         }
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+            .cloned()
+        else {
+            surface.send_configure();
+            return;
+        };
+
+        self.set_window_maximized(&window, true);
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+            .cloned()
+        else {
+            surface.send_configure();
+            return;
+        };
+
+        self.set_window_maximized(&window, false);
+    }
+
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+    ) {
+        let wl_surface = surface.wl_surface();
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+            .cloned()
+        else {
+            surface.send_configure();
+            return;
+        };
+
+        self.set_window_fullscreen(&window, true, output);
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+            .cloned()
+        else {
+            surface.send_configure();
+            return;
+        };
+
+        self.set_window_fullscreen(&window, false, None);
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+            .cloned()
+        else {
+            surface.send_configure();
+            return;
+        };
+
+        self.set_window_minimized(&window);
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {

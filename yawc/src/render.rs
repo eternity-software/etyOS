@@ -77,6 +77,7 @@ uniform vec2 texel_size;
 uniform float radius;
 uniform vec2 src_origin;
 uniform vec2 src_size;
+uniform float flip_y;
 varying vec2 v_coords;
 
 float inside_top_round(vec2 p, vec2 size, float r) {
@@ -103,7 +104,7 @@ void main() {
         return;
     }
 
-    vec2 sample_coords = vec2(v_coords.x, 1.0 - v_coords.y);
+    vec2 sample_coords = vec2(v_coords.x, mix(v_coords.y, 1.0 - v_coords.y, flip_y));
     vec4 color = vec4(0.0);
     float total = 0.0;
     const float sigma = 4.0;
@@ -320,6 +321,7 @@ impl RenderState {
 
         for window in space.elements().rev() {
             let mut window_elements = Vec::new();
+            let mut blur_element = None;
             let frame_meta = window
                 .toplevel()
                 .and_then(|toplevel| frame_by_surface.get(toplevel.wl_surface()));
@@ -329,10 +331,11 @@ impl RenderState {
                     window_elements.extend(deco);
                 }
 
-                if let (Some(frame_meta), Some(shader), Some(capture)) = (
-                    frame_meta,
+                if let (Some(shader), Some(capture)) = (
                     titlebar_shader.as_ref(),
-                    frame_meta.and_then(|frame| blur_capture_for_frame(frame, output_size)),
+                    frame_meta.and_then(|frame| {
+                        blur_capture_for_frame(frame, output_size, BlurOrigin::TopLeft)
+                    }),
                 ) {
                     let blur_texture = self.ensure_blur_texture(
                         renderer,
@@ -340,11 +343,11 @@ impl RenderState {
                         capture.capture_w,
                         capture.capture_h,
                     )?;
-                    window_elements.push(YawcRenderElements::from(TitlebarBlurElement::new(
+                    blur_element = Some(YawcRenderElements::from(TitlebarBlurElement::new(
                         blur_texture,
                         shader.clone(),
-                        frame_meta.frame.loc,
-                        Size::from((frame_meta.frame.size.w, TITLEBAR_HEIGHT)),
+                        capture.dst_loc,
+                        capture.dst_size(),
                         capture,
                     )));
                 }
@@ -366,6 +369,13 @@ impl RenderState {
                 } else {
                     window_elements.extend(surf.into_iter().map(YawcRenderElements::from));
                 }
+            }
+
+            // DrmOutput draws elements back-to-front from this front-to-back list.
+            // Put blur after the client element in the list so it captures before
+            // this window's own client is drawn, while the overlay remains above it.
+            if let Some(blur_element) = blur_element {
+                window_elements.push(blur_element);
             }
 
             elements.extend(window_elements);
@@ -430,7 +440,9 @@ impl RenderState {
 
                 if let Some(toplevel) = window.toplevel() {
                     if let Some(frame_meta) = frame_by_surface.get(toplevel.wl_surface()) {
-                        let Some(capture) = blur_capture_for_frame(frame_meta, size) else {
+                        let Some(capture) =
+                            blur_capture_for_frame(frame_meta, size, BlurOrigin::BottomLeft)
+                        else {
                             continue;
                         };
                         used_blur_surfaces.insert(toplevel.wl_surface().clone());
@@ -440,6 +452,7 @@ impl RenderState {
                             capture.capture_w,
                             capture.capture_h,
                         )?;
+                        let blur_texture_size = blur_texture.size();
                         let blur_buffer = TextureBuffer::from_texture(
                             renderer,
                             blur_texture.clone(),
@@ -452,28 +465,25 @@ impl RenderState {
                                 blur_texture,
                                 YawcRenderElements::from(TextureShaderElement::new(
                                     TextureRenderElement::from_texture_buffer(
-                                        point_to_physical(frame_meta.frame.loc),
+                                        point_to_physical(capture.dst_loc),
                                         &blur_buffer,
                                         None,
                                         Some(Rectangle::new(
                                             (capture.src_x as f64, capture.src_y as f64).into(),
-                                            (
-                                                frame_meta.frame.size.w as f64,
-                                                TITLEBAR_HEIGHT as f64,
-                                            )
-                                                .into(),
+                                            (capture.dst_w as f64, capture.dst_h as f64).into(),
                                         )),
-                                        Some((frame_meta.frame.size.w, TITLEBAR_HEIGHT).into()),
+                                        Some((capture.dst_w, capture.dst_h).into()),
                                         Kind::Unspecified,
                                     ),
                                     shader.clone(),
                                     titlebar_shader_uniforms(
-                                        frame_meta.frame.size.w,
-                                        TITLEBAR_HEIGHT,
-                                        capture.capture_w,
-                                        capture.capture_h,
+                                        capture.dst_w,
+                                        capture.dst_h,
+                                        blur_texture_size.w,
+                                        blur_texture_size.h,
                                         capture.src_x,
                                         capture.src_y,
+                                        capture.flip_y,
                                     ),
                                 )),
                                 frame_meta.clone(),
@@ -599,6 +609,7 @@ impl RenderState {
                 UniformName::new("radius", UniformType::_1f),
                 UniformName::new("src_origin", UniformType::_2f),
                 UniformName::new("src_size", UniformType::_2f),
+                UniformName::new("flip_y", UniformType::_1f),
             ],
         ) {
             Ok(shader) => {
@@ -622,10 +633,19 @@ impl RenderState {
         height: i32,
     ) -> Result<GlesTexture, GlesError> {
         if let Some(texture) = self.blur_texture_cache.get(surface) {
-            if texture.size() == Size::from((width, height)) {
+            let size = texture.size();
+            if size.w >= width && size.h >= height {
                 return Ok(texture.clone());
             }
         }
+
+        let old_size = self
+            .blur_texture_cache
+            .get(surface)
+            .map(|texture| texture.size())
+            .unwrap_or_else(|| Size::from((0, 0)));
+        let width = round_blur_texture_extent(width.max(old_size.w));
+        let height = round_blur_texture_extent(height.max(old_size.h));
 
         let tex = renderer.with_context(|gl| unsafe {
             let mut tex = 0;
@@ -952,10 +972,11 @@ impl RenderElement<GlesRenderer> for TitlebarBlurElement {
         let uniforms = titlebar_shader_uniforms(
             self.size.w,
             self.size.h,
-            self.capture.capture_w,
-            self.capture.capture_h,
+            self.texture.size().w,
+            self.texture.size().h,
             self.capture.src_x,
             self.capture.src_y,
+            self.capture.flip_y,
         );
         frame.render_texture_from_to(
             &self.texture,
@@ -1094,6 +1115,7 @@ impl RenderElement<GlesRenderer> for RoundedSurfaceElement {
 struct DecorationCacheKey {
     frame_w: i32,
     active: bool,
+    maximized: bool,
     title: String,
     app_id: Option<String>,
 }
@@ -1103,6 +1125,7 @@ impl DecorationCacheKey {
         Self {
             frame_w: frame.frame.size.w,
             active: frame.active,
+            maximized: frame.maximized,
             title: frame.title.clone(),
             app_id: frame.app_id.clone(),
         }
@@ -1110,7 +1133,17 @@ impl DecorationCacheKey {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "tty-udev"), allow(dead_code))]
+enum BlurOrigin {
+    BottomLeft,
+    TopLeft,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct BlurCapture {
+    dst_loc: Point<i32, Logical>,
+    dst_w: i32,
+    dst_h: i32,
     loc: Point<i32, Physical>,
     capture_x: i32,
     capture_y_gl: i32,
@@ -1118,9 +1151,15 @@ struct BlurCapture {
     capture_h: i32,
     src_x: i32,
     src_y: i32,
+    flip_y: bool,
 }
 
 impl BlurCapture {
+    #[cfg_attr(not(feature = "tty-udev"), allow(dead_code))]
+    fn dst_size(self) -> Size<i32, Physical> {
+        Size::from((self.dst_w, self.dst_h))
+    }
+
     fn size(self) -> Size<i32, Physical> {
         Size::from((self.capture_w, self.capture_h))
     }
@@ -1129,29 +1168,49 @@ impl BlurCapture {
 fn blur_capture_for_frame(
     frame: &WindowFrame,
     output_size: Size<i32, Physical>,
+    origin: BlurOrigin,
 ) -> Option<BlurCapture> {
     let titlebar_w = frame.frame.size.w.max(1);
     let titlebar_h = TITLEBAR_HEIGHT.max(1);
 
-    let left = (frame.frame.loc.x - BLUR_PAD_X).max(0);
-    let top = (frame.frame.loc.y - BLUR_PAD_Y).max(0);
-    let right = (frame.frame.loc.x + titlebar_w + BLUR_PAD_X).min(output_size.w);
-    let bottom = (frame.frame.loc.y + titlebar_h + BLUR_PAD_Y).min(output_size.h);
+    let dst_left = frame.frame.loc.x.max(0).min(output_size.w);
+    let dst_top = frame.frame.loc.y.max(0).min(output_size.h);
+    let dst_right = (frame.frame.loc.x + titlebar_w).max(0).min(output_size.w);
+    let dst_bottom = (frame.frame.loc.y + titlebar_h).max(0).min(output_size.h);
+    let dst_w = dst_right - dst_left;
+    let dst_h = dst_bottom - dst_top;
+    if dst_w <= 0 || dst_h <= 0 {
+        return None;
+    }
 
-    let capture_w = (right - left).max(1);
-    let capture_h = (bottom - top).max(1);
+    let left = (dst_left - BLUR_PAD_X).max(0);
+    let top = (dst_top - BLUR_PAD_Y).max(0);
+    let right = (dst_right + BLUR_PAD_X).min(output_size.w);
+    let bottom = (dst_bottom + BLUR_PAD_Y).min(output_size.h);
+
+    let capture_w = right - left;
+    let capture_h = bottom - top;
     if capture_w <= 0 || capture_h <= 0 {
         return None;
     }
 
+    let (capture_y_gl, flip_y) = match origin {
+        BlurOrigin::BottomLeft => (output_size.h - bottom, true),
+        BlurOrigin::TopLeft => (top, false),
+    };
+
     Some(BlurCapture {
+        dst_loc: Point::from((dst_left, dst_top)),
+        dst_w,
+        dst_h,
         loc: Point::from((left, top)),
         capture_x: left,
-        capture_y_gl: output_size.h - bottom,
+        capture_y_gl,
         capture_w,
         capture_h,
-        src_x: frame.frame.loc.x - left,
-        src_y: frame.frame.loc.y - top,
+        src_x: dst_left - left,
+        src_y: dst_top - top,
+        flip_y,
     })
 }
 
@@ -1201,6 +1260,7 @@ fn titlebar_shader_uniforms(
     texture_h: i32,
     src_x: i32,
     src_y: i32,
+    flip_y: bool,
 ) -> Vec<Uniform<'static>> {
     vec![
         Uniform::new("area_size", (width as f32, height as f32)),
@@ -1223,10 +1283,16 @@ fn titlebar_shader_uniforms(
                 height.max(1) as f32 / texture_h.max(1) as f32,
             ),
         ),
+        Uniform::new("flip_y", if flip_y { 1.0 } else { 0.0 }),
     ]
 }
 
-// Overlay with the titlebar tint, text, icon, and close button.
+fn round_blur_texture_extent(value: i32) -> i32 {
+    const STEP: i32 = 256;
+    ((value.max(1) + STEP - 1) / STEP) * STEP
+}
+
+// Overlay with the titlebar tint, text, icon, and SSD buttons.
 fn overlay_buffer(
     frame: &WindowFrame,
     title_font: Option<&Font<'static>>,
@@ -1245,9 +1311,9 @@ fn overlay_buffer(
     };
 
     if let Some(font) = title_font {
-        let close_left = frame.close_button.loc.x - frame.frame.loc.x;
+        let minimize_left = frame.minimize_button.loc.x - frame.frame.loc.x;
         let content_left = TITLE_PADDING;
-        let content_right = (close_left - BUTTON_PADDING).max(content_left);
+        let content_right = (minimize_left - BUTTON_PADDING).max(content_left);
         let text_width = measure_text_width(font, title, TITLE_FONT_SIZE);
         let icon_width = app_icon.map(|_| ICON_SIZE as i32).unwrap_or(0);
         let group_width = text_width
@@ -1282,6 +1348,26 @@ fn overlay_buffer(
             (content_right - text_x).max(0),
         );
     }
+
+    let minimize_button = Rectangle::new(
+        (
+            frame.minimize_button.loc.x - frame.frame.loc.x,
+            frame.minimize_button.loc.y - frame.frame.loc.y,
+        )
+            .into(),
+        frame.minimize_button.size,
+    );
+    draw_minimize_button(&mut image, minimize_button, CLOSE_COLOR);
+
+    let maximize_button = Rectangle::new(
+        (
+            frame.maximize_button.loc.x - frame.frame.loc.x,
+            frame.maximize_button.loc.y - frame.frame.loc.y,
+        )
+            .into(),
+        frame.maximize_button.size,
+    );
+    draw_maximize_button(&mut image, maximize_button, CLOSE_COLOR, frame.maximized);
 
     let close_button = Rectangle::new(
         (
@@ -1464,6 +1550,60 @@ fn inside_rounded_rect(
     let dy = py - center_y;
 
     dx * dx + dy * dy <= radius * radius
+}
+
+fn draw_minimize_button(image: &mut RgbaImage, rect: Rectangle<i32, Logical>, color: Rgba<u8>) {
+    let y = rect.loc.y + rect.size.h - 5;
+    let left = rect.loc.x + 4;
+    let right = rect.loc.x + rect.size.w - 4;
+
+    for py in (y - 1).max(0)..(y + 2).min(image.height() as i32) {
+        for px in left.max(0)..right.min(image.width() as i32) {
+            blend_pixel(image, px as u32, py as u32, color, 1.0);
+        }
+    }
+}
+
+fn draw_maximize_button(
+    image: &mut RgbaImage,
+    rect: Rectangle<i32, Logical>,
+    color: Rgba<u8>,
+    restore: bool,
+) {
+    if restore {
+        let back = Rectangle::new(
+            (rect.loc.x + 6, rect.loc.y + 4).into(),
+            (rect.size.w - 8, rect.size.h - 8).into(),
+        );
+        draw_outline_rect(image, back, color);
+        let front = Rectangle::new(
+            (rect.loc.x + 3, rect.loc.y + 7).into(),
+            (rect.size.w - 8, rect.size.h - 8).into(),
+        );
+        draw_outline_rect(image, front, color);
+    } else {
+        let outline = Rectangle::new(
+            (rect.loc.x + 4, rect.loc.y + 4).into(),
+            (rect.size.w - 8, rect.size.h - 8).into(),
+        );
+        draw_outline_rect(image, outline, color);
+    }
+}
+
+fn draw_outline_rect(image: &mut RgbaImage, rect: Rectangle<i32, Logical>, color: Rgba<u8>) {
+    let left = rect.loc.x.max(0);
+    let top = rect.loc.y.max(0);
+    let right = (rect.loc.x + rect.size.w).min(image.width() as i32);
+    let bottom = (rect.loc.y + rect.size.h).min(image.height() as i32);
+
+    for y in top..bottom {
+        for x in left..right {
+            let is_edge = x <= left + 1 || x >= right - 2 || y <= top + 1 || y >= bottom - 2;
+            if is_edge {
+                blend_pixel(image, x as u32, y as u32, color, 1.0);
+            }
+        }
+    }
 }
 
 fn draw_close_button(image: &mut RgbaImage, rect: Rectangle<i32, Logical>, color: Rgba<u8>) {

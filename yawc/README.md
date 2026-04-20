@@ -22,8 +22,10 @@ The current codebase focuses on building a real, clean, extensible compositor co
 - `xdg-decoration` handling with server-side decorations
 - explicit window tracking with title and `app_id` metadata
 - focus, raise-on-click, and active window state
-- move and resize grabs
-- close button handling
+- move, resize, maximize, minimize, and fullscreen state handling
+- close, minimize, and maximize SSD button handling
+- live-reloaded configurable compositor hotkeys
+- default window hotkeys: `Super+Up`, `Super+Left`, `Super+Right`, `Ctrl+Alt+F`, `Ctrl+Alt+M`
 - keyboard, pointer, and scroll input routing
 - seat and data-device skeleton
 - single-output nested compositor backend via `winit`
@@ -45,14 +47,14 @@ The repository is intentionally modular so the compositor can grow into a full s
 - `src/state.rs`
   Global compositor state, Wayland socket setup, seat creation, popup manager, and Smithay protocol state.
 - `src/window.rs`
-  Window tracking, frame geometry, hit testing, and decoration interaction regions.
+  Window tracking, fullscreen/maximize/minimize geometry, frame geometry, hit testing, and decoration interaction regions.
 
 ### Protocol and Shell
 
 - `src/shell/compositor.rs`
   Surface commit handling, SHM integration, and resize commit coordination.
 - `src/shell/xdg.rs`
-  Toplevels, popups, metadata updates, popup unconstraining, move/resize requests.
+  Toplevels, popups, metadata updates, popup unconstraining, move/resize/maximize/minimize/fullscreen requests.
 - `src/shell/decoration.rs`
   `xdg-decoration` policy.
 - `src/shell/seat.rs`
@@ -62,6 +64,8 @@ The repository is intentionally modular so the compositor can grow into a full s
 
 - `src/input.rs`
   Keyboard/pointer input dispatch, focus changes, pointer cursor updates, decoration clicks.
+- `src/config.rs`
+  Live-reloaded compositor config and hotkey parsing.
 - `src/grabs/`
   Dedicated move and resize grab implementations.
 - `src/render.rs`
@@ -216,6 +220,30 @@ cd /home/serio/etyOS/yawc
 
 This rebuilds and replaces the installed session binary without stopping the currently running process.
 Then press `Ctrl+Alt+Backspace` or `Ctrl+Alt+Esc` to return to the login screen and choose `YAWC` again.
+
+## Configuration
+
+YAWC creates a config file on startup if one does not already exist:
+
+```text
+~/.config/yawc/config
+```
+
+Hotkeys are reloaded automatically when keyboard input is handled, so after editing the file the next key press uses the new bindings without logging out or restarting YAWC.
+
+Default config:
+
+```text
+maximize = Super+Up
+snap_left = Super+Left
+snap_right = Super+Right
+fullscreen = Ctrl+Alt+F
+minimize = Ctrl+Alt+M
+```
+
+Pressing the same snap binding again restores the window to the position and size it had before snapping.
+
+Supported modifiers are `Super`, `Ctrl`, `Alt`, and `Shift`. Supported keys are currently `Up`, `Down`, `Left`, `Right`, `F`, and `M`. Set a binding to `none` to disable it.
 
 Useful session overrides:
 

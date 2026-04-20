@@ -1,4 +1,5 @@
 mod backend;
+mod config;
 mod cursor;
 mod grabs;
 mod input;

@@ -1,7 +1,7 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     input::{
         keyboard::FilterResult,
@@ -12,12 +12,14 @@ use smithay::{
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Rectangle, SERIAL_COUNTER},
 };
+use tracing::debug;
 
 use crate::{
+    config::HotkeyAction,
     cursor::CursorShape,
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
     state::Yawc,
-    window::{DecorationAction, ResizeEdge},
+    window::{DecorationAction, ResizeEdge, SnapSide},
 };
 
 fn edges_to_cursor(edges: ResizeEdge) -> CursorShape {
@@ -42,7 +44,20 @@ fn cursor_for_decoration_hit(hit: Option<crate::window::DecorationHit>) -> Curso
     match hit.map(|hit| hit.action) {
         Some(DecorationAction::Resize(edges)) => edges_to_cursor(edges),
         Some(DecorationAction::Move) => CursorShape::Move,
-        Some(DecorationAction::Close) | None => CursorShape::Default,
+        Some(DecorationAction::Minimize)
+        | Some(DecorationAction::ToggleMaximize)
+        | Some(DecorationAction::Close)
+        | None => CursorShape::Default,
+    }
+}
+
+fn decoration_action_name(action: DecorationAction) -> &'static str {
+    match action {
+        DecorationAction::Move => "move",
+        DecorationAction::Resize(_) => "resize",
+        DecorationAction::Close => "close",
+        DecorationAction::Minimize => "minimize",
+        DecorationAction::ToggleMaximize => "toggle_maximize",
     }
 }
 
@@ -52,6 +67,7 @@ impl Yawc {
             InputEvent::Keyboard { event, .. } => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = Event::time_msec(&event);
+                let pressed = event.state() == KeyState::Pressed;
 
                 self.seat.get_keyboard().unwrap().input::<(), _>(
                     self,
@@ -59,7 +75,43 @@ impl Yawc {
                     event.state(),
                     serial,
                     time,
-                    |_, _, _| FilterResult::Forward,
+                    |state, modifiers, keysym| {
+                        if !pressed {
+                            return FilterResult::Forward;
+                        }
+
+                        let Some(key) = keysym
+                            .raw_latin_sym_or_raw_current_sym()
+                            .map(|sym| sym.raw())
+                        else {
+                            return FilterResult::Forward;
+                        };
+
+                        state.config.reload_if_changed();
+                        match state.config.hotkey_action(key, *modifiers) {
+                            Some(HotkeyAction::ToggleMaximize) => {
+                                state.toggle_active_window_maximized();
+                                FilterResult::Intercept(())
+                            }
+                            Some(HotkeyAction::SnapLeft) => {
+                                state.snap_active_window(SnapSide::Left);
+                                FilterResult::Intercept(())
+                            }
+                            Some(HotkeyAction::SnapRight) => {
+                                state.snap_active_window(SnapSide::Right);
+                                FilterResult::Intercept(())
+                            }
+                            Some(HotkeyAction::ToggleFullscreen) => {
+                                state.toggle_active_window_fullscreen();
+                                FilterResult::Intercept(())
+                            }
+                            Some(HotkeyAction::ToggleMinimize) => {
+                                state.toggle_active_window_minimized();
+                                FilterResult::Intercept(())
+                            }
+                            None => FilterResult::Forward,
+                        }
+                    },
                 );
             }
             InputEvent::PointerMotion { event, .. } => {
@@ -150,6 +202,10 @@ impl Yawc {
                         .windows
                         .decoration_hit_at(&self.space, pointer.current_location())
                     {
+                        debug!(
+                            action = decoration_action_name(hit.action),
+                            "decoration pointer press"
+                        );
                         let surface = hit.window.toplevel().unwrap().wl_surface().clone();
                         self.space.raise_element(&hit.window, true);
                         self.windows.activate(&surface);
@@ -166,6 +222,9 @@ impl Yawc {
 
                         match hit.action {
                             crate::window::DecorationAction::Move => {
+                                if let Some(toplevel) = hit.window.toplevel() {
+                                    self.windows.clear_snap(toplevel.wl_surface());
+                                }
                                 let start_data = PointerGrabStartData {
                                     focus: None,
                                     button,
@@ -191,6 +250,10 @@ impl Yawc {
                                     button,
                                     location: pointer.current_location(),
                                 };
+                                if let Some(toplevel) = hit.window.toplevel() {
+                                    self.windows.clear_snap(toplevel.wl_surface());
+                                    self.windows.set_resizing(toplevel.wl_surface(), true);
+                                }
                                 let initial_window_location =
                                     self.space.element_location(&hit.window).unwrap();
                                 let initial_window_size = hit.window.geometry().size;
@@ -204,6 +267,12 @@ impl Yawc {
                             }
                             crate::window::DecorationAction::Close => {
                                 hit.window.toplevel().unwrap().send_close();
+                            }
+                            crate::window::DecorationAction::Minimize => {
+                                self.set_window_minimized(&hit.window);
+                            }
+                            crate::window::DecorationAction::ToggleMaximize => {
+                                self.toggle_window_maximized(&hit.window);
                             }
                         }
 

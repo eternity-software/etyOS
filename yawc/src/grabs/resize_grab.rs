@@ -134,6 +134,7 @@ impl PointerGrab<Yawc> for ResizeSurfaceGrab {
             handle.unset_grab(self, data, event.serial, event.time, true);
 
             let xdg = self.window.toplevel().unwrap();
+            data.windows.set_resizing(xdg.wl_surface(), false);
             xdg.with_pending_state(|state| {
                 state.states.unset(xdg_toplevel::State::Resizing);
                 state.size = Some(self.last_window_size);
@@ -238,7 +239,11 @@ impl PointerGrab<Yawc> for ResizeSurfaceGrab {
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut Yawc) {}
+    fn unset(&mut self, data: &mut Yawc) {
+        if let Some(xdg) = self.window.toplevel() {
+            data.windows.set_resizing(xdg.wl_surface(), false);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]

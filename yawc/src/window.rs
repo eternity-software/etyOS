@@ -9,10 +9,13 @@ use smithay::{
 use crate::shell::xdg::WindowMetadata;
 
 pub const TITLEBAR_HEIGHT: i32 = 40;
-pub const RESIZE_HITBOX: i32 = 16;
-pub const CSD_RESIZE_HITBOX: i32 = 8;
+pub const RESIZE_HITBOX: i32 = 6;
+pub const TOP_RESIZE_HITBOX: i32 = 10;
+pub const CSD_RESIZE_HITBOX: i32 = 4;
+pub const CSD_TOP_RESIZE_HITBOX: i32 = 8;
 pub const BUTTON_SIZE: i32 = 18;
 pub const BUTTON_PADDING: i32 = 12;
+const BUTTON_STEP: i32 = BUTTON_SIZE + BUTTON_PADDING;
 #[cfg_attr(not(feature = "winit-backend"), allow(dead_code))]
 pub const FRAME_RADIUS: i32 = 18;
 
@@ -44,6 +47,15 @@ pub struct TrackedWindow {
     pub app_id: Option<String>,
     pub server_decoration: bool,
     pub decoration_negotiated: bool,
+    pub maximized: bool,
+    pub maximized_server_decoration: Option<bool>,
+    pub minimized: bool,
+    pub fullscreen: bool,
+    pub resizing: bool,
+    pub restore_rect: Option<Rectangle<i32, Logical>>,
+    pub minimized_rect: Option<Rectangle<i32, Logical>>,
+    pub snap_side: Option<SnapSide>,
+    pub snap_restore_rect: Option<Rectangle<i32, Logical>>,
 }
 
 #[derive(Clone)]
@@ -51,8 +63,13 @@ pub struct WindowFrame {
     pub window: Window,
     pub frame: Rectangle<i32, Logical>,
     pub header: Rectangle<i32, Logical>,
+    pub minimize_button: Rectangle<i32, Logical>,
+    pub maximize_button: Rectangle<i32, Logical>,
     pub close_button: Rectangle<i32, Logical>,
     pub active: bool,
+    pub maximized: bool,
+    pub fullscreen: bool,
+    pub resizing: bool,
     pub title: String,
     pub app_id: Option<String>,
 }
@@ -67,7 +84,15 @@ pub struct DecorationHit {
 pub enum DecorationAction {
     Move,
     Resize(ResizeEdge),
+    Minimize,
+    ToggleMaximize,
     Close,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapSide {
+    Left,
+    Right,
 }
 
 #[derive(Default)]
@@ -87,6 +112,15 @@ impl WindowStore {
             app_id: None,
             server_decoration: true,
             decoration_negotiated: false,
+            maximized: false,
+            maximized_server_decoration: None,
+            minimized: false,
+            fullscreen: false,
+            resizing: false,
+            restore_rect: None,
+            minimized_rect: None,
+            snap_side: None,
+            snap_restore_rect: None,
         });
 
         location
@@ -114,6 +148,21 @@ impl WindowStore {
             tracked.active = false;
             tracked.window.set_activated(false);
         }
+    }
+
+    pub fn active_window(&self) -> Option<Window> {
+        self.windows
+            .iter()
+            .find(|tracked| tracked.active)
+            .map(|tracked| tracked.window.clone())
+    }
+
+    pub fn last_minimized_window(&self) -> Option<Window> {
+        self.windows
+            .iter()
+            .rev()
+            .find(|tracked| tracked.minimized)
+            .map(|tracked| tracked.window.clone())
     }
 
     pub fn prune_dead(&mut self) {
@@ -145,6 +194,130 @@ impl WindowStore {
         }
     }
 
+    pub fn set_fullscreen(
+        &mut self,
+        surface: &WlSurface,
+        fullscreen: bool,
+        restore_rect: Option<Rectangle<i32, Logical>>,
+    ) {
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.fullscreen = fullscreen;
+            if fullscreen {
+                tracked.maximized = false;
+                tracked.snap_side = None;
+                tracked.snap_restore_rect = None;
+            }
+            tracked.restore_rect = fullscreen.then(|| restore_rect).flatten();
+        }
+    }
+
+    pub fn set_maximized(
+        &mut self,
+        surface: &WlSurface,
+        maximized: bool,
+        restore_rect: Option<Rectangle<i32, Logical>>,
+        server_decoration: Option<bool>,
+    ) {
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.maximized = maximized;
+            tracked.maximized_server_decoration = maximized.then_some(server_decoration).flatten();
+            if maximized {
+                tracked.fullscreen = false;
+                tracked.snap_side = None;
+                tracked.snap_restore_rect = None;
+            }
+            tracked.restore_rect = maximized.then(|| restore_rect).flatten();
+        }
+    }
+
+    pub fn is_maximized(&self, surface: &WlSurface) -> bool {
+        self.find(surface)
+            .map(|tracked| tracked.maximized)
+            .unwrap_or(false)
+    }
+
+    pub fn set_minimized(
+        &mut self,
+        surface: &WlSurface,
+        minimized: bool,
+        restore_rect: Option<Rectangle<i32, Logical>>,
+    ) {
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.minimized = minimized;
+            if minimized {
+                tracked.active = false;
+                tracked.window.set_activated(false);
+            }
+            if let Some(restore_rect) = restore_rect {
+                tracked.minimized_rect = Some(restore_rect);
+            }
+            if !minimized {
+                tracked.minimized_rect = None;
+            }
+        }
+    }
+
+    pub fn set_resizing(&mut self, surface: &WlSurface, resizing: bool) {
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.resizing = resizing;
+        }
+    }
+
+    pub fn is_fullscreen(&self, surface: &WlSurface) -> bool {
+        self.find(surface)
+            .map(|tracked| tracked.fullscreen)
+            .unwrap_or(false)
+    }
+
+    pub fn restore_rect(&self, surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
+        self.find(surface).and_then(|tracked| tracked.restore_rect)
+    }
+
+    pub fn snap_side(&self, surface: &WlSurface) -> Option<SnapSide> {
+        self.find(surface).and_then(|tracked| tracked.snap_side)
+    }
+
+    pub fn snap_restore_rect(&self, surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
+        self.find(surface)
+            .and_then(|tracked| tracked.snap_restore_rect)
+    }
+
+    pub fn set_snap(
+        &mut self,
+        surface: &WlSurface,
+        side: SnapSide,
+        restore_rect: Option<Rectangle<i32, Logical>>,
+    ) {
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.snap_side = Some(side);
+            if tracked.snap_restore_rect.is_none() {
+                tracked.snap_restore_rect = restore_rect;
+            }
+            tracked.maximized = false;
+            tracked.maximized_server_decoration = None;
+            tracked.fullscreen = false;
+            tracked.restore_rect = None;
+        }
+    }
+
+    pub fn clear_snap(&mut self, surface: &WlSurface) {
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.snap_side = None;
+            tracked.snap_restore_rect = None;
+        }
+    }
+
+    pub fn minimized_rect(&self, surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
+        self.find(surface)
+            .and_then(|tracked| tracked.minimized_rect)
+    }
+
+    pub fn uses_server_decoration(&self, surface: &WlSurface) -> bool {
+        self.find(surface)
+            .map(uses_server_decoration)
+            .unwrap_or(true)
+    }
+
     pub fn frames(&self, space: &Space<Window>) -> Vec<WindowFrame> {
         let mut frames = Vec::new();
 
@@ -158,18 +331,26 @@ impl WindowStore {
             let Some(tracked) = self.find(&surface) else {
                 continue;
             };
+            if tracked.fullscreen || tracked.minimized {
+                continue;
+            }
             if !uses_server_decoration(tracked) {
                 continue;
             }
-            let Some(content_geometry) = space.element_geometry(window) else {
+            let Some(content_geometry) = server_content_geometry(space, window) else {
                 continue;
             };
             frames.push(WindowFrame {
                 window: window.clone(),
                 frame: frame_geometry(content_geometry),
                 header: header_geometry(content_geometry),
+                minimize_button: minimize_button_geometry(content_geometry),
+                maximize_button: maximize_button_geometry(content_geometry),
                 close_button: close_button_geometry(content_geometry),
                 active: tracked.active,
+                maximized: tracked.maximized,
+                fullscreen: tracked.fullscreen,
+                resizing: tracked.resizing,
                 title: tracked.title.clone(),
                 app_id: tracked.app_id.clone(),
             });
@@ -193,51 +374,87 @@ impl WindowStore {
             let Some(tracked) = self.find(&surface) else {
                 continue;
             };
-
-            let uses_server = uses_server_decoration(tracked);
-            let visual_rect = if uses_server {
-                let Some(content_geometry) = space.element_geometry(window) else {
-                    continue;
-                };
-                frame_geometry(content_geometry)
-            } else {
-                let Some(location) = space.element_location(window) else {
-                    continue;
-                };
-                Rectangle::new(location, window.geometry().size)
-            };
-
-            let resize_hitbox = if uses_server {
-                RESIZE_HITBOX
-            } else {
-                CSD_RESIZE_HITBOX
-            };
-
-            if let Some(edges) = resize_edge_for(visual_rect, position, resize_hitbox)
-                .and_then(|edges| allowed_resize_edges(&tracked.window, edges))
-            {
-                return Some(DecorationHit {
-                    window: tracked.window.clone(),
-                    action: DecorationAction::Resize(edges),
-                });
+            if tracked.minimized {
+                continue;
             }
 
-            if !uses_server {
-                if contains(visual_rect, position) {
+            if tracked.fullscreen {
+                let Some(rect) = window_rect(space, window) else {
+                    continue;
+                };
+                if contains(rect, position) {
                     return None;
                 }
                 continue;
             }
 
-            let Some(content_geometry) = space.element_geometry(window) else {
+            let uses_server = uses_server_decoration(tracked);
+            let visual_rect = if uses_server {
+                let Some(content_geometry) = server_content_geometry(space, window) else {
+                    continue;
+                };
+                frame_geometry(content_geometry)
+            } else {
+                let Some(rect) = window_rect(space, window) else {
+                    continue;
+                };
+                rect
+            };
+
+            let (resize_hitbox, top_resize_hitbox) = if uses_server {
+                (RESIZE_HITBOX, TOP_RESIZE_HITBOX)
+            } else {
+                (CSD_RESIZE_HITBOX, CSD_TOP_RESIZE_HITBOX)
+            };
+
+            if !uses_server {
+                if contains(visual_rect, position) {
+                    // Let smart client-side-decorated apps, such as Firefox,
+                    // receive their own border press and issue xdg_toplevel.resize.
+                    return None;
+                }
+
+                if !tracked.maximized {
+                    if let Some(edges) =
+                        resize_edge_for(visual_rect, position, resize_hitbox, top_resize_hitbox)
+                            .and_then(|edges| allowed_resize_edges(&tracked.window, edges))
+                    {
+                        return Some(DecorationHit {
+                            window: tracked.window.clone(),
+                            action: DecorationAction::Resize(edges),
+                        });
+                    }
+                }
+
+                continue;
+            }
+
+            if !tracked.maximized {
+                if let Some(edges) =
+                    resize_edge_for(visual_rect, position, resize_hitbox, top_resize_hitbox)
+                        .and_then(|edges| allowed_resize_edges(&tracked.window, edges))
+                {
+                    return Some(DecorationHit {
+                        window: tracked.window.clone(),
+                        action: DecorationAction::Resize(edges),
+                    });
+                }
+            }
+
+            let Some(content_geometry) = server_content_geometry(space, window) else {
                 continue;
             };
             let frame = WindowFrame {
                 window: window.clone(),
                 frame: frame_geometry(content_geometry),
                 header: header_geometry(content_geometry),
+                minimize_button: minimize_button_geometry(content_geometry),
+                maximize_button: maximize_button_geometry(content_geometry),
                 close_button: close_button_geometry(content_geometry),
                 active: tracked.active,
+                maximized: tracked.maximized,
+                fullscreen: tracked.fullscreen,
+                resizing: tracked.resizing,
                 title: tracked.title.clone(),
                 app_id: tracked.app_id.clone(),
             };
@@ -253,7 +470,21 @@ impl WindowStore {
                 });
             }
 
-            if contains(frame.header, position) {
+            if contains(frame.maximize_button, position) {
+                return Some(DecorationHit {
+                    window: tracked.window.clone(),
+                    action: DecorationAction::ToggleMaximize,
+                });
+            }
+
+            if contains(frame.minimize_button, position) {
+                return Some(DecorationHit {
+                    window: tracked.window.clone(),
+                    action: DecorationAction::Minimize,
+                });
+            }
+
+            if !tracked.maximized && contains(frame.header, position) {
                 return Some(DecorationHit {
                     window: tracked.window.clone(),
                     action: DecorationAction::Move,
@@ -290,6 +521,12 @@ fn same_surface(tracked: &TrackedWindow, surface: &WlSurface) -> bool {
 }
 
 fn uses_server_decoration(tracked: &TrackedWindow) -> bool {
+    if tracked.maximized {
+        if let Some(server_decoration) = tracked.maximized_server_decoration {
+            return server_decoration;
+        }
+    }
+
     if tracked.decoration_negotiated {
         return tracked.server_decoration;
     }
@@ -364,6 +601,35 @@ fn close_button_geometry(content_geometry: Rectangle<i32, Logical>) -> Rectangle
     )
 }
 
+fn button_left_of(rect: Rectangle<i32, Logical>, steps: i32) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (rect.loc.x - BUTTON_STEP * steps, rect.loc.y).into(),
+        rect.size,
+    )
+}
+
+fn minimize_button_geometry(content_geometry: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    button_left_of(close_button_geometry(content_geometry), 2)
+}
+
+fn maximize_button_geometry(content_geometry: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    button_left_of(close_button_geometry(content_geometry), 1)
+}
+
+fn server_content_geometry(
+    space: &Space<Window>,
+    window: &Window,
+) -> Option<Rectangle<i32, Logical>> {
+    let location = space.element_location(window)?;
+    Some(Rectangle::new(location, window.geometry().size))
+}
+
+fn window_rect(space: &Space<Window>, window: &Window) -> Option<Rectangle<i32, Logical>> {
+    let location = space.element_location(window)?;
+    let bbox = window.bbox();
+    Some(Rectangle::new(location + bbox.loc, bbox.size))
+}
+
 fn contains(rect: Rectangle<i32, Logical>, position: Point<f64, Logical>) -> bool {
     position.x >= rect.loc.x as f64
         && position.x < (rect.loc.x + rect.size.w) as f64
@@ -375,12 +641,13 @@ fn resize_edge_for(
     frame: Rectangle<i32, Logical>,
     position: Point<f64, Logical>,
     hitbox_size: i32,
+    top_hitbox_size: i32,
 ) -> Option<ResizeEdge> {
     let hitbox = Rectangle::new(
-        (frame.loc.x - hitbox_size, frame.loc.y - hitbox_size).into(),
+        (frame.loc.x - hitbox_size, frame.loc.y - top_hitbox_size).into(),
         (
             frame.size.w + hitbox_size * 2,
-            frame.size.h + hitbox_size * 2,
+            frame.size.h + top_hitbox_size + hitbox_size,
         )
             .into(),
     );
