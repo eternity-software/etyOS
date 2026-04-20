@@ -16,7 +16,7 @@ use smithay::{
             Display, DisplayHandle,
         },
     },
-    utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
+    utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         cursor_shape::CursorShapeManagerState,
@@ -164,6 +164,124 @@ impl Yawc {
         });
     }
 
+    pub(crate) fn initial_window_location(&self, window: &Window) -> Point<i32, Logical> {
+        let Some(surface) = window
+            .toplevel()
+            .map(|toplevel| toplevel.wl_surface().clone())
+        else {
+            return Point::from((48, 48));
+        };
+        let uses_server_decoration = self.windows.uses_server_decoration(&surface);
+        let content_size = non_empty_size(window.geometry().size, default_initial_window_size());
+
+        self.centered_content_location(content_size, uses_server_decoration)
+            .unwrap_or_else(|| Point::from((48, 48)))
+    }
+
+    pub(crate) fn position_new_window_if_needed(&mut self, window: &Window, surface: &WlSurface) {
+        if !self.windows.needs_initial_position(surface) {
+            return;
+        }
+
+        let content_size = non_empty_size(window.geometry().size, window.bbox().size);
+        if content_size.w <= 0 || content_size.h <= 0 {
+            return;
+        }
+
+        let uses_server_decoration = self.windows.uses_server_decoration(surface);
+        let location = self
+            .centered_content_location(content_size, uses_server_decoration)
+            .unwrap_or_else(|| Point::from((48, 48)));
+
+        self.space.map_element(window.clone(), location, false);
+        self.windows.mark_initial_positioned(surface);
+        info!(
+            x = location.x,
+            y = location.y,
+            width = content_size.w,
+            height = content_size.h,
+            "centered new window"
+        );
+    }
+
+    fn centered_content_location(
+        &self,
+        content_size: Size<i32, Logical>,
+        uses_server_decoration: bool,
+    ) -> Option<Point<i32, Logical>> {
+        let output_geometry = self.output_geometry_for(None)?;
+        let titlebar_height = if uses_server_decoration {
+            crate::window::TITLEBAR_HEIGHT
+        } else {
+            0
+        };
+        let visual_width = content_size.w.max(1);
+        let visual_height = (content_size.h + titlebar_height).max(1);
+        let visual_x = output_geometry.loc.x + ((output_geometry.size.w - visual_width).max(0) / 2);
+        let visual_y =
+            output_geometry.loc.y + ((output_geometry.size.h - visual_height).max(0) / 2);
+
+        Some(Point::from((visual_x, visual_y + titlebar_height)))
+    }
+
+    fn window_visual_rect(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        let location = self.space.element_location(window)?;
+        let surface = window
+            .toplevel()
+            .map(|toplevel| toplevel.wl_surface().clone())?;
+
+        if self.windows.uses_server_decoration(&surface) && !self.windows.is_fullscreen(&surface) {
+            let content_size = non_empty_size(window.geometry().size, window.bbox().size);
+            return Some(Rectangle::new(
+                (location.x, location.y - crate::window::TITLEBAR_HEIGHT).into(),
+                (
+                    content_size.w.max(1),
+                    (content_size.h + crate::window::TITLEBAR_HEIGHT).max(1),
+                )
+                    .into(),
+            ));
+        }
+
+        let bbox = window.bbox();
+        Some(Rectangle::new(location + bbox.loc, bbox.size))
+    }
+
+    fn visual_rect_from_content(
+        content_rect: Rectangle<i32, Logical>,
+        uses_server_decoration: bool,
+    ) -> Rectangle<i32, Logical> {
+        if !uses_server_decoration {
+            return content_rect;
+        }
+
+        Rectangle::new(
+            (
+                content_rect.loc.x,
+                content_rect.loc.y - crate::window::TITLEBAR_HEIGHT,
+            )
+                .into(),
+            (
+                content_rect.size.w,
+                content_rect.size.h + crate::window::TITLEBAR_HEIGHT,
+            )
+                .into(),
+        )
+    }
+
+    fn content_location_from_visual(
+        visual_rect: Rectangle<i32, Logical>,
+        uses_server_decoration: bool,
+    ) -> Point<i32, Logical> {
+        if uses_server_decoration {
+            Point::from((
+                visual_rect.loc.x,
+                visual_rect.loc.y + crate::window::TITLEBAR_HEIGHT,
+            ))
+        } else {
+            visual_rect.loc
+        }
+    }
+
     pub fn prune_windows(&mut self) {
         self.windows.prune_dead();
     }
@@ -242,6 +360,12 @@ impl Yawc {
                 .unwrap_or_else(|| Rectangle::from_size(window.geometry().size));
 
             self.windows.clear_snap(&surface);
+            if let Some(from_rect) = self.window_visual_rect(window) {
+                let uses_server_decoration = self.windows.uses_server_decoration(&surface);
+                let to_rect = Self::visual_rect_from_content(restore_rect, uses_server_decoration);
+                self.windows
+                    .start_geometry_animation(&surface, from_rect, to_rect);
+            }
             self.space.raise_element(window, true);
             self.space
                 .map_element(window.clone(), restore_rect.loc, false);
@@ -281,13 +405,22 @@ impl Yawc {
         };
         let content_width = (output_geometry.size.w / 2).max(1);
         let content_height = (output_geometry.size.h - titlebar_height).max(1);
-        let x = match side {
+        let visual_x = match side {
             SnapSide::Left => output_geometry.loc.x,
             SnapSide::Right => output_geometry.loc.x + output_geometry.size.w - content_width,
         };
-        let y = output_geometry.loc.y + titlebar_height;
-        let window_location = Point::from((x, y));
+        let target_visual_rect = Rectangle::new(
+            (visual_x, output_geometry.loc.y).into(),
+            (content_width, output_geometry.size.h).into(),
+        );
+        let window_location =
+            Self::content_location_from_visual(target_visual_rect, uses_server_decoration);
         let window_size = (content_width, content_height).into();
+
+        if let Some(from_rect) = self.window_visual_rect(window) {
+            self.windows
+                .start_geometry_animation(&surface, from_rect, target_visual_rect);
+        }
 
         self.windows.set_snap(&surface, side, restore_rect);
         self.space.raise_element(window, true);
@@ -344,6 +477,12 @@ impl Yawc {
                 (output_geometry.size.h - titlebar_height).max(1),
             )
                 .into();
+            let target_visual_rect = Rectangle::new(output_geometry.loc, output_geometry.size);
+
+            if let Some(from_rect) = self.window_visual_rect(window) {
+                self.windows
+                    .start_geometry_animation(&surface, from_rect, target_visual_rect);
+            }
 
             self.windows
                 .set_maximized(&surface, true, restore_rect, Some(uses_server_decoration));
@@ -387,6 +526,12 @@ impl Yawc {
                 })
                 .unwrap_or_else(|| Rectangle::from_size(window.geometry().size));
 
+            if let Some(from_rect) = self.window_visual_rect(window) {
+                let uses_server_decoration = self.windows.uses_server_decoration(&surface);
+                let to_rect = Self::visual_rect_from_content(restore_rect, uses_server_decoration);
+                self.windows
+                    .start_geometry_animation(&surface, from_rect, to_rect);
+            }
             self.windows.set_maximized(&surface, false, None, None);
             self.space
                 .map_element(window.clone(), restore_rect.loc, false);
@@ -541,6 +686,23 @@ impl Yawc {
         }
 
         self.space.outputs().next()
+    }
+}
+
+fn default_initial_window_size() -> Size<i32, Logical> {
+    (900, 640).into()
+}
+
+fn non_empty_size(
+    preferred: Size<i32, Logical>,
+    fallback: Size<i32, Logical>,
+) -> Size<i32, Logical> {
+    if preferred.w > 0 && preferred.h > 0 {
+        preferred
+    } else if fallback.w > 0 && fallback.h > 0 {
+        fallback
+    } else {
+        default_initial_window_size()
     }
 }
 

@@ -40,9 +40,10 @@ impl XdgShellHandler for Yawc {
         let metadata = read_toplevel_metadata(&surface);
         let window = Window::new_wayland_window(surface);
         let wl_surface = window.toplevel().unwrap().wl_surface().clone();
-        let location = self.windows.insert(window.clone());
+        self.windows.insert(window.clone());
         self.windows.set_metadata(&wl_surface, metadata.clone());
         self.windows.activate(&wl_surface);
+        let location = self.initial_window_location(&window);
 
         self.space.map_element(window, location, true);
         if let Some(keyboard) = self.seat.get_keyboard() {

@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use smithay::{
     desktop::{Space, Window},
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -6,7 +8,7 @@ use smithay::{
     wayland::{compositor, shell::xdg::SurfaceCachedState},
 };
 
-use crate::shell::xdg::WindowMetadata;
+use crate::{config::AnimationConfig, shell::xdg::WindowMetadata};
 
 pub const TITLEBAR_HEIGHT: i32 = 40;
 pub const RESIZE_HITBOX: i32 = 6;
@@ -18,6 +20,7 @@ pub const BUTTON_PADDING: i32 = 12;
 const BUTTON_STEP: i32 = BUTTON_SIZE + BUTTON_PADDING;
 #[cfg_attr(not(feature = "winit-backend"), allow(dead_code))]
 pub const FRAME_RADIUS: i32 = 18;
+const MAP_ANIMATION_START_SCALE: f64 = 0.94;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -56,6 +59,10 @@ pub struct TrackedWindow {
     pub minimized_rect: Option<Rectangle<i32, Logical>>,
     pub snap_side: Option<SnapSide>,
     pub snap_restore_rect: Option<Rectangle<i32, Logical>>,
+    pub mapped_at: Instant,
+    pub map_animation_started: bool,
+    pub geometry_animation: Option<GeometryAnimation>,
+    pub initial_positioned: bool,
 }
 
 #[derive(Clone)]
@@ -72,6 +79,7 @@ pub struct WindowFrame {
     pub resizing: bool,
     pub title: String,
     pub app_id: Option<String>,
+    pub animation: WindowAnimation,
 }
 
 #[derive(Clone)]
@@ -93,6 +101,37 @@ pub enum DecorationAction {
 pub enum SnapSide {
     Left,
     Right,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct WindowAnimation {
+    pub alpha: f32,
+    pub scale: f64,
+    pub geometry: Option<GeometryAnimationFrame>,
+}
+
+impl Default for WindowAnimation {
+    fn default() -> Self {
+        Self {
+            alpha: 1.0,
+            scale: 1.0,
+            geometry: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GeometryAnimationFrame {
+    pub from: Rectangle<i32, Logical>,
+    pub to: Rectangle<i32, Logical>,
+    pub progress: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GeometryAnimation {
+    pub from: Rectangle<i32, Logical>,
+    pub to: Rectangle<i32, Logical>,
+    pub started_at: Instant,
 }
 
 #[derive(Default)]
@@ -121,6 +160,10 @@ impl WindowStore {
             minimized_rect: None,
             snap_side: None,
             snap_restore_rect: None,
+            mapped_at: Instant::now(),
+            map_animation_started: false,
+            geometry_animation: None,
+            initial_positioned: false,
         });
 
         location
@@ -206,6 +249,7 @@ impl WindowStore {
                 tracked.maximized = false;
                 tracked.snap_side = None;
                 tracked.snap_restore_rect = None;
+                tracked.initial_positioned = true;
             }
             tracked.restore_rect = fullscreen.then(|| restore_rect).flatten();
         }
@@ -225,6 +269,7 @@ impl WindowStore {
                 tracked.fullscreen = false;
                 tracked.snap_side = None;
                 tracked.snap_restore_rect = None;
+                tracked.initial_positioned = true;
             }
             tracked.restore_rect = maximized.then(|| restore_rect).flatten();
         }
@@ -297,6 +342,7 @@ impl WindowStore {
             tracked.maximized_server_decoration = None;
             tracked.fullscreen = false;
             tracked.restore_rect = None;
+            tracked.initial_positioned = true;
         }
     }
 
@@ -318,7 +364,59 @@ impl WindowStore {
             .unwrap_or(true)
     }
 
-    pub fn frames(&self, space: &Space<Window>) -> Vec<WindowFrame> {
+    pub fn animation(&self, surface: &WlSurface, config: AnimationConfig) -> WindowAnimation {
+        self.find(surface)
+            .map(|tracked| animation_for_tracked(tracked, config))
+            .unwrap_or_default()
+    }
+
+    pub fn start_map_animation_if_needed(&mut self, surface: &WlSurface) {
+        if let Some(tracked) = self.find_mut(surface) {
+            if !tracked.map_animation_started {
+                tracked.mapped_at = Instant::now();
+                tracked.map_animation_started = true;
+            }
+        }
+    }
+
+    pub fn start_geometry_animation(
+        &mut self,
+        surface: &WlSurface,
+        from: Rectangle<i32, Logical>,
+        to: Rectangle<i32, Logical>,
+    ) {
+        if from == to {
+            return;
+        }
+
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.geometry_animation = Some(GeometryAnimation {
+                from,
+                to,
+                started_at: Instant::now(),
+            });
+        }
+    }
+
+    pub fn needs_initial_position(&self, surface: &WlSurface) -> bool {
+        self.find(surface)
+            .map(|tracked| {
+                !tracked.initial_positioned
+                    && !tracked.maximized
+                    && !tracked.fullscreen
+                    && tracked.snap_side.is_none()
+                    && !tracked.minimized
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn mark_initial_positioned(&mut self, surface: &WlSurface) {
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.initial_positioned = true;
+        }
+    }
+
+    pub fn frames(&self, space: &Space<Window>, config: AnimationConfig) -> Vec<WindowFrame> {
         let mut frames = Vec::new();
 
         for window in space.elements() {
@@ -353,6 +451,7 @@ impl WindowStore {
                 resizing: tracked.resizing,
                 title: tracked.title.clone(),
                 app_id: tracked.app_id.clone(),
+                animation: animation_for_tracked(tracked, config),
             });
         }
 
@@ -457,6 +556,7 @@ impl WindowStore {
                 resizing: tracked.resizing,
                 title: tracked.title.clone(),
                 app_id: tracked.app_id.clone(),
+                animation: WindowAnimation::default(),
             };
 
             if !contains(frame.frame, position) {
@@ -518,6 +618,54 @@ fn same_surface(tracked: &TrackedWindow, surface: &WlSurface) -> bool {
         .toplevel()
         .map(|toplevel| toplevel.wl_surface() == surface)
         .unwrap_or(false)
+}
+
+fn animation_for_tracked(tracked: &TrackedWindow, config: AnimationConfig) -> WindowAnimation {
+    if !config.enabled {
+        return WindowAnimation::default();
+    }
+
+    let mut animation = if tracked.map_animation_started {
+        animation_for_elapsed(tracked.mapped_at.elapsed(), config)
+    } else {
+        WindowAnimation::default()
+    };
+
+    animation.geometry = tracked.geometry_animation.and_then(|geometry| {
+        if config.geometry_ms == 0 {
+            return None;
+        }
+
+        let duration = Duration::from_millis(config.geometry_ms);
+        let t = geometry.started_at.elapsed().as_secs_f64() / duration.as_secs_f64();
+        (t < 1.0).then_some(GeometryAnimationFrame {
+            from: geometry.from,
+            to: geometry.to,
+            progress: ease_out_cubic(t.clamp(0.0, 1.0)),
+        })
+    });
+
+    animation
+}
+
+fn animation_for_elapsed(elapsed: Duration, config: AnimationConfig) -> WindowAnimation {
+    if config.popup_ms == 0 {
+        return WindowAnimation::default();
+    }
+
+    let duration = Duration::from_millis(config.popup_ms);
+    let t = (elapsed.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
+    let eased = ease_out_cubic(t);
+
+    WindowAnimation {
+        alpha: eased as f32,
+        scale: MAP_ANIMATION_START_SCALE + (1.0 - MAP_ANIMATION_START_SCALE) * eased,
+        geometry: None,
+    }
+}
+
+fn ease_out_cubic(t: f64) -> f64 {
+    1.0 - (1.0 - t).powi(3)
 }
 
 fn uses_server_decoration(tracked: &TrackedWindow) -> bool {

@@ -59,7 +59,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     render::{RenderState, YawcRenderElements},
-    window::WindowFrame,
+    window::{WindowFrame, WindowStore},
     CalloopData,
 };
 
@@ -221,12 +221,19 @@ impl TtyRuntime {
             .compositor_cursor
             .map(|shape| CursorImageStatus::Named(shape.to_cursor_icon()))
             .unwrap_or_else(|| data.state.cursor_image.clone());
-        let frames = data.state.windows.frames(&data.state.space);
+        data.state.config.reload_if_changed();
+        let animation_config = data.state.config.animations();
+        let frames = data
+            .state
+            .windows
+            .frames(&data.state.space, animation_config);
         let elements = render_elements(
             &mut renderer,
             &mut self.render_state,
             &data.state.space,
             &frames,
+            &data.state.windows,
+            animation_config,
             &self.background,
             &mut self.cursor_theme,
             &cursor_image,
@@ -607,6 +614,8 @@ fn render_elements<'a>(
     render_state: &mut RenderState,
     space: &Space<Window>,
     frames: &[WindowFrame],
+    windows: &WindowStore,
+    animation_config: crate::config::AnimationConfig,
     background: &SolidColorBuffer,
     cursor_theme: &mut TtyCursorTheme,
     cursor_image: &CursorImageStatus,
@@ -624,7 +633,13 @@ fn render_elements<'a>(
         );
     }
 
-    match render_state.tty_scene_elements(renderer.as_mut(), space, frames) {
+    match render_state.tty_scene_elements(
+        renderer.as_mut(),
+        space,
+        frames,
+        windows,
+        animation_config,
+    ) {
         Ok(scene) => elements.extend(
             scene
                 .into_iter()

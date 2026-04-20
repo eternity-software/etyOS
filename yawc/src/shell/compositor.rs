@@ -40,12 +40,19 @@ impl CompositorHandler for Yawc {
                 root = parent;
             }
 
-            if let Some(window) = self
+            let committed_window = self
                 .space
                 .elements()
                 .find(|window| window.toplevel().unwrap().wl_surface() == &root)
-            {
+                .cloned();
+
+            if let Some(window) = committed_window {
                 window.on_commit();
+                let bbox = window.bbox();
+                if bbox.size.w > 0 && bbox.size.h > 0 {
+                    self.position_new_window_if_needed(&window, &root);
+                    self.windows.start_map_animation_if_needed(&root);
+                }
             }
         }
 

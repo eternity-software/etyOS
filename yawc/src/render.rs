@@ -34,9 +34,11 @@ use smithay::{
 };
 use tracing::{info, warn};
 
+#[cfg(feature = "tty-udev")]
+use crate::window::WindowStore;
 use crate::{
     state::Yawc,
-    window::{WindowFrame, BUTTON_PADDING, FRAME_RADIUS, TITLEBAR_HEIGHT},
+    window::{WindowAnimation, WindowFrame, BUTTON_PADDING, FRAME_RADIUS, TITLEBAR_HEIGHT},
 };
 
 smithay::backend::renderer::element::render_elements! {
@@ -46,6 +48,7 @@ smithay::backend::renderer::element::render_elements! {
     TextureShader=TextureShaderElement,
     TitlebarBlur=TitlebarBlurElement,
     RoundedSurface=RoundedSurfaceElement,
+    AnimatedSurface=AnimatedSurfaceElement,
 }
 
 const FRAME_FILL_RGBA: [u8; 4] = [92, 96, 102, 150];
@@ -302,6 +305,8 @@ impl RenderState {
         renderer: &mut GlesRenderer,
         space: &Space<Window>,
         frames: &[WindowFrame],
+        windows: &WindowStore,
+        animation_config: crate::config::AnimationConfig,
     ) -> Result<Vec<YawcRenderElements>, GlesError> {
         let mut frame_by_surface = HashMap::new();
         for frame in frames {
@@ -325,6 +330,14 @@ impl RenderState {
             let frame_meta = window
                 .toplevel()
                 .and_then(|toplevel| frame_by_surface.get(toplevel.wl_surface()));
+            let animation = window
+                .toplevel()
+                .map(|toplevel| {
+                    frame_meta.map(|frame| frame.animation).unwrap_or_else(|| {
+                        windows.animation(toplevel.wl_surface(), animation_config)
+                    })
+                })
+                .unwrap_or_default();
 
             if let Some(toplevel) = window.toplevel() {
                 if let Some(deco) = deco_by_surface.remove(toplevel.wl_surface()) {
@@ -349,6 +362,8 @@ impl RenderState {
                         capture.dst_loc,
                         capture.dst_size(),
                         capture,
+                        frame_meta.map(|frame| frame.frame),
+                        animation,
                     )));
                 }
             }
@@ -358,16 +373,17 @@ impl RenderState {
                     loc.x - window.geometry().loc.x,
                     loc.y - window.geometry().loc.y,
                 ));
+                let anchor = animation_anchor(space, window, frame_meta);
                 let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
                 let surf: Vec<
                     SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
-                > = window.render_elements(renderer, phys_loc, RendererScale::from(1.0_f64), 1.0);
+                > = window.render_elements(renderer, phys_loc, RendererScale::from(1.0), 1.0);
 
                 if let Some(frame_meta) = frame_meta {
                     window_elements
                         .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
                 } else {
-                    window_elements.extend(surf.into_iter().map(YawcRenderElements::from));
+                    window_elements.extend(animated_surface_elements(surf, anchor, animation));
                 }
             }
 
@@ -407,9 +423,11 @@ impl RenderState {
         state: &mut Yawc,
         display_handle: &mut DisplayHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        state.config.reload_if_changed();
+        let animation_config = state.config.animations();
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
-        let all_frames = state.windows.frames(&state.space);
+        let all_frames = state.windows.frames(&state.space, animation_config);
         let mut frame_by_surface = HashMap::new();
         for frame in &all_frames {
             if let Some(toplevel) = frame.window.toplevel() {
@@ -461,24 +479,33 @@ impl RenderState {
                             None,
                         );
                         let blur_payload = titlebar_shader.as_ref().map(|shader| {
+                            let capture_rect = Rectangle::new(
+                                capture.dst_loc,
+                                (capture.dst_w, capture.dst_h).into(),
+                            );
+                            let (blur_loc, blur_size) = animated_rect(
+                                capture_rect,
+                                Some(frame_meta.frame),
+                                frame_meta.animation,
+                            );
                             (
                                 blur_texture,
                                 YawcRenderElements::from(TextureShaderElement::new(
                                     TextureRenderElement::from_texture_buffer(
-                                        point_to_physical(capture.dst_loc),
+                                        blur_loc,
                                         &blur_buffer,
-                                        None,
+                                        Some(frame_meta.animation.alpha),
                                         Some(Rectangle::new(
                                             (capture.src_x as f64, capture.src_y as f64).into(),
                                             (capture.dst_w as f64, capture.dst_h as f64).into(),
                                         )),
-                                        Some((capture.dst_w, capture.dst_h).into()),
+                                        Some(blur_size),
                                         Kind::Unspecified,
                                     ),
                                     shader.clone(),
                                     titlebar_shader_uniforms(
-                                        capture.dst_w,
-                                        capture.dst_h,
+                                        blur_size.w,
+                                        blur_size.h,
                                         blur_texture_size.w,
                                         blur_texture_size.h,
                                         capture.src_x,
@@ -510,7 +537,7 @@ impl RenderState {
                             > = window.render_elements(
                                 renderer,
                                 phys_loc,
-                                RendererScale::from(1.0_f64),
+                                RendererScale::from(1.0),
                                 1.0,
                             );
                             step_elements
@@ -541,24 +568,34 @@ impl RenderState {
                         loc.x - window.geometry().loc.x,
                         loc.y - window.geometry().loc.y,
                     ));
+                    let frame_meta = window
+                        .toplevel()
+                        .and_then(|toplevel| frame_by_surface.get(toplevel.wl_surface()));
+                    let animation = window
+                        .toplevel()
+                        .map(|toplevel| {
+                            frame_meta.map(|frame| frame.animation).unwrap_or_else(|| {
+                                state
+                                    .windows
+                                    .animation(toplevel.wl_surface(), animation_config)
+                            })
+                        })
+                        .unwrap_or_default();
+                    let anchor = animation_anchor(&state.space, window, frame_meta);
                     let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
                     let surf: Vec<
                         SpaceRenderElements<
                             GlesRenderer,
                             WaylandSurfaceRenderElement<GlesRenderer>,
                         >,
-                    > = window.render_elements(
-                        renderer,
-                        phys_loc,
-                        RendererScale::from(1.0_f64),
-                        1.0,
-                    );
-                    if let Some(toplevel) = window.toplevel() {
-                        if let Some(frame_meta) = frame_by_surface.get(toplevel.wl_surface()) {
+                    > = window.render_elements(renderer, phys_loc, RendererScale::from(1.0), 1.0);
+                    if window.toplevel().is_some() {
+                        if let Some(frame_meta) = frame_meta {
                             step_elements
                                 .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
                         } else {
-                            step_elements.extend(surf.into_iter().map(YawcRenderElements::from));
+                            step_elements
+                                .extend(animated_surface_elements(surf, anchor, animation));
                         }
                     } else {
                         step_elements.extend(surf.into_iter().map(YawcRenderElements::from));
@@ -758,15 +795,18 @@ impl RenderState {
 
             let mut frame_elements: Vec<YawcRenderElements> = Vec::new();
 
+            let (overlay_loc, overlay_size) =
+                animated_rect(frame.frame, Some(frame.frame), frame.animation);
+
             // CPU overlay: text, icons, close button (top layer).
             frame_elements.push(YawcRenderElements::from(
                 MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
-                    point_to_physical(frame.frame.loc),
+                    overlay_loc,
                     frame_buffer,
-                    None,
-                    None,
-                    None,
+                    Some(frame.animation.alpha),
+                    Some(Rectangle::from_size(frame.frame.size.to_f64())),
+                    Some(overlay_size),
                     Kind::Unspecified,
                 )?,
             ));
@@ -824,12 +864,18 @@ impl RenderState {
         surfaces: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>,
     ) -> Result<Vec<YawcRenderElements>, GlesError> {
         let shader = self.ensure_client_clip_shader(renderer)?.cloned();
-        let client_loc =
-            point_to_physical((frame.frame.loc.x, frame.frame.loc.y + TITLEBAR_HEIGHT).into());
-        let client_size = Size::<i32, Physical>::from((
-            frame.frame.size.w,
-            (frame.frame.size.h - TITLEBAR_HEIGHT).max(0),
-        ));
+        let client_rect = Rectangle::new(
+            (frame.frame.loc.x, frame.frame.loc.y + TITLEBAR_HEIGHT).into(),
+            (
+                frame.frame.size.w,
+                (frame.frame.size.h - TITLEBAR_HEIGHT).max(0),
+            )
+                .into(),
+        );
+        let (client_loc, client_size_logical) =
+            animated_rect(client_rect, Some(frame.frame), frame.animation);
+        let client_size =
+            Size::<i32, Physical>::from((client_size_logical.w, client_size_logical.h));
 
         let mut elements = Vec::with_capacity(surfaces.len());
         for surface in surfaces {
@@ -840,6 +886,8 @@ impl RenderState {
                         shader.clone(),
                         client_loc,
                         client_size,
+                        Some(frame.frame),
+                        frame.animation,
                     )));
                 }
                 (_, surface) => elements.push(YawcRenderElements::from(surface)),
@@ -868,6 +916,7 @@ struct TitlebarBlurElement {
     titlebar_loc: Point<i32, Physical>,
     size: Size<i32, Physical>,
     capture: BlurCapture,
+    alpha: f32,
 }
 
 impl TitlebarBlurElement {
@@ -878,14 +927,19 @@ impl TitlebarBlurElement {
         loc: Point<i32, Logical>,
         size: Size<i32, Physical>,
         capture: BlurCapture,
+        anchor: Option<Rectangle<i32, Logical>>,
+        animation: WindowAnimation,
     ) -> Self {
+        let rect = Rectangle::new(loc, (size.w, size.h).into());
+        let (animated_loc, animated_size) = animated_rect(rect, anchor, animation);
         Self {
             texture,
             program,
             id: Id::new(),
-            titlebar_loc: Point::<i32, Physical>::from((loc.x, loc.y)),
-            size,
+            titlebar_loc: animated_loc.to_i32_round(),
+            size: Size::from((animated_size.w, animated_size.h)),
             capture,
+            alpha: animation.alpha,
         }
     }
 }
@@ -919,12 +973,8 @@ impl Element for TitlebarBlurElement {
         _scale: RendererScale<f64>,
         _commit: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
-        DamageSet::from_slice(&[Rectangle::new(
-            Point::from((
-                self.capture.loc.x - self.titlebar_loc.x,
-                self.capture.loc.y - self.titlebar_loc.y,
-            )),
-            self.capture.size(),
+        DamageSet::from_slice(&[Rectangle::from_size(
+            self.geometry(RendererScale::from(1.0_f64)).size,
         )])
     }
 
@@ -933,7 +983,7 @@ impl Element for TitlebarBlurElement {
     }
 
     fn alpha(&self) -> f32 {
-        1.0
+        self.alpha
     }
 
     fn kind(&self) -> Kind {
@@ -985,7 +1035,7 @@ impl RenderElement<GlesRenderer> for TitlebarBlurElement {
             damage,
             &[],
             Transform::Normal,
-            1.0,
+            self.alpha(),
             Some(&self.program),
             &uniforms,
         )
@@ -999,6 +1049,8 @@ struct RoundedSurfaceElement {
     id: Id,
     client_loc: Point<i32, Physical>,
     client_size: Size<i32, Physical>,
+    anchor: Option<Rectangle<i32, Logical>>,
+    animation: WindowAnimation,
 }
 
 impl RoundedSurfaceElement {
@@ -1007,6 +1059,8 @@ impl RoundedSurfaceElement {
         program: GlesTexProgram,
         client_loc: Point<f64, Physical>,
         client_size: Size<i32, Physical>,
+        anchor: Option<Rectangle<i32, Logical>>,
+        animation: WindowAnimation,
     ) -> Self {
         Self {
             inner,
@@ -1014,6 +1068,8 @@ impl RoundedSurfaceElement {
             id: Id::new(),
             client_loc: client_loc.to_i32_round(),
             client_size,
+            anchor,
+            animation,
         }
     }
 }
@@ -1028,7 +1084,7 @@ impl Element for RoundedSurfaceElement {
     }
 
     fn geometry(&self, scale: RendererScale<f64>) -> Rectangle<i32, Physical> {
-        self.inner.geometry(scale)
+        animated_physical_rect(self.inner.geometry(scale), self.anchor, self.animation)
     }
 
     fn transform(&self) -> Transform {
@@ -1042,9 +1098,9 @@ impl Element for RoundedSurfaceElement {
     fn damage_since(
         &self,
         scale: RendererScale<f64>,
-        commit: Option<CommitCounter>,
+        _commit: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
-        self.inner.damage_since(scale, commit)
+        DamageSet::from_slice(&[self.geometry(scale)])
     }
 
     fn opaque_regions(&self, _scale: RendererScale<f64>) -> OpaqueRegions<i32, Physical> {
@@ -1052,7 +1108,7 @@ impl Element for RoundedSurfaceElement {
     }
 
     fn alpha(&self) -> f32 {
-        self.inner.alpha()
+        self.inner.alpha() * self.animation.alpha
     }
 
     fn kind(&self) -> Kind {
@@ -1060,7 +1116,7 @@ impl Element for RoundedSurfaceElement {
     }
 
     fn location(&self, scale: RendererScale<f64>) -> Point<i32, Physical> {
-        self.inner.location(scale)
+        self.geometry(scale).loc
     }
 }
 
@@ -1111,6 +1167,101 @@ impl RenderElement<GlesRenderer> for RoundedSurfaceElement {
     }
 }
 
+#[derive(Debug)]
+struct AnimatedSurfaceElement {
+    inner: WaylandSurfaceRenderElement<GlesRenderer>,
+    id: Id,
+    anchor: Option<Rectangle<i32, Logical>>,
+    animation: WindowAnimation,
+}
+
+impl AnimatedSurfaceElement {
+    fn new(
+        inner: WaylandSurfaceRenderElement<GlesRenderer>,
+        anchor: Option<Rectangle<i32, Logical>>,
+        animation: WindowAnimation,
+    ) -> Self {
+        Self {
+            inner,
+            id: Id::new(),
+            anchor,
+            animation,
+        }
+    }
+}
+
+impl Element for AnimatedSurfaceElement {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+
+    fn geometry(&self, scale: RendererScale<f64>) -> Rectangle<i32, Physical> {
+        animated_physical_rect(self.inner.geometry(scale), self.anchor, self.animation)
+    }
+
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+
+    fn src(&self) -> Rectangle<f64, smithay::utils::Buffer> {
+        self.inner.src()
+    }
+
+    fn damage_since(
+        &self,
+        scale: RendererScale<f64>,
+        _commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        DamageSet::from_slice(&[self.geometry(scale)])
+    }
+
+    fn opaque_regions(&self, _scale: RendererScale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
+    }
+
+    fn alpha(&self) -> f32 {
+        self.inner.alpha() * self.animation.alpha
+    }
+
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+
+    fn location(&self, scale: RendererScale<f64>) -> Point<i32, Physical> {
+        self.geometry(scale).loc
+    }
+}
+
+impl RenderElement<GlesRenderer> for AnimatedSurfaceElement {
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+        src: Rectangle<f64, smithay::utils::Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        match self.inner.texture() {
+            WaylandSurfaceTexture::Texture(texture) => frame.render_texture_from_to(
+                texture,
+                src,
+                dst,
+                damage,
+                &[],
+                self.transform(),
+                self.alpha(),
+                None,
+                &[],
+            ),
+            WaylandSurfaceTexture::SolidColor(color) => frame.draw_solid(dst, damage, *color),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct DecorationCacheKey {
     frame_w: i32,
@@ -1144,7 +1295,6 @@ struct BlurCapture {
     dst_loc: Point<i32, Logical>,
     dst_w: i32,
     dst_h: i32,
-    loc: Point<i32, Physical>,
     capture_x: i32,
     capture_y_gl: i32,
     capture_w: i32,
@@ -1158,10 +1308,6 @@ impl BlurCapture {
     #[cfg_attr(not(feature = "tty-udev"), allow(dead_code))]
     fn dst_size(self) -> Size<i32, Physical> {
         Size::from((self.dst_w, self.dst_h))
-    }
-
-    fn size(self) -> Size<i32, Physical> {
-        Size::from((self.capture_w, self.capture_h))
     }
 }
 
@@ -1203,7 +1349,6 @@ fn blur_capture_for_frame(
         dst_loc: Point::from((dst_left, dst_top)),
         dst_w,
         dst_h,
-        loc: Point::from((left, top)),
         capture_x: left,
         capture_y_gl,
         capture_w,
@@ -1743,4 +1888,143 @@ fn app_icon_candidates(app_id: &str) -> Vec<String> {
 
 fn point_to_physical(point: Point<i32, Logical>) -> Point<f64, Physical> {
     Point::<f64, Physical>::from((point.x as f64, point.y as f64))
+}
+
+fn animation_anchor(
+    space: &Space<Window>,
+    window: &Window,
+    frame: Option<&WindowFrame>,
+) -> Option<Rectangle<i32, Logical>> {
+    if let Some(frame) = frame {
+        return Some(frame.frame);
+    }
+
+    let loc = space.element_location(window)?;
+    let render_loc = Point::<i32, Logical>::from((
+        loc.x - window.geometry().loc.x,
+        loc.y - window.geometry().loc.y,
+    ));
+    let bbox = window.bbox();
+    Some(Rectangle::new(
+        (render_loc.x + bbox.loc.x, render_loc.y + bbox.loc.y).into(),
+        bbox.size,
+    ))
+}
+
+fn animated_surface_elements(
+    surfaces: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>,
+    anchor: Option<Rectangle<i32, Logical>>,
+    animation: WindowAnimation,
+) -> Vec<YawcRenderElements> {
+    surfaces
+        .into_iter()
+        .map(|surface| match surface {
+            SpaceRenderElements::Surface(surface) => {
+                YawcRenderElements::from(AnimatedSurfaceElement::new(surface, anchor, animation))
+            }
+            surface => YawcRenderElements::from(surface),
+        })
+        .collect()
+}
+
+fn animated_point(
+    point: Point<f64, Physical>,
+    anchor: Option<Rectangle<i32, Logical>>,
+    animation: WindowAnimation,
+) -> Point<f64, Physical> {
+    let Some(anchor) = anchor else {
+        return point;
+    };
+
+    if let Some(geometry) = animation.geometry {
+        let current = interpolated_rect(geometry.from, geometry.to, geometry.progress);
+        let scale_x = current.size.w as f64 / anchor.size.w.max(1) as f64;
+        let scale_y = current.size.h as f64 / anchor.size.h.max(1) as f64;
+
+        return Point::from((
+            current.loc.x as f64 + (point.x - anchor.loc.x as f64) * scale_x,
+            current.loc.y as f64 + (point.y - anchor.loc.y as f64) * scale_y,
+        ));
+    }
+
+    let center_x = anchor.loc.x as f64 + anchor.size.w as f64 / 2.0;
+    let center_y = anchor.loc.y as f64 + anchor.size.h as f64 / 2.0;
+
+    Point::from((
+        center_x + (point.x - center_x) * animation.scale,
+        center_y + (point.y - center_y) * animation.scale,
+    ))
+}
+
+fn animated_rect(
+    rect: Rectangle<i32, Logical>,
+    anchor: Option<Rectangle<i32, Logical>>,
+    animation: WindowAnimation,
+) -> (Point<f64, Physical>, Size<i32, Logical>) {
+    if let (Some(anchor), Some(geometry)) = (anchor, animation.geometry) {
+        let current = interpolated_rect(geometry.from, geometry.to, geometry.progress);
+        let scale_x = current.size.w as f64 / anchor.size.w.max(1) as f64;
+        let scale_y = current.size.h as f64 / anchor.size.h.max(1) as f64;
+        let loc = animated_point(point_to_physical(rect.loc), Some(anchor), animation);
+        let size = Size::from((
+            ((rect.size.w as f64) * scale_x).round().max(1.0) as i32,
+            ((rect.size.h as f64) * scale_y).round().max(1.0) as i32,
+        ));
+
+        return (loc, size);
+    }
+
+    let loc = animated_point(point_to_physical(rect.loc), anchor, animation);
+    let size = Size::from((
+        ((rect.size.w as f64) * animation.scale).round().max(1.0) as i32,
+        ((rect.size.h as f64) * animation.scale).round().max(1.0) as i32,
+    ));
+
+    (loc, size)
+}
+
+fn animated_physical_rect(
+    rect: Rectangle<i32, Physical>,
+    anchor: Option<Rectangle<i32, Logical>>,
+    animation: WindowAnimation,
+) -> Rectangle<i32, Physical> {
+    let logical_rect = Rectangle::<i32, Logical>::new(
+        (rect.loc.x, rect.loc.y).into(),
+        (rect.size.w, rect.size.h).into(),
+    );
+    let (loc, size) = animated_rect(logical_rect, anchor, animation);
+    Rectangle::new(loc.to_i32_round(), Size::from((size.w, size.h)))
+}
+
+fn interpolated_rect(
+    from: Rectangle<i32, Logical>,
+    to: Rectangle<i32, Logical>,
+    progress: f64,
+) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (
+            lerp(from.loc.x as f64, to.loc.x as f64, progress)
+                .round()
+                .max(i32::MIN as f64)
+                .min(i32::MAX as f64) as i32,
+            lerp(from.loc.y as f64, to.loc.y as f64, progress)
+                .round()
+                .max(i32::MIN as f64)
+                .min(i32::MAX as f64) as i32,
+        )
+            .into(),
+        (
+            lerp(from.size.w as f64, to.size.w as f64, progress)
+                .round()
+                .max(1.0) as i32,
+            lerp(from.size.h as f64, to.size.h as f64, progress)
+                .round()
+                .max(1.0) as i32,
+        )
+            .into(),
+    )
+}
+
+fn lerp(from: f64, to: f64, progress: f64) -> f64 {
+    from + (to - from) * progress
 }
