@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = ["winit-backend"]
 winit-backend = ["smithay/backend_winit"]
+standalone = ["tty-udev"]
 tty-udev = [
   "smithay/backend_egl",
   "smithay/backend_libinput",

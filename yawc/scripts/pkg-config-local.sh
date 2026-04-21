@@ -7,7 +7,7 @@ PKGCONF_BIN="$SYSROOT_ROOT/usr/bin/pkg-config"
 PKGCONF_LIBDIR="$SYSROOT_ROOT/usr/lib/x86_64-linux-gnu"
 
 if [ ! -x "$PKGCONF_BIN" ]; then
-  echo "error: local pkg-config is missing, run ./scripts/bootstrap-tty-deps.sh first" >&2
+  echo "error: local pkg-config is missing, run ./scripts/bootstrap-standalone-deps.sh first" >&2
   exit 1
 fi
 

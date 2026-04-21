@@ -1,0 +1,19 @@
+# Runtime packages expected in an etyOS / etyDE image that ships YAWC.
+#
+# This is intentionally separate from build dependencies. The full OS image
+# builder should include these so common desktop features work out of the box.
+
+# Session bus and portal broker used by sandboxed/portal-aware apps.
+dbus-user-session
+xdg-desktop-portal
+
+# ScreenCast/Screenshot backend used by OBS and other PipeWire portal clients.
+xdg-desktop-portal-wlr
+
+# PipeWire session stack for screen capture and audio/video routing.
+pipewire
+wireplumber
+
+# Standalone backend seat/device access.
+libseat1
+seatd

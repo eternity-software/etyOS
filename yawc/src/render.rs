@@ -23,11 +23,11 @@ use smithay::{
                 Element, Id, Kind, RenderElement,
             },
             gles::{
-                element::TextureShaderElement, ffi, GlesError, GlesRenderer, GlesTexProgram,
-                GlesTexture, Uniform, UniformName, UniformType,
+                element::TextureShaderElement, ffi, GlesError, GlesRenderer, GlesTarget,
+                GlesTexProgram, GlesTexture, Uniform, UniformName, UniformType,
             },
             utils::{CommitCounter, DamageSet, OpaqueRegions},
-            Frame, Renderer, Texture,
+            ExportMem, Frame, Renderer, Texture,
         },
     },
     desktop::{
@@ -35,10 +35,11 @@ use smithay::{
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::wayland_server::{protocol::wl_surface::WlSurface, DisplayHandle},
-    utils::{Logical, Physical, Point, Rectangle, Scale as RendererScale, Size, Transform},
+    utils::{Buffer, Logical, Physical, Point, Rectangle, Scale as RendererScale, Size, Transform},
 };
 use tracing::{info, warn};
 
+use crate::screencopy::CapturedFrame;
 #[cfg(feature = "tty-udev")]
 use crate::window::WindowStore;
 use crate::{
@@ -46,6 +47,8 @@ use crate::{
     state::Yawc,
     window::{WindowAnimation, WindowFrame, BUTTON_PADDING, FRAME_RADIUS, TITLEBAR_HEIGHT},
 };
+#[cfg(feature = "tty-udev")]
+use smithay::backend::renderer::{Bind, Offscreen};
 
 smithay::backend::renderer::element::render_elements! {
     pub YawcRenderElements<=GlesRenderer>;
@@ -238,7 +241,7 @@ impl RenderState {
             size,
             refresh,
             Transform::Normal,
-            "TTY Session",
+            "Standalone Session",
         )
     }
 
@@ -303,6 +306,39 @@ impl RenderState {
     #[cfg(feature = "tty-udev")]
     pub fn wallpaper_buffer(&self) -> Option<&MemoryRenderBuffer> {
         self.wallpaper_buffer.as_ref()
+    }
+
+    #[cfg(feature = "tty-udev")]
+    pub fn capture_scene_xrgb8888(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        space: &Space<Window>,
+        frames: &[WindowFrame],
+        windows: &WindowStore,
+        animation_config: crate::config::AnimationConfig,
+        region: Rectangle<i32, Logical>,
+    ) -> Result<CapturedFrame, GlesError> {
+        let output_size = self
+            .output
+            .current_mode()
+            .map(|mode| mode.size)
+            .unwrap_or_else(|| Size::from((1, 1)));
+        let buffer_size = Size::<i32, Buffer>::from((output_size.w, output_size.h));
+        let mut target: GlesTexture = renderer.create_buffer(Fourcc::Xrgb8888, buffer_size)?;
+        let mut framebuffer = renderer.bind(&mut target)?;
+        let scene = self.tty_scene_elements(renderer, space, frames, windows, animation_config)?;
+
+        {
+            let mut frame = renderer.render(&mut framebuffer, output_size, Transform::Normal)?;
+            frame.clear(
+                [0.06, 0.09, 0.11, 1.0].into(),
+                &[Rectangle::from_size(output_size)],
+            )?;
+            draw_elements_back_to_front(&mut frame, &scene)?;
+            let _ = frame.finish()?;
+        }
+
+        read_xrgb_framebuffer(renderer, &framebuffer, output_size, region)
     }
 
     #[cfg(feature = "tty-udev")]
@@ -631,6 +667,16 @@ impl RenderState {
                 let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
                 draw_elements(&mut frame, &dnd_icon)?;
                 let _ = frame.finish()?;
+            }
+
+            if state.screencopy_state.has_pending() {
+                let requests = state.screencopy_state.take_pending();
+                for request in requests {
+                    let captured =
+                        read_xrgb_framebuffer(renderer, &framebuffer, size, request.region())
+                            .map_err(|error| format!("{error:?}"));
+                    request.finish(captured);
+                }
             }
         }
 
@@ -1426,6 +1472,55 @@ fn draw_elements(
     elements: &[YawcRenderElements],
 ) -> Result<(), GlesError> {
     for element in elements {
+        let geometry = element.geometry(RendererScale::from(1.0));
+        if geometry.size.w <= 0 || geometry.size.h <= 0 {
+            continue;
+        }
+        let local_damage = [Rectangle::from_size(geometry.size)];
+        element.draw(frame, element.src(), geometry, &local_damage, &[])?;
+    }
+
+    Ok(())
+}
+
+fn read_xrgb_framebuffer(
+    renderer: &mut GlesRenderer,
+    framebuffer: &GlesTarget<'_>,
+    output_size: Size<i32, Physical>,
+    region: Rectangle<i32, Logical>,
+) -> Result<CapturedFrame, GlesError> {
+    let width = region.size.w.max(1);
+    let height = region.size.h.max(1);
+    let read_y = output_size.h - region.loc.y - height;
+    let read_region =
+        Rectangle::<i32, Buffer>::new((region.loc.x, read_y.max(0)).into(), (width, height).into());
+    let mapping = renderer.copy_framebuffer(framebuffer, read_region, Fourcc::Xrgb8888)?;
+    let raw = renderer.map_texture(&mapping)?;
+    let stride = width * 4;
+    let mut data = vec![0_u8; (stride * height) as usize];
+    let row_bytes = stride as usize;
+    let height_usize = height as usize;
+
+    for row in 0..height_usize {
+        let src_start = row * row_bytes;
+        let dst_start = row * row_bytes;
+        data[dst_start..dst_start + row_bytes]
+            .copy_from_slice(&raw[src_start..src_start + row_bytes]);
+    }
+
+    Ok(CapturedFrame {
+        size: Size::from((width, height)),
+        stride,
+        data,
+    })
+}
+
+#[cfg(feature = "tty-udev")]
+fn draw_elements_back_to_front(
+    frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+    elements: &[YawcRenderElements],
+) -> Result<(), GlesError> {
+    for element in elements.iter().rev() {
         let geometry = element.geometry(RendererScale::from(1.0));
         if geometry.size.w <= 0 || geometry.size.h <= 0 {
             continue;

@@ -2,5 +2,4 @@
 set -eu
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-echo "warning: start-tty.sh is deprecated; use start-standalone.sh" >&2
 exec sh "$ROOT_DIR/scripts/start-standalone.sh" "$@"

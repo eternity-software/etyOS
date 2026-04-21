@@ -24,11 +24,11 @@ else
 fi
 
 if [ "${YAWC_SKIP_BUILD:-0}" != "1" ]; then
-  "$ROOT_DIR/scripts/build-tty.sh"
+  "$ROOT_DIR/scripts/build-standalone.sh"
 fi
 
 if [ ! -x "$BUILD_BINARY" ]; then
-  echo "error: expected built tty binary at $BUILD_BINARY" >&2
+  echo "error: expected built standalone binary at $BUILD_BINARY" >&2
   exit 1
 fi
 

@@ -191,7 +191,7 @@ impl TtyRuntime {
             }
 
             if !self.missed_vblank_warned {
-                warn!("forcing tty render after missed drm vblank");
+                warn!("forcing standalone render after missed drm vblank");
                 self.missed_vblank_warned = true;
             }
 
@@ -205,7 +205,7 @@ impl TtyRuntime {
         let mut renderer = match self.gpus.single_renderer(&self.node) {
             Ok(renderer) => renderer,
             Err(error) => {
-                error!(?error, "failed to acquire tty renderer");
+                error!(?error, "failed to acquire standalone renderer");
                 data.state.loop_signal.stop();
                 return;
             }
@@ -267,7 +267,27 @@ impl TtyRuntime {
                 }
             }
             Err(error) => {
-                warn!(?error, "tty render_frame failed");
+                warn!(?error, "standalone render_frame failed");
+            }
+        }
+        drop(elements);
+
+        if data.state.screencopy_state.has_pending() {
+            let requests = data.state.screencopy_state.take_pending();
+            for request in requests {
+                let region = request.region();
+                let captured = self
+                    .render_state
+                    .capture_scene_xrgb8888(
+                        renderer.as_mut(),
+                        &data.state.space,
+                        &frames,
+                        &data.state.windows,
+                        animation_config,
+                        region,
+                    )
+                    .map_err(|error| format!("{error:?}"));
+                request.finish(captured);
             }
         }
 
@@ -361,7 +381,7 @@ pub fn init(
     info!(
         seat = %seat_name,
         active = initial_active,
-        "initialized libseat session for tty/udev backend"
+        "initialized libseat session for standalone backend"
     );
 
     let udev_backend = UdevBackend::new(&seat_name)
@@ -369,7 +389,7 @@ pub fn init(
     let device_path = select_drm_device(&udev_backend)?;
     let node = DrmNode::from_path(&device_path)
         .map_err(|error| format!("failed to resolve drm node from {:?}: {error}", device_path))?;
-    info!(path = ?device_path, ?node, "selected drm device for tty backend");
+    info!(path = ?device_path, ?node, "selected drm device for standalone backend");
 
     let opened_fd = session
         .open(
@@ -386,7 +406,7 @@ pub fn init(
     let allocator_flags = GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING;
     info!(
         ?allocator_flags,
-        "using gbm allocator flags for tty primary buffers"
+        "using gbm allocator flags for standalone primary buffers"
     );
     let allocator = GbmAllocator::new(gbm.clone(), allocator_flags);
     let exporter = GbmFramebufferExporter::new(gbm.clone(), None);
@@ -399,7 +419,7 @@ pub fn init(
 
     let mut renderer = gpus
         .single_renderer(&node)
-        .map_err(|error| format!("failed to create renderer for tty backend: {error}"))?;
+        .map_err(|error| format!("failed to create renderer for standalone backend: {error}"))?;
     data.state.shm_state.update_formats(renderer.shm_formats());
 
     let mut drm_output_manager = TtyOutputManager::new(
@@ -429,7 +449,7 @@ pub fn init(
         width = output_size.w,
         height = output_size.h,
         refresh_hz,
-        "selected drm mode for tty output"
+        "selected drm mode for standalone output"
     );
     let render_state = RenderState::new_standalone(
         &data.display_handle,
@@ -579,14 +599,14 @@ pub fn init(
             .handle()
             .insert_source(notifier, move |event, _, _data| match event {
                 SessionEvent::PauseSession => {
-                    info!("tty session paused");
+                    info!("standalone session paused");
                     libinput_context.suspend();
                     let mut runtime = runtime.borrow_mut();
                     runtime.active = false;
                     runtime.drm_output_manager.pause();
                 }
                 SessionEvent::ActivateSession => {
-                    info!("tty session activated");
+                    info!("standalone session activated");
                     if let Err(error) = libinput_context.resume() {
                         error!(?error, "failed to resume libinput context");
                     }
@@ -605,7 +625,7 @@ pub fn init(
     std::env::set_var("WAYLAND_DISPLAY", &data.state.socket_name);
     info!(
         display = %data.state.socket_name.to_string_lossy(),
-        "exported WAYLAND_DISPLAY for tty clients"
+        "exported WAYLAND_DISPLAY for standalone clients"
     );
 
     Ok(())
@@ -665,7 +685,7 @@ fn render_elements<'a>(
                 .map(TtyYawcElement::from)
                 .map(TtyRenderElements::from),
         ),
-        Err(error) => warn!(?error, "failed to build tty scene elements"),
+        Err(error) => warn!(?error, "failed to build standalone scene elements"),
     }
 
     let background = SolidColorRenderElement::from_buffer(
@@ -704,7 +724,7 @@ fn push_cursor_element<'a>(
                 Kind::Cursor,
             ) {
                 Ok(cursor) => elements.push(TtyRenderElements::from(cursor)),
-                Err(error) => warn!(?error, "failed to upload tty cursor"),
+                Err(error) => warn!(?error, "failed to upload standalone cursor"),
             }
         }
         CursorImageStatus::Surface(surface) => {
@@ -770,7 +790,7 @@ impl TtyCursorTheme {
             .filter(|size| *size > 0)
             .unwrap_or(24);
 
-        info!(theme = %theme_name, size, "loading tty cursor theme");
+        info!(theme = %theme_name, size, "loading standalone cursor theme");
 
         Self {
             theme: xcursor::CursorTheme::load(&theme_name),
@@ -931,7 +951,7 @@ fn select_drm_device(udev_backend: &UdevBackend) -> Result<PathBuf, Box<dyn std:
         .device_list()
         .next()
         .map(|(_, path)| path.to_path_buf())
-        .ok_or_else(|| "no drm device available for tty backend".into())
+        .ok_or_else(|| "no drm device available for standalone backend".into())
 }
 
 fn select_connector_and_mode(

@@ -4,6 +4,7 @@ mod cursor;
 mod grabs;
 mod input;
 mod render;
+mod screencopy;
 mod shell;
 mod state;
 mod window;
@@ -57,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "winit-backend")]
         BackendKind::Winit => backend::winit::init(&mut event_loop, &mut data)?,
         #[cfg(feature = "tty-udev")]
-        BackendKind::TtyUdev => backend::tty_udev::init(&mut event_loop, &mut data)?,
+        BackendKind::Standalone => backend::tty_udev::init(&mut event_loop, &mut data)?,
     }
 
     update_activation_environment();
@@ -97,6 +98,9 @@ fn update_activation_environment() {
         "XDG_CURRENT_DESKTOP",
         "XDG_SESSION_DESKTOP",
         "DESKTOP_SESSION",
+        "XDG_DESKTOP_PORTAL_DIR",
+        "XDG_DATA_DIRS",
+        "XDG_DATA_HOME",
         "GDK_BACKEND",
         "QT_QPA_PLATFORM",
         "SDL_VIDEODRIVER",
@@ -150,7 +154,7 @@ enum BackendKind {
     #[cfg(feature = "winit-backend")]
     Winit,
     #[cfg(feature = "tty-udev")]
-    TtyUdev,
+    Standalone,
 }
 
 #[derive(Debug)]
@@ -169,7 +173,7 @@ fn parse_cli() -> Result<Cli, String> {
             #[cfg(feature = "winit-backend")]
             "--winit" => backend = BackendKind::Winit,
             #[cfg(feature = "tty-udev")]
-            "--tty-udev" => backend = BackendKind::TtyUdev,
+            "--standalone" | "--tty-udev" => backend = BackendKind::Standalone,
             "-c" | "--command" => {
                 let value = args
                     .next()
@@ -192,7 +196,7 @@ fn default_backend() -> Result<BackendKind, String> {
 
     #[cfg(all(not(feature = "winit-backend"), feature = "tty-udev"))]
     {
-        return Ok(BackendKind::TtyUdev);
+        return Ok(BackendKind::Standalone);
     }
 
     #[allow(unreachable_code)]
@@ -201,7 +205,7 @@ fn default_backend() -> Result<BackendKind, String> {
 
 #[cfg(feature = "tty-udev")]
 fn default_startup_command(backend: BackendKind) -> Option<String> {
-    if matches!(backend, BackendKind::TtyUdev) {
+    if matches!(backend, BackendKind::Standalone) {
         for candidate in [
             "foot",
             "weston-terminal",
@@ -245,7 +249,7 @@ fn spawn_startup_client(command: String, _backend: BackendKind) {
     let mut child = Command::new("sh");
     child.arg("-lc").arg(&command);
     #[cfg(feature = "tty-udev")]
-    if matches!(_backend, BackendKind::TtyUdev) {
+    if matches!(_backend, BackendKind::Standalone) {
         child
             .env("XDG_SESSION_TYPE", "wayland")
             .env("GDK_BACKEND", "wayland")
@@ -261,12 +265,14 @@ fn spawn_startup_client(command: String, _backend: BackendKind) {
 }
 
 fn usage() -> String {
-    let mut lines = vec!["USAGE: yawc [--winit|--tty-udev] [--command CMD]".to_string()];
+    let mut lines = vec!["USAGE: yawc [--winit|--standalone] [--command CMD]".to_string()];
 
     #[cfg(feature = "winit-backend")]
     lines.push("  --winit       Run YAWC as a nested compositor window.".to_string());
     #[cfg(feature = "tty-udev")]
-    lines.push("  --tty-udev    Run YAWC with the experimental tty/udev backend.".to_string());
+    lines.push("  --standalone  Run YAWC as a standalone hardware session.".to_string());
+    #[cfg(feature = "tty-udev")]
+    lines.push("  --tty-udev    Deprecated alias for --standalone.".to_string());
     lines.push("  --command CMD Spawn a client after backend initialization.".to_string());
 
     lines.join("\n")

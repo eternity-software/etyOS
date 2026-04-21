@@ -32,6 +32,7 @@ use tracing::{info, warn};
 use crate::{
     config::{Config, KeyboardConfig},
     cursor::CursorShape,
+    screencopy::ScreencopyState,
     window::{SnapSide, WindowStore},
     CalloopData,
 };
@@ -58,6 +59,7 @@ pub struct Yawc {
     pub cursor_shape_state: CursorShapeManagerState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
+    pub screencopy_state: ScreencopyState,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
     pub pending_cursor: CursorShape,
@@ -82,6 +84,7 @@ impl Yawc {
         let cursor_shape_state = CursorShapeManagerState::new::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let screencopy_state = ScreencopyState::new(&display_handle);
         let popups = PopupManager::default();
         let windows = WindowStore::default();
 
@@ -109,6 +112,7 @@ impl Yawc {
             cursor_shape_state,
             seat_state,
             data_device_state,
+            screencopy_state,
             popups,
             seat,
             pending_cursor: CursorShape::Default,
