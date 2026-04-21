@@ -153,22 +153,19 @@ impl Yawc {
                 );
             }
             InputEvent::PointerMotion { event, .. } => {
-                let Some(output) = self.space.outputs().next() else {
-                    return;
-                };
-                let Some(output_geometry) = self.space.output_geometry(output) else {
+                let Some(bounds) = self.virtual_output_geometry() else {
                     return;
                 };
 
                 let pointer = self.seat.get_pointer().unwrap();
                 let mut location = pointer.current_location() + event.delta();
                 location.x = location.x.clamp(
-                    output_geometry.loc.x as f64,
-                    (output_geometry.loc.x + output_geometry.size.w - 1) as f64,
+                    bounds.loc.x as f64,
+                    (bounds.loc.x + bounds.size.w - 1) as f64,
                 );
                 location.y = location.y.clamp(
-                    output_geometry.loc.y as f64,
-                    (output_geometry.loc.y + output_geometry.size.h - 1) as f64,
+                    bounds.loc.y as f64,
+                    (bounds.loc.y + bounds.size.h - 1) as f64,
                 );
 
                 let serial = SERIAL_COUNTER.next_serial();
@@ -198,15 +195,11 @@ impl Yawc {
                 }
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
-                let Some(output) = self.space.outputs().next() else {
-                    return;
-                };
-                let Some(output_geometry) = self.space.output_geometry(output) else {
+                let Some(bounds) = self.virtual_output_geometry() else {
                     return;
                 };
 
-                let location =
-                    event.position_transformed(output_geometry.size) + output_geometry.loc.to_f64();
+                let location = event.position_transformed(bounds.size) + bounds.loc.to_f64();
                 let serial = SERIAL_COUNTER.next_serial();
                 let pointer = self.seat.get_pointer().unwrap();
                 let controls_mode = self.config.window_controls();

@@ -43,7 +43,8 @@ The design favors direct Wayland/Smithay integration over borrowing behavior fro
 - keyboard, pointer, and scroll input routing
 - seat, clipboard/data-device, and drag-and-drop plumbing
 - single-output nested compositor backend via `winit`
-- standalone backend with `libseat`, `udev`, `libinput`, and single-output DRM/KMS scanout
+- standalone backend with `libseat`, `udev`, `libinput`, and multi-output DRM/KMS scanout
+- configurable multi-monitor layout with per-output refresh timing, scale, hotplug rescans, and output-aware window placement
 - themed cursor loading for the standalone backend with fallback cursor rendering
 - custom GPU-rendered window decorations
 - rounded client corners and blurred titlebar styling
@@ -227,7 +228,6 @@ YAWC_ALLOW_DIRECT_STANDALONE_RUN=1 ./scripts/run-standalone-direct.sh
 
 Important:
 
-- this path targets a single output
 - if you launch it from inside an already active desktop session on the same GPU, DRM ownership may be busy
 
 ### Login Screen Session
@@ -248,6 +248,8 @@ The installer builds the standalone binary and installs:
 After installation, log out, open the session selector on the login screen, and choose `YAWC`.
 The session launcher starts YAWC with the standalone backend and opens the first available terminal emulator.
 Login-screen session output is saved to `~/.local/state/yawc/session.log`.
+
+Standalone sessions map connected DRM outputs into one desktop layout. Pointer movement, initial window placement, maximize/snap/fullscreen, frame callbacks, and portal screencopy are output-aware. Unconfigured outputs are placed left-to-right; configured outputs can set position, scale, primary status, enabled state, and mode.
 
 The installer removes the old `YAWC dmabuf probe` login entry by default. The normal YAWC session now advertises GPU buffer support directly; the probe entry can still be installed explicitly with `YAWC_INSTALL_DMABUF_PROBE=1 ./scripts/install-session.sh` when diagnosing vendor-specific EGL behavior.
 
@@ -296,6 +298,15 @@ close_animation_ms = 220
 
 window_controls = gestures
 screencopy_dmabuf = false
+
+# Output names use DRM connector names such as HDMI-A-1, DP-1, or eDP-1.
+# Unconfigured outputs are enabled automatically and placed left-to-right.
+# output.DP-1.primary = true
+# output.DP-1.x = 0
+# output.DP-1.y = 0
+# output.DP-1.scale = 1
+# output.DP-1.mode = 2560x1440@120
+# output.HDMI-A-1.enabled = false
 ```
 
 Pressing the same snap binding again restores the window to the position and size it had before snapping.
@@ -309,6 +320,8 @@ Supported modifiers are `Super`, `Ctrl`, `Alt`, and `Shift`. Supported keys are 
 
 Animation values are in milliseconds and reload live. Set `animations = false` to disable popup, geometry, decoration, and close animations.
 `screencopy_dmabuf = false` keeps portal screen capture on the SHM-compatible path used by `xdg-desktop-portal-wlr`; compositor-side client `linux-dmabuf` support remains enabled separately for native Wayland EGL clients.
+
+Output config keys are live-reloaded on the next render/input cycle. `output.<name>.primary = true` makes that monitor the preferred fallback for new windows. `output.<name>.x` and `output.<name>.y` set logical desktop position; if either is missing, YAWC falls back to automatic horizontal placement. `output.<name>.scale` accepts fractional values from `0.5` to `4.0`. `output.<name>.mode` accepts `WIDTHxHEIGHT` or `WIDTHxHEIGHT@HZ`.
 
 Useful session overrides:
 

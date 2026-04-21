@@ -33,7 +33,7 @@ use smithay::{
     desktop::{
         space::SpaceRenderElements, utils::send_frames_surface_tree, PopupManager, Space, Window,
     },
-    output::{Mode, Output, PhysicalProperties, Subpixel},
+    output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel},
     reexports::wayland_server::{protocol::wl_surface::WlSurface, DisplayHandle},
     utils::{Buffer, Logical, Physical, Point, Rectangle, Scale as RendererScale, Size, Transform},
 };
@@ -345,6 +345,10 @@ void main() {
 
 pub struct RenderState {
     output: Output,
+    #[cfg_attr(not(feature = "tty-udev"), allow(dead_code))]
+    output_location: Point<i32, Logical>,
+    #[cfg_attr(not(feature = "tty-udev"), allow(dead_code))]
+    output_scale: f64,
     titlebar_shader: Option<GlesTexProgram>,
     titlebar_shader_failed: bool,
     client_clip_shader: Option<GlesTexProgram>,
@@ -367,6 +371,7 @@ pub struct RenderState {
 struct CsdWindowSnapshot {
     texture: GlesTexture,
     rect: Rectangle<i32, Logical>,
+    output_location: Point<i32, Logical>,
 }
 
 impl RenderState {
@@ -382,6 +387,9 @@ impl RenderState {
             60_000,
             Transform::Flipped180,
             "Nested Compositor",
+            "yawc".to_string(),
+            (0, 0).into(),
+            1.0,
         )
     }
 
@@ -399,6 +407,32 @@ impl RenderState {
             refresh,
             Transform::Normal,
             "Standalone Session",
+            "yawc".to_string(),
+            (0, 0).into(),
+            1.0,
+        )
+    }
+
+    #[cfg(feature = "tty-udev")]
+    pub fn new_standalone_at(
+        display_handle: &DisplayHandle,
+        space: &mut Space<Window>,
+        size: Size<i32, Physical>,
+        refresh: i32,
+        name: String,
+        location: Point<i32, Logical>,
+        scale: f64,
+    ) -> Self {
+        Self::new_with_output(
+            display_handle,
+            space,
+            size,
+            refresh,
+            Transform::Normal,
+            "Standalone Session",
+            name,
+            location,
+            scale,
         )
     }
 
@@ -409,6 +443,9 @@ impl RenderState {
         refresh: i32,
         transform: Transform,
         model: &str,
+        name: String,
+        location: Point<i32, Logical>,
+        scale: f64,
     ) -> Self {
         let mode = Mode {
             size,
@@ -416,7 +453,7 @@ impl RenderState {
         };
 
         let output = Output::new(
-            "yawc".to_string(),
+            name,
             PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
@@ -426,9 +463,14 @@ impl RenderState {
         );
         let _ = output.create_global::<Yawc>(display_handle);
 
-        output.change_current_state(Some(mode), Some(transform), None, Some((0, 0).into()));
+        output.change_current_state(
+            Some(mode),
+            Some(transform),
+            Some(output_scale(scale)),
+            Some(location),
+        );
         output.set_preferred(mode);
-        space.map_output(&output, (0, 0));
+        space.map_output(&output, location);
 
         let title_font = load_title_font();
         let wallpaper_source = load_png(
@@ -439,6 +481,8 @@ impl RenderState {
 
         let mut state = Self {
             output,
+            output_location: location,
+            output_scale: scale,
             titlebar_shader: None,
             titlebar_shader_failed: false,
             client_clip_shader: None,
@@ -464,6 +508,51 @@ impl RenderState {
     #[cfg(feature = "tty-udev")]
     pub fn output(&self) -> &Output {
         &self.output
+    }
+
+    #[cfg(feature = "tty-udev")]
+    pub fn output_geometry(&self) -> Rectangle<i32, Logical> {
+        let size = self
+            .output
+            .current_mode()
+            .map(|mode| {
+                mode.size
+                    .to_f64()
+                    .to_logical(self.output.current_scale().fractional_scale())
+                    .to_i32_ceil()
+            })
+            .unwrap_or_else(|| Size::from((1, 1)));
+        Rectangle::new(self.output_location, size)
+    }
+
+    #[cfg(feature = "tty-udev")]
+    pub fn reconfigure_output(
+        &mut self,
+        size: Size<i32, Physical>,
+        refresh: i32,
+        location: Point<i32, Logical>,
+        scale: f64,
+    ) {
+        let mode = Mode {
+            size,
+            refresh: refresh.max(1),
+        };
+
+        self.output.change_current_state(
+            Some(mode),
+            Some(Transform::Normal),
+            Some(output_scale(scale)),
+            Some(location),
+        );
+        self.output.set_preferred(mode);
+        if self.output_location != location || (self.output_scale - scale).abs() > f64::EPSILON {
+            self.overlay_cache.clear();
+            self.blur_texture_cache.clear();
+            self.csd_snapshot_cache.clear();
+        }
+        self.output_location = location;
+        self.output_scale = scale;
+        self.rebuild_desktop_buffers(size);
     }
 
     #[cfg(feature = "tty-udev")]
@@ -497,11 +586,23 @@ impl RenderState {
                 [0.06, 0.09, 0.11, 1.0].into(),
                 &[Rectangle::from_size(output_size)],
             )?;
-            draw_elements_back_to_front(&mut frame, &scene)?;
+            draw_elements_back_to_front_with_offset(
+                &mut frame,
+                &scene,
+                self.output_location.to_physical(1),
+            )?;
             let _ = frame.finish()?;
         }
 
-        read_xrgb_framebuffer(renderer, &framebuffer, output_size, region)
+        let local_region = Rectangle::new(
+            (
+                region.loc.x - self.output_location.x,
+                region.loc.y - self.output_location.y,
+            )
+                .into(),
+            region.size,
+        );
+        read_xrgb_framebuffer(renderer, &framebuffer, output_size, local_region)
     }
 
     #[cfg(feature = "tty-udev")]
@@ -565,6 +666,7 @@ impl RenderState {
             .current_mode()
             .map(|mode| mode.size)
             .unwrap_or_else(|| Size::from((1, 1)));
+        let output_geometry = self.output_geometry();
         let titlebar_shader = self.ensure_titlebar_shader(renderer)?.cloned();
         let mut deco_by_surface = self.decoration_elements(renderer, frames)?;
         let mut live_csd_surfaces = HashSet::new();
@@ -600,7 +702,7 @@ impl RenderState {
                 if let (Some(shader), Some(capture)) = (
                     titlebar_shader.as_ref(),
                     frame_meta.and_then(|frame| {
-                        blur_capture_for_frame(frame, output_size, BlurOrigin::TopLeft)
+                        blur_capture_for_frame(frame, output_geometry, BlurOrigin::TopLeft)
                     }),
                 ) {
                     let blur_texture = self.ensure_blur_texture(
@@ -696,7 +798,14 @@ impl RenderState {
             }
             if let Some((surface, rect)) = csd_snapshot {
                 live_csd_surfaces.insert(surface.clone());
-                self.update_csd_snapshot(renderer, &surface, output_size, rect, &window_elements)?;
+                self.update_csd_snapshot(
+                    renderer,
+                    &surface,
+                    output_size,
+                    self.output_location,
+                    rect,
+                    &window_elements,
+                )?;
             }
 
             elements.extend(window_elements);
@@ -707,7 +816,11 @@ impl RenderState {
         elements.splice(0..0, snapshot_elements);
         self.retain_csd_snapshots(&live_csd_surfaces, &destroyed);
 
-        elements.extend(desktop_elements(renderer, self.wallpaper_buffer.as_ref())?);
+        elements.extend(desktop_elements(
+            renderer,
+            self.wallpaper_buffer.as_ref(),
+            self.output_location.to_f64(),
+        )?);
 
         Ok(elements)
     }
@@ -732,6 +845,7 @@ impl RenderState {
         renderer: &mut GlesRenderer,
         surface: &WlSurface,
         output_size: Size<i32, Physical>,
+        output_location: Point<i32, Logical>,
         rect: Rectangle<i32, Logical>,
         elements: &[YawcRenderElements],
     ) -> Result<(), GlesError> {
@@ -749,7 +863,11 @@ impl RenderState {
                     [0.0, 0.0, 0.0, 0.0].into(),
                     &[Rectangle::from_size(output_size)],
                 )?;
-                draw_elements_back_to_front(&mut frame, elements)?;
+                draw_elements_back_to_front_with_offset(
+                    &mut frame,
+                    elements,
+                    output_location.to_physical(1),
+                )?;
                 let _ = frame.finish()?;
             }
         }
@@ -758,10 +876,17 @@ impl RenderState {
             Some(snapshot) => {
                 snapshot.texture = texture;
                 snapshot.rect = rect;
+                snapshot.output_location = output_location;
             }
             None => {
-                self.csd_snapshot_cache
-                    .insert(surface.clone(), CsdWindowSnapshot { texture, rect });
+                self.csd_snapshot_cache.insert(
+                    surface.clone(),
+                    CsdWindowSnapshot {
+                        texture,
+                        rect,
+                        output_location,
+                    },
+                );
             }
         }
         Ok(())
@@ -806,7 +931,11 @@ impl RenderState {
                 );
                 let (loc, size) = animated_rect(snapshot.rect, Some(snapshot.rect), *animation);
                 let src = Rectangle::<f64, Logical>::new(
-                    (snapshot.rect.loc.x as f64, snapshot.rect.loc.y as f64).into(),
+                    (
+                        (snapshot.rect.loc.x - snapshot.output_location.x) as f64,
+                        (snapshot.rect.loc.y - snapshot.output_location.y) as f64,
+                    )
+                        .into(),
                     (snapshot.rect.size.w as f64, snapshot.rect.size.h as f64).into(),
                 );
 
@@ -876,7 +1005,11 @@ impl RenderState {
             let (renderer, mut framebuffer) = backend.bind()?;
             let windows: Vec<Window> = state.space.elements().cloned().collect();
             let titlebar_shader = self.ensure_titlebar_shader(renderer)?.cloned();
-            let desktop = desktop_elements(renderer, self.wallpaper_buffer.as_ref())?;
+            let desktop = desktop_elements(
+                renderer,
+                self.wallpaper_buffer.as_ref(),
+                Point::<f64, Logical>::from((0.0, 0.0)),
+            )?;
             {
                 let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
                 frame.clear([0.06, 0.09, 0.11, 1.0].into(), &[damage])?;
@@ -890,9 +1023,11 @@ impl RenderState {
 
                 if let Some(toplevel) = window.toplevel() {
                     if let Some(frame_meta) = frame_by_surface.get(toplevel.wl_surface()) {
-                        let Some(capture) =
-                            blur_capture_for_frame(frame_meta, size, BlurOrigin::BottomLeft)
-                        else {
+                        let Some(capture) = blur_capture_for_frame(
+                            frame_meta,
+                            Rectangle::from_size(size.to_logical(1)),
+                            BlurOrigin::BottomLeft,
+                        ) else {
                             continue;
                         };
                         used_blur_surfaces.insert(toplevel.wl_surface().clone());
@@ -1076,7 +1211,14 @@ impl RenderState {
 
                 if let Some((surface, rect)) = csd_snapshot {
                     live_csd_surfaces.insert(surface.clone());
-                    self.update_csd_snapshot(renderer, &surface, size, rect, &step_elements)?;
+                    self.update_csd_snapshot(
+                        renderer,
+                        &surface,
+                        size,
+                        (0, 0).into(),
+                        rect,
+                        &step_elements,
+                    )?;
                 }
 
                 let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
@@ -2309,16 +2451,25 @@ impl BlurCapture {
 
 fn blur_capture_for_frame(
     frame: &WindowFrame,
-    output_size: Size<i32, Physical>,
+    output_geometry: Rectangle<i32, Logical>,
     origin: BlurOrigin,
 ) -> Option<BlurCapture> {
     let titlebar_w = frame.frame.size.w.max(1);
     let titlebar_h = TITLEBAR_HEIGHT.max(1);
+    let output_size = output_geometry.size;
+    let local_frame = Rectangle::new(
+        (
+            frame.frame.loc.x - output_geometry.loc.x,
+            frame.frame.loc.y - output_geometry.loc.y,
+        )
+            .into(),
+        frame.frame.size,
+    );
 
-    let dst_left = frame.frame.loc.x.max(0).min(output_size.w);
-    let dst_top = frame.frame.loc.y.max(0).min(output_size.h);
-    let dst_right = (frame.frame.loc.x + titlebar_w).max(0).min(output_size.w);
-    let dst_bottom = (frame.frame.loc.y + titlebar_h).max(0).min(output_size.h);
+    let dst_left = local_frame.loc.x.max(0).min(output_size.w);
+    let dst_top = local_frame.loc.y.max(0).min(output_size.h);
+    let dst_right = (local_frame.loc.x + titlebar_w).max(0).min(output_size.w);
+    let dst_bottom = (local_frame.loc.y + titlebar_h).max(0).min(output_size.h);
     let dst_w = dst_right - dst_left;
     let dst_h = dst_bottom - dst_top;
     if dst_w <= 0 || dst_h <= 0 {
@@ -2342,7 +2493,10 @@ fn blur_capture_for_frame(
     };
 
     Some(BlurCapture {
-        dst_loc: Point::from((dst_left, dst_top)),
+        dst_loc: Point::from((
+            dst_left + output_geometry.loc.x,
+            dst_top + output_geometry.loc.y,
+        )),
         dst_w,
         dst_h,
         capture_x: left,
@@ -2358,6 +2512,7 @@ fn blur_capture_for_frame(
 fn desktop_elements(
     renderer: &mut GlesRenderer,
     wallpaper: Option<&MemoryRenderBuffer>,
+    location: Point<f64, Logical>,
 ) -> Result<Vec<YawcRenderElements>, GlesError> {
     let mut elements = Vec::new();
 
@@ -2365,7 +2520,7 @@ fn desktop_elements(
         elements.push(YawcRenderElements::from(
             MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
-                Point::<f64, Physical>::from((0.0, 0.0)),
+                location.to_physical(1.0),
                 wallpaper,
                 None,
                 None,
@@ -2426,23 +2581,6 @@ fn read_xrgb_framebuffer(
     })
 }
 
-fn draw_elements_back_to_front(
-    frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
-    elements: &[YawcRenderElements],
-) -> Result<(), GlesError> {
-    for element in elements.iter().rev() {
-        let geometry = element.geometry(RendererScale::from(1.0));
-        if geometry.size.w <= 0 || geometry.size.h <= 0 {
-            continue;
-        }
-        let local_damage = [Rectangle::from_size(geometry.size)];
-        element.draw(frame, element.src(), geometry, &local_damage, &[])?;
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "tty-udev")]
 fn draw_elements_back_to_front_with_offset(
     frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
     elements: &[YawcRenderElements],
@@ -2916,6 +3054,14 @@ fn overlay_image(image: &mut RgbaImage, icon: &RgbaImage, start_x: i32, start_y:
             continue;
         }
         blend_pixel(image, px as u32, py as u32, *pixel, alpha);
+    }
+}
+
+fn output_scale(scale: f64) -> OutputScale {
+    if (scale.fract()).abs() <= f64::EPSILON {
+        OutputScale::Integer(scale.round() as i32)
+    } else {
+        OutputScale::Fractional(scale)
     }
 }
 

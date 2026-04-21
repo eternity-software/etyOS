@@ -30,6 +30,7 @@ pub struct Config {
     keyboard: KeyboardConfig,
     window_controls: WindowControlsMode,
     screencopy_dmabuf: bool,
+    outputs: Vec<OutputConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +83,24 @@ pub struct KeyboardConfig {
     pub model: String,
     pub variant: String,
     pub options: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OutputConfig {
+    pub name: String,
+    pub enabled: Option<bool>,
+    pub primary: bool,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub scale: Option<f64>,
+    pub mode: Option<OutputModeConfig>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputModeConfig {
+    pub width: i32,
+    pub height: i32,
+    pub refresh_millihz: Option<i32>,
 }
 
 impl Default for AnimationConfig {
@@ -163,6 +182,7 @@ impl Config {
             keyboard: KeyboardConfig::default(),
             window_controls: WindowControlsMode::default(),
             screencopy_dmabuf: false,
+            outputs: Vec::new(),
         };
         config.reload();
         config
@@ -212,6 +232,10 @@ impl Config {
         self.screencopy_dmabuf
     }
 
+    pub fn outputs(&self) -> Vec<OutputConfig> {
+        self.outputs.clone()
+    }
+
     fn reload(&mut self) -> bool {
         let contents = match fs::read_to_string(&self.path) {
             Ok(contents) => contents,
@@ -231,6 +255,7 @@ impl Config {
         self.keyboard = parsed.keyboard;
         self.window_controls = parsed.window_controls;
         self.screencopy_dmabuf = parsed.screencopy_dmabuf;
+        self.outputs = parsed.outputs;
         self.modified = fs::metadata(&self.path)
             .and_then(|metadata| metadata.modified())
             .ok();
@@ -246,6 +271,7 @@ struct ParsedConfig {
     keyboard: KeyboardConfig,
     window_controls: WindowControlsMode,
     screencopy_dmabuf: bool,
+    outputs: Vec<OutputConfig>,
 }
 
 impl Hotkeys {
@@ -299,6 +325,7 @@ fn parse_config(contents: &str) -> ParsedConfig {
     let mut keyboard = KeyboardConfig::default();
     let mut window_controls = WindowControlsMode::default();
     let mut screencopy_dmabuf = false;
+    let mut outputs = Vec::new();
 
     for (line_number, raw_line) in contents.lines().enumerate() {
         let line = raw_line
@@ -316,6 +343,11 @@ fn parse_config(contents: &str) -> ParsedConfig {
         };
         let key = key.trim();
         let value = value.trim().trim_matches('"').trim_matches('\'');
+
+        if let Some((name, property)) = parse_output_key(key) {
+            parse_output_config(&mut outputs, name, property, value, line_number + 1);
+            continue;
+        }
 
         match normalize_name(key).as_str() {
             "hotkeymaximize" | "maximize" => hotkeys.maximize = parse_binding(value),
@@ -440,6 +472,99 @@ fn parse_config(contents: &str) -> ParsedConfig {
         keyboard,
         window_controls,
         screencopy_dmabuf,
+        outputs,
+    }
+}
+
+fn parse_output_key(key: &str) -> Option<(&str, &str)> {
+    let key = key.trim();
+    let rest = key.strip_prefix("output.")?;
+    let (name, property) = rest.rsplit_once('.')?;
+    let name = name.trim();
+    let property = property.trim();
+    (!name.is_empty() && !property.is_empty()).then_some((name, property))
+}
+
+fn parse_output_config(
+    outputs: &mut Vec<OutputConfig>,
+    name: &str,
+    property: &str,
+    value: &str,
+    line_number: usize,
+) {
+    let index = outputs
+        .iter()
+        .position(|output| output.name == name)
+        .unwrap_or_else(|| {
+            outputs.push(OutputConfig {
+                name: name.to_string(),
+                ..OutputConfig::default()
+            });
+            outputs.len() - 1
+        });
+    let output = &mut outputs[index];
+
+    match normalize_name(property).as_str() {
+        "enabled" | "enable" => {
+            if let Some(enabled) = parse_bool(value) {
+                output.enabled = Some(enabled);
+            } else {
+                warn!(
+                    line = line_number,
+                    value, "ignoring invalid output enabled boolean"
+                );
+            }
+        }
+        "primary" => {
+            if let Some(primary) = parse_bool(value) {
+                output.primary = primary;
+            } else {
+                warn!(
+                    line = line_number,
+                    value, "ignoring invalid output primary boolean"
+                );
+            }
+        }
+        "x" => {
+            if let Some(x) = parse_i32(value) {
+                output.x = Some(x);
+            } else {
+                warn!(
+                    line = line_number,
+                    value, "ignoring invalid output x position"
+                );
+            }
+        }
+        "y" => {
+            if let Some(y) = parse_i32(value) {
+                output.y = Some(y);
+            } else {
+                warn!(
+                    line = line_number,
+                    value, "ignoring invalid output y position"
+                );
+            }
+        }
+        "scale" => {
+            if let Some(scale) = parse_scale(value) {
+                output.scale = Some(scale);
+            } else {
+                warn!(line = line_number, value, "ignoring invalid output scale");
+            }
+        }
+        "mode" => {
+            if let Some(mode) = parse_output_mode(value) {
+                output.mode = Some(mode);
+            } else {
+                warn!(line = line_number, value, "ignoring invalid output mode");
+            }
+        }
+        _ => warn!(
+            line = line_number,
+            output = name,
+            property,
+            "ignoring unknown output property"
+        ),
     }
 }
 
@@ -459,6 +584,55 @@ fn parse_duration_ms(value: &str) -> Option<u64> {
         .unwrap_or(trimmed)
         .trim();
     without_suffix.parse::<u64>().ok()
+}
+
+fn parse_i32(value: &str) -> Option<i32> {
+    value.trim().parse::<i32>().ok()
+}
+
+fn parse_scale(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|scale| scale.is_finite() && *scale >= 0.5 && *scale <= 4.0)
+}
+
+fn parse_output_mode(value: &str) -> Option<OutputModeConfig> {
+    let value = value.trim();
+    let (size, refresh) = value
+        .split_once('@')
+        .map(|(size, refresh)| (size.trim(), Some(refresh.trim())))
+        .unwrap_or((value, None));
+    let (width, height) = size.split_once('x').or_else(|| size.split_once('X'))?;
+    let width = width
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|width| *width > 0)?;
+    let height = height
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|height| *height > 0)?;
+    let refresh_millihz = refresh.and_then(parse_refresh_millihz);
+
+    Some(OutputModeConfig {
+        width,
+        height,
+        refresh_millihz,
+    })
+}
+
+fn parse_refresh_millihz(value: &str) -> Option<i32> {
+    let value = value
+        .trim()
+        .strip_suffix("Hz")
+        .or_else(|| value.trim().strip_suffix("hz"))
+        .unwrap_or(value)
+        .trim();
+    let refresh = value.parse::<f64>().ok()?;
+    (refresh.is_finite() && refresh > 0.0).then(|| (refresh * 1000.0).round() as i32)
 }
 
 fn parse_window_controls(value: &str) -> Option<WindowControlsMode> {
@@ -650,4 +824,19 @@ close_animation_ms = 220
 #   buttons/windows/classic: show close/maximize/minimize buttons.
 window_controls = gestures
 screencopy_dmabuf = false
+
+# Outputs:
+#   Output names use DRM connector names such as HDMI-A-1, DP-1, or eDP-1.
+#   Unconfigured outputs are enabled automatically and placed left-to-right.
+#   Use output.<name>.primary = true to prefer an output for new windows.
+#   Use output.<name>.enabled = false to ignore an output.
+#   Use output.<name>.x/y to set logical position.
+#   Use output.<name>.scale for fractional logical scaling, for example 1.25.
+#   Use output.<name>.mode = WIDTHxHEIGHT[@HZ] to select a mode.
+#
+# output.DP-1.primary = true
+# output.DP-1.x = 0
+# output.DP-1.y = 0
+# output.DP-1.scale = 1
+# output.DP-1.mode = 2560x1440@120
 "#;

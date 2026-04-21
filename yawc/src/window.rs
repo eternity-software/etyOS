@@ -585,6 +585,11 @@ impl WindowStore {
         self.find(surface).and_then(|tracked| tracked.snap_side)
     }
 
+    pub fn app_id(&self, surface: &WlSurface) -> Option<String> {
+        self.find(surface)
+            .and_then(|tracked| tracked.app_id.clone())
+    }
+
     pub fn snap_restore_rect(&self, surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
         self.find(surface)
             .and_then(|tracked| tracked.snap_restore_rect)

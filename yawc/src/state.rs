@@ -1,4 +1,4 @@
-use std::{ffi::OsString, process::Command, sync::Arc, time::Instant};
+use std::{collections::HashMap, ffi::OsString, process::Command, sync::Arc, time::Instant};
 
 use smithay::{
     backend::allocator::Format,
@@ -76,7 +76,7 @@ pub struct Yawc {
     pub config: Config,
     pub titlebar_right_press: Option<WlSurface>,
     pub last_titlebar_click: Option<TitlebarClick>,
-    pub last_snap_side: Option<SnapSide>,
+    pub snap_memory: HashMap<String, SnapSide>,
     pub render_requested: bool,
     applied_keyboard_config: Option<KeyboardConfig>,
 }
@@ -137,7 +137,7 @@ impl Yawc {
             config,
             titlebar_right_press: None,
             last_titlebar_click: None,
-            last_snap_side: None,
+            snap_memory: HashMap::new(),
             render_requested: true,
             applied_keyboard_config: None,
         };
@@ -262,6 +262,68 @@ impl Yawc {
         std::mem::take(&mut self.render_requested)
     }
 
+    pub fn output_at(&self, location: Point<f64, Logical>) -> Option<Output> {
+        self.space
+            .outputs()
+            .find(|output| {
+                self.space
+                    .output_geometry(output)
+                    .map(|geometry| geometry.to_f64().contains(location))
+                    .unwrap_or(false)
+            })
+            .cloned()
+    }
+
+    pub fn output_for_window(&self, window: &Window) -> Option<Output> {
+        let rect = self.window_visual_rect(window)?;
+        self.output_for_rect(rect).cloned()
+    }
+
+    fn output_for_rect(&self, rect: Rectangle<i32, Logical>) -> Option<&Output> {
+        let center = Point::<i32, Logical>::from((
+            rect.loc.x + rect.size.w / 2,
+            rect.loc.y + rect.size.h / 2,
+        ));
+
+        self.space
+            .outputs()
+            .find(|output| {
+                self.space
+                    .output_geometry(output)
+                    .map(|geometry| geometry.contains(center))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                self.space.outputs().max_by_key(|output| {
+                    self.space
+                        .output_geometry(output)
+                        .and_then(|geometry| geometry.intersection(rect))
+                        .map(|overlap| overlap.size.w.max(0) * overlap.size.h.max(0))
+                        .unwrap_or(0)
+                })
+            })
+    }
+
+    pub fn output_geometry_at(
+        &self,
+        location: Point<f64, Logical>,
+    ) -> Option<Rectangle<i32, Logical>> {
+        self.output_at(location)
+            .and_then(|output| self.space.output_geometry(&output))
+    }
+
+    pub fn virtual_output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
+        let mut outputs = self.space.outputs();
+        let first = outputs.next()?;
+        let mut bounds = self.space.output_geometry(first)?;
+        for output in outputs {
+            if let Some(geometry) = self.space.output_geometry(output) {
+                bounds = rect_union(bounds, geometry);
+            }
+        }
+        Some(bounds)
+    }
+
     pub(crate) fn initial_window_location(&self, window: &Window) -> Point<i32, Logical> {
         let Some(surface) = window
             .toplevel()
@@ -272,7 +334,7 @@ impl Yawc {
         let uses_server_decoration = self.windows.uses_server_decoration(&surface);
         let content_size = non_empty_size(window.geometry().size, default_initial_window_size());
 
-        self.centered_content_location(content_size, uses_server_decoration)
+        self.centered_content_location_for(window, content_size, uses_server_decoration)
             .unwrap_or_else(|| Point::from((48, 48)))
     }
 
@@ -287,11 +349,13 @@ impl Yawc {
         }
 
         let uses_server_decoration = self.windows.uses_server_decoration(surface);
-        if let Some(side) = self
-            .last_snap_side
-            .filter(|_| !is_transient_toplevel(window))
-        {
-            if let Some((_, location, size)) = self.snap_layout(side, uses_server_decoration) {
+        if let Some(side) = self.snap_side_for_new_window(surface, window) {
+            let output_geometry = self
+                .placement_output_geometry(Some(window))
+                .or_else(|| self.output_geometry_for(None));
+            if let Some((_, location, size)) = output_geometry
+                .and_then(|geometry| self.snap_layout(side, uses_server_decoration, geometry))
+            {
                 if let Some(toplevel) = window.toplevel() {
                     self.windows.set_snap(surface, side, None);
                     self.space.map_element(window.clone(), location, false);
@@ -317,7 +381,7 @@ impl Yawc {
         }
 
         let location = self
-            .centered_content_location(content_size, uses_server_decoration)
+            .centered_content_location_for(window, content_size, uses_server_decoration)
             .unwrap_or_else(|| Point::from((48, 48)));
 
         self.space.map_element(window.clone(), location, false);
@@ -331,12 +395,26 @@ impl Yawc {
         );
     }
 
-    fn centered_content_location(
+    fn centered_content_location_for(
         &self,
+        window: &Window,
         content_size: Size<i32, Logical>,
         uses_server_decoration: bool,
     ) -> Option<Point<i32, Logical>> {
-        let output_geometry = self.output_geometry_for(None)?;
+        self.centered_content_location_for_window(
+            Some(window),
+            content_size,
+            uses_server_decoration,
+        )
+    }
+
+    fn centered_content_location_for_window(
+        &self,
+        window: Option<&Window>,
+        content_size: Size<i32, Logical>,
+        uses_server_decoration: bool,
+    ) -> Option<Point<i32, Logical>> {
+        let output_geometry = self.placement_output_geometry(window)?;
         let titlebar_height = if uses_server_decoration {
             crate::window::TITLEBAR_HEIGHT
         } else {
@@ -419,12 +497,12 @@ impl Yawc {
         &self,
         side: SnapSide,
         uses_server_decoration: bool,
+        output_geometry: Rectangle<i32, Logical>,
     ) -> Option<(
         Rectangle<i32, Logical>,
         Point<i32, Logical>,
         Size<i32, Logical>,
     )> {
-        let output_geometry = self.output_geometry_for(None)?;
         let titlebar_height = if uses_server_decoration {
             crate::window::TITLEBAR_HEIGHT
         } else {
@@ -634,8 +712,11 @@ impl Yawc {
                 .map(|location| window_content_rect(window, location))
         });
         let uses_server_decoration = self.windows.uses_server_decoration(&surface);
+        let Some(output_geometry) = self.output_geometry_for_window(window) else {
+            return;
+        };
         let Some((target_visual_rect, window_location, window_size)) =
-            self.snap_layout(side, uses_server_decoration)
+            self.snap_layout(side, uses_server_decoration, output_geometry)
         else {
             return;
         };
@@ -646,7 +727,9 @@ impl Yawc {
         }
 
         self.windows.set_snap(&surface, side, restore_rect);
-        self.last_snap_side = Some(side);
+        if let Some(app_id) = self.windows.app_id(&surface) {
+            self.snap_memory.insert(app_id, side);
+        }
         self.space.raise_element(window, true);
         self.space
             .map_element(window.clone(), window_location, false);
@@ -675,7 +758,7 @@ impl Yawc {
         let surface = toplevel.wl_surface().clone();
 
         if maximized {
-            let Some(output_geometry) = self.output_geometry_for(None) else {
+            let Some(output_geometry) = self.output_geometry_for_window(window) else {
                 return;
             };
             let restore_rect = if self.windows.is_maximized(&surface) {
@@ -895,7 +978,10 @@ impl Yawc {
         let surface = toplevel.wl_surface().clone();
 
         if fullscreen {
-            let Some(output_geometry) = self.output_geometry_for(requested_output.as_ref()) else {
+            let Some(output_geometry) = self
+                .output_geometry_for(requested_output.as_ref())
+                .or_else(|| self.output_geometry_for_window(window))
+            else {
                 return;
             };
             let restore_rect = if self.windows.is_fullscreen(&surface) {
@@ -989,6 +1075,66 @@ impl Yawc {
 
         self.space.outputs().next()
     }
+
+    fn output_geometry_for_window(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        self.output_for_window(window)
+            .and_then(|output| self.space.output_geometry(&output))
+            .or_else(|| self.placement_output_geometry(Some(window)))
+    }
+
+    fn placement_output_geometry(
+        &self,
+        window: Option<&Window>,
+    ) -> Option<Rectangle<i32, Logical>> {
+        if let Some(window) = window {
+            if let Some(parent_output) = self.parent_output_geometry(window) {
+                return Some(parent_output);
+            }
+            if let Some(output) = self.output_for_window(window) {
+                return self.space.output_geometry(&output);
+            }
+        }
+
+        if let Some(active) = self.windows.active_window() {
+            if let Some(output) = self.output_for_window(&active) {
+                return self.space.output_geometry(&output);
+            }
+        }
+
+        if let Some(pointer) = self.seat.get_pointer() {
+            if let Some(geometry) = self.output_geometry_at(pointer.current_location()) {
+                return Some(geometry);
+            }
+        }
+
+        self.space
+            .outputs()
+            .next()
+            .and_then(|output| self.space.output_geometry(output))
+    }
+
+    fn parent_output_geometry(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        let parent_surface = window.toplevel()?.parent()?;
+        self.space
+            .elements()
+            .find(|candidate| {
+                candidate
+                    .toplevel()
+                    .map(|toplevel| toplevel.wl_surface() == &parent_surface)
+                    .unwrap_or(false)
+            })
+            .and_then(|candidate| self.output_geometry_for_window(candidate))
+    }
+
+    fn snap_side_for_new_window(&self, surface: &WlSurface, window: &Window) -> Option<SnapSide> {
+        if is_transient_toplevel(window) {
+            return None;
+        }
+
+        self.windows
+            .app_id(surface)
+            .and_then(|app_id| self.snap_memory.get(&app_id).copied())
+    }
 }
 
 fn default_initial_window_size() -> Size<i32, Logical> {
@@ -1020,6 +1166,17 @@ fn non_empty_size(
     } else {
         default_initial_window_size()
     }
+}
+
+fn rect_union(
+    lhs: Rectangle<i32, Logical>,
+    rhs: Rectangle<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    let min_x = lhs.loc.x.min(rhs.loc.x);
+    let min_y = lhs.loc.y.min(rhs.loc.y);
+    let max_x = (lhs.loc.x + lhs.size.w).max(rhs.loc.x + rhs.size.w);
+    let max_y = (lhs.loc.y + lhs.size.h).max(rhs.loc.y + rhs.size.h);
+    Rectangle::new((min_x, min_y).into(), (max_x - min_x, max_y - min_y).into())
 }
 
 #[derive(Default)]

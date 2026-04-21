@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     rc::Rc,
@@ -58,6 +58,7 @@ use smithay::{
 use tracing::{error, info, warn};
 
 use crate::{
+    config::{OutputConfig, OutputModeConfig},
     render::{dnd_icon_elements, RenderState, YawcRenderElements},
     window::{WindowFrame, WindowStore},
     CalloopData,
@@ -159,20 +160,30 @@ impl<'a> RenderElement<TtyRenderer<'a>> for TtyYawcElement {
 struct TtyRuntime {
     node: DrmNode,
     drm_output_manager: TtyOutputManager,
-    drm_output: TtyOutput,
+    outputs: Vec<TtyOutputRuntime>,
     gpus: GpuManager<TtyRenderBackend>,
+    cursor_theme: TtyCursorTheme,
+    active: bool,
+    reset_buffers_each_frame: bool,
+    outputs_dirty: bool,
+    ctrl_down: bool,
+    alt_down: bool,
+}
+
+struct TtyOutputRuntime {
+    connector: connector::Handle,
+    name: String,
+    crtc: crtc::Handle,
+    drm_output: TtyOutput,
     render_state: RenderState,
     background: SolidColorBuffer,
-    cursor_theme: TtyCursorTheme,
     refresh_interval: Duration,
-    active: bool,
+    connected: bool,
+    primary: bool,
     frame_pending: bool,
     last_frame_queued: Option<Instant>,
     last_screencopy_frame: Option<Instant>,
     missed_vblank_warned: bool,
-    reset_buffers_each_frame: bool,
-    ctrl_down: bool,
-    alt_down: bool,
 }
 
 impl TtyRuntime {
@@ -181,27 +192,7 @@ impl TtyRuntime {
             return;
         }
 
-        if self.frame_pending {
-            let missed_vblank = self
-                .last_frame_queued
-                .map(|queued_at| queued_at.elapsed() > Duration::from_millis(250))
-                .unwrap_or(true);
-
-            if !missed_vblank {
-                return;
-            }
-
-            if !self.missed_vblank_warned {
-                warn!("forcing standalone render after missed drm vblank");
-                self.missed_vblank_warned = true;
-            }
-
-            if let Err(error) = self.drm_output.frame_submitted() {
-                warn!(?error, "failed to recover from missed drm vblank");
-            }
-            self.frame_pending = false;
-            self.last_frame_queued = None;
-        }
+        self.recover_missed_vblanks();
 
         let mut renderer = match self.gpus.single_renderer(&self.node) {
             Ok(renderer) => renderer,
@@ -222,7 +213,18 @@ impl TtyRuntime {
             .compositor_cursor
             .map(|shape| CursorImageStatus::Named(shape.to_cursor_icon()))
             .unwrap_or_else(|| data.state.cursor_image.clone());
-        data.state.reload_config_if_changed();
+        if data.state.reload_config_if_changed() {
+            self.outputs_dirty = true;
+        }
+        if self.outputs_dirty {
+            self.outputs_dirty = false;
+            rescan_outputs(
+                &mut self.drm_output_manager,
+                &mut self.outputs,
+                &mut renderer,
+                data,
+            );
+        }
         data.state.finish_close_animations();
         let animation_config = data.state.config.animations();
         let render_requested = data.state.take_render_requested();
@@ -240,72 +242,95 @@ impl TtyRuntime {
             .frames(&data.state.space, animation_config, controls_mode);
         let drew_display_frame = render_requested || animation_pending;
         if drew_display_frame {
-            let elements = render_elements(
-                &mut renderer,
-                &mut self.render_state,
-                &data.state.space,
-                &frames,
-                &data.state.windows,
-                animation_config,
-                &self.background,
-                &mut self.cursor_theme,
-                &cursor_image,
-                pointer_location,
-                data.state.dnd_icon.as_ref(),
-            );
+            for output in &mut self.outputs {
+                if !output.connected || output.frame_pending {
+                    continue;
+                }
 
-            if self.reset_buffers_each_frame {
-                self.drm_output.reset_buffers();
-            }
+                let elements = render_elements(
+                    &mut renderer,
+                    &mut output.render_state,
+                    &data.state.space,
+                    &frames,
+                    &data.state.windows,
+                    animation_config,
+                    &output.background,
+                    &mut self.cursor_theme,
+                    &cursor_image,
+                    pointer_location,
+                    data.state.dnd_icon.as_ref(),
+                );
 
-            match self.drm_output.render_frame(
-                &mut renderer,
-                &elements,
-                [0.06, 0.09, 0.11, 1.0],
-                // The early standalone backend should be predictable before it is clever:
-                // force a fully composited frame instead of allowing direct scanout planes.
-                FrameFlags::empty(),
-            ) {
-                Ok(result) => {
-                    if !result.is_empty {
-                        if let Err(error) = self.drm_output.queue_frame(()) {
-                            warn!(?error, "failed to queue drm frame");
-                        } else {
-                            self.frame_pending = true;
-                            self.last_frame_queued = Some(Instant::now());
-                            self.missed_vblank_warned = false;
+                if self.reset_buffers_each_frame {
+                    output.drm_output.reset_buffers();
+                }
+
+                match output.drm_output.render_frame(
+                    &mut renderer,
+                    &elements,
+                    [0.06, 0.09, 0.11, 1.0],
+                    // The early standalone backend should be predictable before it is clever:
+                    // force a fully composited frame instead of allowing direct scanout planes.
+                    FrameFlags::empty(),
+                ) {
+                    Ok(result) => {
+                        if !result.is_empty {
+                            if let Err(error) = output.drm_output.queue_frame(()) {
+                                warn!(?error, "failed to queue drm frame");
+                            } else {
+                                output.frame_pending = true;
+                                output.last_frame_queued = Some(Instant::now());
+                                output.missed_vblank_warned = false;
+                            }
                         }
                     }
+                    Err(error) => {
+                        warn!(?error, "standalone render_frame failed");
+                    }
                 }
-                Err(error) => {
-                    warn!(?error, "standalone render_frame failed");
-                }
+                drop(elements);
             }
-            drop(elements);
         }
 
-        let screencopy_interval = self.refresh_interval.max(Duration::from_millis(1));
-        let can_service_screencopy = self
-            .last_screencopy_frame
-            .map(|last_frame| last_frame.elapsed() >= screencopy_interval)
-            .unwrap_or(true);
-        if can_service_screencopy {
-            if let Some(request) = data.state.screencopy_state.pop_pending() {
-                self.last_screencopy_frame = Some(Instant::now());
-                capture_screencopy(
-                    &mut self.render_state,
-                    request,
-                    renderer.as_mut(),
-                    data,
-                    &frames,
-                    animation_config,
-                );
+        if let Some(request) = data.state.screencopy_state.pop_pending() {
+            let region = request.region();
+            if let Some(output_index) = output_index_for_region(&self.outputs, region) {
+                let output = &mut self.outputs[output_index];
+                let screencopy_interval = output.refresh_interval.max(Duration::from_millis(1));
+                let can_service_screencopy = output
+                    .last_screencopy_frame
+                    .map(|last_frame| last_frame.elapsed() >= screencopy_interval)
+                    .unwrap_or(true);
+                if can_service_screencopy {
+                    output.last_screencopy_frame = Some(Instant::now());
+                    capture_screencopy(
+                        &mut output.render_state,
+                        request,
+                        renderer.as_mut(),
+                        data,
+                        &frames,
+                        animation_config,
+                    );
+                } else {
+                    data.state.screencopy_state.push_pending_front(request);
+                }
+            } else {
+                request.cancel();
             }
         }
 
         if drew_display_frame {
-            let output = self.render_state.output().clone();
             data.state.space.elements().for_each(|window| {
+                let output = data.state.output_for_window(window).or_else(|| {
+                    self.outputs
+                        .iter()
+                        .find(|output| output.connected && output.primary)
+                        .or_else(|| self.outputs.iter().find(|output| output.connected))
+                        .map(|output| output.render_state.output().clone())
+                });
+                let Some(output) = output else {
+                    return;
+                };
                 window.send_frame(
                     &output,
                     data.state.start_time.elapsed(),
@@ -314,13 +339,24 @@ impl TtyRuntime {
                 );
             });
             if let Some(icon) = data.state.dnd_icon.as_ref() {
-                send_frames_surface_tree(
-                    icon,
-                    &output,
-                    data.state.start_time.elapsed(),
-                    Some(Duration::ZERO),
-                    |_, _| Some(output.clone()),
-                );
+                let output = pointer_location
+                    .and_then(|location| data.state.output_at(location))
+                    .or_else(|| {
+                        self.outputs
+                            .iter()
+                            .find(|output| output.connected && output.primary)
+                            .or_else(|| self.outputs.iter().find(|output| output.connected))
+                            .map(|output| output.render_state.output().clone())
+                    });
+                if let Some(output) = output {
+                    send_frames_surface_tree(
+                        icon,
+                        &output,
+                        data.state.start_time.elapsed(),
+                        Some(Duration::ZERO),
+                        |_, _| Some(output.clone()),
+                    );
+                }
             }
         }
 
@@ -329,13 +365,55 @@ impl TtyRuntime {
         let _ = data.display_handle.flush_clients();
     }
 
-    fn handle_vblank(&mut self) {
-        self.frame_pending = false;
-        self.last_frame_queued = None;
-        self.missed_vblank_warned = false;
-        if let Err(error) = self.drm_output.frame_submitted() {
-            warn!(?error, "failed to mark drm frame as submitted");
+    fn recover_missed_vblanks(&mut self) {
+        for output in &mut self.outputs {
+            if !output.connected || !output.frame_pending {
+                continue;
+            }
+
+            let missed_vblank = output
+                .last_frame_queued
+                .map(|queued_at| queued_at.elapsed() > Duration::from_millis(250))
+                .unwrap_or(true);
+
+            if !missed_vblank {
+                continue;
+            }
+
+            if !output.missed_vblank_warned {
+                warn!(?output.crtc, "forcing standalone render after missed drm vblank");
+                output.missed_vblank_warned = true;
+            }
+
+            if let Err(error) = output.drm_output.frame_submitted() {
+                warn!(?error, ?output.crtc, "failed to recover from missed drm vblank");
+            }
+            output.frame_pending = false;
+            output.last_frame_queued = None;
         }
+    }
+
+    fn handle_vblank(&mut self, crtc: crtc::Handle) {
+        let Some(output) = self.outputs.iter_mut().find(|output| output.crtc == crtc) else {
+            warn!(?crtc, "received vblank for unknown crtc");
+            return;
+        };
+
+        output.frame_pending = false;
+        output.last_frame_queued = None;
+        output.missed_vblank_warned = false;
+        if let Err(error) = output.drm_output.frame_submitted() {
+            warn!(?error, ?crtc, "failed to mark drm frame as submitted");
+        }
+    }
+
+    fn min_refresh_interval(&self) -> Duration {
+        self.outputs
+            .iter()
+            .filter(|output| output.connected)
+            .map(|output| output.refresh_interval)
+            .min()
+            .unwrap_or_else(|| Duration::from_millis(16))
     }
 
     fn handle_keyboard_shortcut(
@@ -380,6 +458,243 @@ impl TtyRuntime {
 
         false
     }
+}
+
+fn output_index_for_region(
+    outputs: &[TtyOutputRuntime],
+    region: Rectangle<i32, Logical>,
+) -> Option<usize> {
+    let center = Point::<i32, Logical>::from((
+        region.loc.x + region.size.w / 2,
+        region.loc.y + region.size.h / 2,
+    ));
+
+    outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, output)| output.connected)
+        .find(|(_, output)| output.render_state.output_geometry().contains(center))
+        .map(|(index, _)| index)
+        .or_else(|| outputs.iter().position(|output| output.connected))
+}
+
+fn rescan_outputs(
+    drm_output_manager: &mut TtyOutputManager,
+    outputs: &mut Vec<TtyOutputRuntime>,
+    renderer: &mut TtyRenderer<'_>,
+    data: &mut CalloopData,
+) {
+    let configs = data.state.config.outputs();
+    let selected = match select_connectors_and_modes(drm_output_manager.device(), &configs) {
+        Ok(selected) => selected,
+        Err(error) => {
+            warn!(?error, "failed to rescan drm outputs");
+            return;
+        }
+    };
+
+    let mut connected = HashSet::new();
+    let mut next_auto_x = 0;
+
+    for (index, (connector_info, crtc, mode)) in selected.into_iter().enumerate() {
+        let connector = connector_info.handle();
+        let name = connector_name(&connector_info);
+        connected.insert(connector);
+
+        let config = output_config(&configs, &name);
+        let scale = config.and_then(|config| config.scale).unwrap_or(1.0);
+        let output_size = Size::<i32, Physical>::from((mode.size().0 as i32, mode.size().1 as i32));
+        let logical_size = output_size.to_f64().to_logical(scale).to_i32_ceil();
+        let location = configured_or_auto_location(config, &mut next_auto_x, logical_size);
+        let refresh_hz = mode.vrefresh().max(1);
+        let refresh_millihz = (refresh_hz as i32).saturating_mul(1000);
+        let primary = config.map(|config| config.primary).unwrap_or(index == 0);
+
+        if let Some(output) = outputs
+            .iter_mut()
+            .find(|output| output.connector == connector)
+        {
+            output.connected = true;
+            output.primary = primary;
+            output.refresh_interval =
+                Duration::from_nanos(1_000_000_000 / refresh_hz.max(1) as u64);
+            output.background = SolidColorBuffer::new(
+                Size::<i32, Logical>::from((output_size.w, output_size.h)),
+                Color32F::from([0.10, 0.13, 0.16, 1.0]),
+            );
+
+            if output.crtc == crtc {
+                let render_elements: DrmOutputRenderElements<
+                    _,
+                    SpaceRenderElements<_, WaylandSurfaceRenderElement<_>>,
+                > = Default::default();
+                if output
+                    .render_state
+                    .output()
+                    .current_mode()
+                    .map(|current| {
+                        current.size != output_size || current.refresh != refresh_millihz
+                    })
+                    .unwrap_or(true)
+                {
+                    if let Err(error) = output.drm_output.use_mode(mode, renderer, &render_elements)
+                    {
+                        warn!(?error, output = %name, "failed to apply configured drm mode");
+                    }
+                }
+            } else {
+                warn!(
+                    output = %name,
+                    old_crtc = ?output.crtc,
+                    new_crtc = ?crtc,
+                    "output crtc changed; keeping existing drm output until restart"
+                );
+            }
+
+            output
+                .render_state
+                .reconfigure_output(output_size, refresh_millihz, location, scale);
+            data.state
+                .space
+                .map_output(output.render_state.output(), location);
+            info!(
+                output = %name,
+                x = location.x,
+                y = location.y,
+                scale,
+                primary,
+                "updated drm output"
+            );
+            continue;
+        }
+
+        match create_output_runtime(
+            drm_output_manager,
+            renderer,
+            &data.display_handle,
+            &mut data.state.space,
+            connector_info,
+            crtc,
+            mode,
+            index,
+            config,
+            &mut next_auto_x,
+        ) {
+            Ok(output) => outputs.push(output),
+            Err(error) => warn!(?error, "failed to initialize hotplugged drm output"),
+        }
+    }
+
+    for output in &mut *outputs {
+        if !connected.contains(&output.connector) && output.connected {
+            output.connected = false;
+            output.frame_pending = false;
+            output.last_frame_queued = None;
+            data.state.space.unmap_output(output.render_state.output());
+            info!(output = %output.name, "unmapped disconnected drm output");
+        }
+    }
+
+    outputs.sort_by_key(|output| (!output.primary, output.name.clone()));
+    for output in outputs.iter().filter(|output| output.connected) {
+        let geometry = output.render_state.output_geometry();
+        data.state.space.unmap_output(output.render_state.output());
+        data.state
+            .space
+            .map_output(output.render_state.output(), geometry.loc);
+    }
+
+    data.state.request_render();
+}
+
+fn create_output_runtime(
+    drm_output_manager: &mut TtyOutputManager,
+    renderer: &mut TtyRenderer<'_>,
+    display_handle: &smithay::reexports::wayland_server::DisplayHandle,
+    space: &mut Space<Window>,
+    connector_info: connector::Info,
+    crtc: crtc::Handle,
+    mode: smithay::reexports::drm::control::Mode,
+    index: usize,
+    config: Option<&OutputConfig>,
+    next_auto_x: &mut i32,
+) -> Result<TtyOutputRuntime, Box<dyn std::error::Error>> {
+    let output_name = connector_name(&connector_info);
+    let scale = config.and_then(|config| config.scale).unwrap_or(1.0);
+    let output_size = Size::<i32, Physical>::from((mode.size().0 as i32, mode.size().1 as i32));
+    let logical_size = output_size.to_f64().to_logical(scale).to_i32_ceil();
+    let output_location = configured_or_auto_location(config, next_auto_x, logical_size);
+
+    let background = SolidColorBuffer::new(
+        Size::<i32, Logical>::from((output_size.w, output_size.h)),
+        Color32F::from([0.10, 0.13, 0.16, 1.0]),
+    );
+    let refresh_hz = mode.vrefresh().max(1);
+    let refresh_millihz = (refresh_hz as i32).saturating_mul(1000);
+    let primary = config.map(|config| config.primary).unwrap_or(index == 0);
+    info!(
+        output = %output_name,
+        ?crtc,
+        x = output_location.x,
+        y = output_location.y,
+        scale,
+        width = output_size.w,
+        height = output_size.h,
+        refresh_hz,
+        primary,
+        "selected drm mode for standalone output"
+    );
+    let render_state = RenderState::new_standalone_at(
+        display_handle,
+        space,
+        output_size,
+        refresh_millihz,
+        output_name.clone(),
+        output_location,
+        scale,
+    );
+    let output = render_state.output().clone();
+    let available_planes = drm_output_manager
+        .device()
+        .planes(&crtc)
+        .map_err(|error| format!("failed to query drm planes: {error}"))?;
+    let safe_planes = Planes {
+        primary: available_planes.primary,
+        cursor: Vec::new(),
+        overlay: Vec::new(),
+    };
+    let render_elements: DrmOutputRenderElements<
+        _,
+        SpaceRenderElements<_, WaylandSurfaceRenderElement<_>>,
+    > = Default::default();
+    let drm_output = drm_output_manager
+        .initialize_output(
+            crtc,
+            mode,
+            &[connector_info.handle()],
+            &output,
+            Some(safe_planes),
+            renderer,
+            &render_elements,
+        )
+        .map_err(|error| format!("failed to initialize drm output: {error}"))?;
+
+    let refresh_interval = Duration::from_nanos(1_000_000_000 / refresh_hz.max(1) as u64);
+    Ok(TtyOutputRuntime {
+        connector: connector_info.handle(),
+        name: output_name,
+        crtc,
+        drm_output,
+        render_state,
+        background,
+        refresh_interval,
+        connected: true,
+        primary,
+        frame_pending: false,
+        last_frame_queued: None,
+        last_screencopy_frame: None,
+        missed_vblank_warned: false,
+    })
 }
 
 pub fn init(
@@ -511,54 +826,29 @@ pub fn init(
         renderer_dmabuf_formats,
     );
 
-    let (connector_info, crtc, mode) = select_connector_and_mode(drm_output_manager.device())?;
-    let output_size = Size::<i32, Physical>::from((mode.size().0 as i32, mode.size().1 as i32));
-    let background = SolidColorBuffer::new(
-        Size::<i32, Logical>::from((output_size.w, output_size.h)),
-        Color32F::from([0.10, 0.13, 0.16, 1.0]),
-    );
     let cursor_theme = TtyCursorTheme::load();
-    let refresh_hz = mode.vrefresh().max(1);
-    let refresh_millihz = (refresh_hz as i32).saturating_mul(1000);
-    info!(
-        width = output_size.w,
-        height = output_size.h,
-        refresh_hz,
-        "selected drm mode for standalone output"
-    );
-    let render_state = RenderState::new_standalone(
-        &data.display_handle,
-        &mut data.state.space,
-        output_size,
-        refresh_millihz,
-    );
-    let output = render_state.output().clone();
-    let available_planes = drm_output_manager
-        .device()
-        .planes(&crtc)
-        .map_err(|error| format!("failed to query drm planes: {error}"))?;
-    let safe_planes = Planes {
-        primary: available_planes.primary,
-        cursor: Vec::new(),
-        overlay: Vec::new(),
-    };
-    let render_elements: DrmOutputRenderElements<
-        _,
-        SpaceRenderElements<_, WaylandSurfaceRenderElement<_>>,
-    > = Default::default();
-    let drm_output = drm_output_manager
-        .initialize_output(
+    let output_configs = data.state.config.outputs();
+    let connectors = select_connectors_and_modes(drm_output_manager.device(), &output_configs)?;
+    let mut outputs = Vec::new();
+    let mut next_auto_x = 0;
+
+    for (index, (connector_info, crtc, mode)) in connectors.into_iter().enumerate() {
+        let output_name = connector_name(&connector_info);
+        let output = create_output_runtime(
+            &mut drm_output_manager,
+            &mut renderer,
+            &data.display_handle,
+            &mut data.state.space,
+            connector_info,
             crtc,
             mode,
-            &[connector_info.handle()],
-            &output,
-            Some(safe_planes),
-            &mut renderer,
-            &render_elements,
-        )
-        .map_err(|error| format!("failed to initialize drm output: {error}"))?;
+            index,
+            output_config(&output_configs, &output_name),
+            &mut next_auto_x,
+        )?;
+        outputs.push(output);
+    }
 
-    let refresh_interval = Duration::from_nanos(1_000_000_000 / refresh_hz.max(1) as u64);
     let reset_buffers_each_frame = std::env::var("YAWC_DRM_RESET_BUFFERS_EACH_FRAME")
         .map(|value| value != "0")
         .unwrap_or(false);
@@ -569,18 +859,12 @@ pub fn init(
     let runtime = Rc::new(RefCell::new(TtyRuntime {
         node,
         drm_output_manager,
-        drm_output,
+        outputs,
         gpus,
-        render_state,
-        background,
         cursor_theme,
-        refresh_interval,
         active: true,
-        frame_pending: false,
-        last_frame_queued: None,
-        last_screencopy_frame: None,
-        missed_vblank_warned: false,
         reset_buffers_each_frame,
+        outputs_dirty: false,
         ctrl_down: false,
         alt_down: false,
     }));
@@ -590,8 +874,8 @@ pub fn init(
         event_loop.handle().insert_source(
             drm_notifier,
             move |event, metadata, _data| match event {
-                DrmEvent::VBlank(_) => {
-                    runtime.borrow_mut().handle_vblank();
+                DrmEvent::VBlank(crtc) => {
+                    runtime.borrow_mut().handle_vblank(crtc);
                     if metadata.is_none() {
                         warn!("drm vblank arrived without metadata");
                     }
@@ -609,23 +893,30 @@ pub fn init(
             .handle()
             .insert_source(Timer::immediate(), move |_, _, data| {
                 runtime.borrow_mut().render(data);
-                TimeoutAction::ToDuration(runtime.borrow().refresh_interval)
+                TimeoutAction::ToDuration(runtime.borrow().min_refresh_interval())
             })?;
     }
 
-    event_loop
-        .handle()
-        .insert_source(udev_backend, |event, _, _data| match event {
-            UdevEvent::Added { device_id, path } => {
-                info!(?device_id, ?path, "detected drm device");
-            }
-            UdevEvent::Changed { device_id } => {
-                info!(?device_id, "drm device changed");
-            }
-            UdevEvent::Removed { device_id } => {
-                warn!(?device_id, "drm device removed");
-            }
-        })?;
+    {
+        let runtime = Rc::clone(&runtime);
+        event_loop
+            .handle()
+            .insert_source(udev_backend, move |event, _, data| {
+                runtime.borrow_mut().outputs_dirty = true;
+                data.state.request_render();
+                match event {
+                    UdevEvent::Added { device_id, path } => {
+                        info!(?device_id, ?path, "detected drm device");
+                    }
+                    UdevEvent::Changed { device_id } => {
+                        info!(?device_id, "drm device changed");
+                    }
+                    UdevEvent::Removed { device_id } => {
+                        warn!(?device_id, "drm device removed");
+                    }
+                }
+            })?;
+    }
 
     let mut libinput_context =
         Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
@@ -692,9 +983,12 @@ pub fn init(
                         error!(?error, "failed to reactivate drm output manager");
                     }
                     runtime.active = true;
-                    runtime.frame_pending = false;
-                    runtime.last_frame_queued = None;
-                    runtime.missed_vblank_warned = false;
+                    for output in &mut runtime.outputs {
+                        output.frame_pending = false;
+                        output.last_frame_queued = None;
+                        output.missed_vblank_warned = false;
+                    }
+                    runtime.outputs_dirty = true;
                 }
             })?;
     }
@@ -1090,46 +1384,160 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn select_connector_and_mode(
+fn select_connectors_and_modes(
     drm_device: &DrmDevice,
+    configs: &[OutputConfig],
 ) -> Result<
-    (
+    Vec<(
         connector::Info,
         crtc::Handle,
         smithay::reexports::drm::control::Mode,
-    ),
+    )>,
     Box<dyn std::error::Error>,
 > {
     let resources = drm_device.resource_handles()?;
-    let connector_info = resources
+    let mut used_crtcs = HashSet::new();
+    let mut outputs = Vec::new();
+    let mut connected = resources
         .connectors()
         .iter()
         .filter_map(|connector| drm_device.get_connector(*connector, true).ok())
-        .find(|info| info.state() == connector::State::Connected && !info.modes().is_empty())
-        .ok_or("no connected drm connector with a valid mode found")?;
-
-    let encoder_handle = connector_info
-        .current_encoder()
-        .or_else(|| connector_info.encoders().first().copied())
-        .ok_or("connected connector has no encoder")?;
-    let encoder_info = drm_device.get_encoder(encoder_handle)?;
-    let crtc = encoder_info
-        .crtc()
-        .or_else(|| {
-            resources
-                .filter_crtcs(encoder_info.possible_crtcs())
-                .first()
-                .copied()
+        .filter(|info| info.state() == connector::State::Connected && !info.modes().is_empty())
+        .filter(|info| {
+            output_config(configs, &connector_name(info))
+                .and_then(|config| config.enabled)
+                .unwrap_or(true)
         })
-        .ok_or("encoder has no usable crtc")?;
-    let mode = select_best_mode(&connector_info).ok_or("connected connector reported no modes")?;
+        .collect::<Vec<_>>();
+    connected.sort_by_key(|info| {
+        let name = connector_name(info);
+        let config = output_config(configs, &name);
+        (
+            !config.map(|config| config.primary).unwrap_or(false),
+            config.and_then(|config| config.x).unwrap_or(i32::MAX),
+            config.and_then(|config| config.y).unwrap_or(i32::MAX),
+            name,
+        )
+    });
 
-    Ok((connector_info, crtc, mode))
+    for connector_info in connected {
+        let config = output_config(configs, &connector_name(&connector_info));
+        let Some(mode) = select_best_mode(&connector_info, config.and_then(|config| config.mode))
+        else {
+            continue;
+        };
+        let Some(crtc) =
+            select_crtc_for_connector(drm_device, &resources, &connector_info, &used_crtcs)?
+        else {
+            warn!(
+                connector = %connector_name(&connector_info),
+                "connected connector has no unused crtc"
+            );
+            continue;
+        };
+        used_crtcs.insert(crtc);
+        outputs.push((connector_info, crtc, mode));
+    }
+
+    if outputs.is_empty() {
+        return Err("no connected drm connector with a valid mode found".into());
+    }
+
+    Ok(outputs)
+}
+
+fn select_crtc_for_connector(
+    drm_device: &DrmDevice,
+    resources: &smithay::reexports::drm::control::ResourceHandles,
+    connector_info: &connector::Info,
+    used_crtcs: &HashSet<crtc::Handle>,
+) -> Result<Option<crtc::Handle>, Box<dyn std::error::Error>> {
+    let mut encoders = Vec::new();
+    if let Some(encoder) = connector_info.current_encoder() {
+        encoders.push(encoder);
+    }
+    for encoder in connector_info.encoders().iter().copied() {
+        if !encoders.contains(&encoder) {
+            encoders.push(encoder);
+        }
+    }
+
+    for encoder_handle in encoders {
+        let encoder_info = drm_device.get_encoder(encoder_handle)?;
+        if let Some(crtc) = encoder_info
+            .crtc()
+            .filter(|crtc| !used_crtcs.contains(crtc))
+        {
+            return Ok(Some(crtc));
+        }
+
+        if let Some(crtc) = resources
+            .filter_crtcs(encoder_info.possible_crtcs())
+            .into_iter()
+            .find(|crtc| !used_crtcs.contains(crtc))
+        {
+            return Ok(Some(crtc));
+        }
+    }
+
+    Ok(None)
+}
+
+fn connector_name(connector_info: &connector::Info) -> String {
+    format!(
+        "{}-{}",
+        connector_info.interface().as_str(),
+        connector_info.interface_id()
+    )
+}
+
+fn output_config<'a>(configs: &'a [OutputConfig], name: &str) -> Option<&'a OutputConfig> {
+    configs.iter().find(|config| config.name == name)
+}
+
+fn configured_or_auto_location(
+    config: Option<&OutputConfig>,
+    next_auto_x: &mut i32,
+    logical_size: Size<i32, Logical>,
+) -> Point<i32, Logical> {
+    if let Some(config) = config {
+        if let (Some(x), Some(y)) = (config.x, config.y) {
+            return (x, y).into();
+        }
+    }
+
+    let location = (*next_auto_x, 0).into();
+    *next_auto_x += logical_size.w.max(1);
+    location
 }
 
 fn select_best_mode(
     connector_info: &connector::Info,
+    configured: Option<OutputModeConfig>,
 ) -> Option<smithay::reexports::drm::control::Mode> {
+    if let Some(configured) = configured {
+        if let Some(mode) = connector_info.modes().iter().copied().find(|mode| {
+            let (width, height) = mode.size();
+            width as i32 == configured.width
+                && height as i32 == configured.height
+                && configured
+                    .refresh_millihz
+                    .map(|refresh| {
+                        ((mode.vrefresh() as i32).saturating_mul(1000) - refresh).abs() <= 1000
+                    })
+                    .unwrap_or(true)
+        }) {
+            return Some(mode);
+        }
+        warn!(
+            connector = %connector_name(connector_info),
+            width = configured.width,
+            height = configured.height,
+            refresh_millihz = configured.refresh_millihz,
+            "configured output mode is unavailable; using best mode"
+        );
+    }
+
     connector_info.modes().iter().copied().max_by_key(|mode| {
         let (width, height) = mode.size();
         let area = width as u64 * height as u64;

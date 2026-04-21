@@ -70,6 +70,10 @@ impl ScreencopyState {
         self.pending.push(request);
     }
 
+    pub fn push_pending_front(&mut self, request: PendingScreencopy) {
+        self.pending.insert(0, request);
+    }
+
     pub fn take_pending(&mut self) -> Vec<PendingScreencopy> {
         std::mem::take(&mut self.pending)
     }
@@ -134,6 +138,10 @@ impl PendingScreencopy {
                 self.frame.failed();
             }
         }
+    }
+
+    pub fn cancel(self) {
+        self.frame.failed();
     }
 
     fn send_ready(&self) {
@@ -278,7 +286,12 @@ impl Yawc {
         let full = Rectangle::new((0, 0).into(), geometry.size);
 
         let region = requested_region.unwrap_or(full);
-        clip_rect(region, full)
+        clip_rect(region, full).map(|region| {
+            Rectangle::new(
+                (geometry.loc.x + region.loc.x, geometry.loc.y + region.loc.y).into(),
+                region.size,
+            )
+        })
     }
 
     fn output_for_screencopy(&self, requested_output: &WlOutput) -> Option<&Output> {
