@@ -4,7 +4,7 @@ use std::{
 };
 
 use smithay::{
-    backend::allocator::Fourcc,
+    backend::allocator::{dmabuf::Dmabuf, Fourcc},
     output::Output,
     reexports::{
         wayland_protocols_wlr::screencopy::v1::server::{
@@ -18,9 +18,12 @@ use smithay::{
         },
     },
     utils::{Logical, Rectangle, Size},
-    wayland::shm::{with_buffer_contents_mut, BufferData},
+    wayland::{
+        dmabuf::get_dmabuf,
+        shm::{with_buffer_contents_mut, BufferData},
+    },
 };
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::state::Yawc;
 
@@ -32,7 +35,7 @@ pub struct ScreencopyState {
 #[derive(Clone, Debug)]
 pub struct PendingScreencopy {
     frame: ZwlrScreencopyFrameV1,
-    buffer: WlBuffer,
+    buffer: ScreencopyBuffer,
     region: Rectangle<i32, Logical>,
     with_damage: bool,
 }
@@ -42,6 +45,12 @@ pub struct CapturedFrame {
     pub size: Size<i32, Logical>,
     pub stride: i32,
     pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScreencopyBuffer {
+    wl_buffer: WlBuffer,
+    dmabuf: Option<Dmabuf>,
 }
 
 struct ScreencopyFrameData {
@@ -65,6 +74,10 @@ impl ScreencopyState {
         std::mem::take(&mut self.pending)
     }
 
+    pub fn pop_pending(&mut self) -> Option<PendingScreencopy> {
+        (!self.pending.is_empty()).then(|| self.pending.remove(0))
+    }
+
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
@@ -75,10 +88,31 @@ impl PendingScreencopy {
         self.region
     }
 
+    pub fn dmabuf(&self) -> Option<Dmabuf> {
+        self.buffer.dmabuf.clone()
+    }
+
+    pub fn finish_dmabuf(self, captured: Result<(), String>) {
+        match captured {
+            Ok(()) => {
+                self.send_ready();
+                trace!(
+                    width = self.region.size.w,
+                    height = self.region.size.h,
+                    "completed dmabuf screencopy frame"
+                );
+            }
+            Err(message) => {
+                warn!(message, "failed to capture dmabuf screencopy frame");
+                self.frame.failed();
+            }
+        }
+    }
+
     pub fn finish(self, captured: Result<CapturedFrame, String>) {
         match captured {
             Ok(captured) => {
-                if let Err(message) = copy_frame_to_buffer(&self.buffer, &captured) {
+                if let Err(message) = copy_frame_to_buffer(&self.buffer.wl_buffer, &captured) {
                     warn!(
                         message,
                         "failed to copy screencopy frame into client buffer"
@@ -87,20 +121,8 @@ impl PendingScreencopy {
                     return;
                 }
 
-                if self.with_damage {
-                    self.frame.damage(
-                        0,
-                        0,
-                        captured.size.w.max(0) as u32,
-                        captured.size.h.max(0) as u32,
-                    );
-                }
-
-                self.frame.flags(zwlr_screencopy_frame_v1::Flags::empty());
-                let (sec_hi, sec_lo, nsec) = now_timestamp();
-                self.frame.ready(sec_hi, sec_lo, nsec);
-                self.buffer.release();
-                debug!(
+                self.send_ready();
+                trace!(
                     width = captured.size.w,
                     height = captured.size.h,
                     stride = captured.stride,
@@ -112,6 +134,22 @@ impl PendingScreencopy {
                 self.frame.failed();
             }
         }
+    }
+
+    fn send_ready(&self) {
+        if self.with_damage {
+            self.frame.damage(
+                0,
+                0,
+                self.region.size.w.max(0) as u32,
+                self.region.size.h.max(0) as u32,
+            );
+        }
+
+        self.frame.flags(zwlr_screencopy_frame_v1::Flags::empty());
+        let (sec_hi, sec_lo, nsec) = now_timestamp();
+        self.frame.ready(sec_hi, sec_lo, nsec);
+        self.buffer.wl_buffer.release();
     }
 }
 
@@ -153,14 +191,14 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for Yawc {
                     frame.failed();
                     return;
                 };
-                debug!(
+                trace!(
                     x = region.loc.x,
                     y = region.loc.y,
                     width = region.size.w,
                     height = region.size.h,
                     "screencopy capture_output requested"
                 );
-                init_frame(frame, region, data_init);
+                init_frame(frame, region, state.config.screencopy_dmabuf(), data_init);
             }
             zwlr_screencopy_manager_v1::Request::CaptureOutputRegion {
                 frame,
@@ -191,14 +229,14 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for Yawc {
                     frame.failed();
                     return;
                 };
-                debug!(
+                trace!(
                     x = region.loc.x,
                     y = region.loc.y,
                     width = region.size.w,
                     height = region.size.h,
                     "screencopy capture_output_region requested"
                 );
-                init_frame(frame, region, data_init);
+                init_frame(frame, region, state.config.screencopy_dmabuf(), data_init);
             }
             zwlr_screencopy_manager_v1::Request::Destroy => {}
             _ => {}
@@ -254,6 +292,7 @@ impl Yawc {
 fn init_frame(
     frame: New<ZwlrScreencopyFrameV1>,
     region: Rectangle<i32, Logical>,
+    _allow_dmabuf: bool,
     data_init: &mut DataInit<'_, Yawc>,
 ) {
     let width = region.size.w.max(1) as u32;
@@ -292,13 +331,17 @@ fn queue_copy(
         return;
     }
 
+    let dmabuf = get_dmabuf(&buffer).ok().cloned();
     state.screencopy_state.push_pending(PendingScreencopy {
         frame: frame.clone(),
-        buffer,
+        buffer: ScreencopyBuffer {
+            wl_buffer: buffer,
+            dmabuf,
+        },
         region: data.region,
         with_damage,
     });
-    debug!(
+    trace!(
         x = data.region.loc.x,
         y = data.region.loc.y,
         width = data.region.size.w,

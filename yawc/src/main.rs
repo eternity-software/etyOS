@@ -12,6 +12,7 @@ mod window;
 #[cfg(feature = "tty-udev")]
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
 
 use smithay::reexports::{
     calloop::EventLoop,
@@ -62,6 +63,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     update_activation_environment();
+    #[cfg(feature = "tty-udev")]
+    if matches!(cli.backend, BackendKind::Standalone) {
+        refresh_portal_services();
+    }
 
     let startup_command = cli.command.or_else(|| default_startup_command(cli.backend));
 
@@ -83,6 +88,7 @@ fn ensure_session_environment_defaults() {
     set_env_default("SDL_VIDEODRIVER", "wayland");
     set_env_default("CLUTTER_BACKEND", "wayland");
     set_env_default("MOZ_ENABLE_WAYLAND", "1");
+    set_env_default("EGL_PLATFORM", "wayland");
 }
 
 fn set_env_default(key: &str, value: &str) {
@@ -106,6 +112,10 @@ fn update_activation_environment() {
         "SDL_VIDEODRIVER",
         "CLUTTER_BACKEND",
         "MOZ_ENABLE_WAYLAND",
+        "EGL_PLATFORM",
+        "GBM_BACKEND",
+        "__EGL_VENDOR_LIBRARY_FILENAMES",
+        "__GLX_VENDOR_LIBRARY_NAME",
     ];
 
     let active_names: Vec<&str> = ENV_NAMES
@@ -147,6 +157,33 @@ fn run_activation_command(mut command: Command, label: &str) {
             );
         }
     }
+}
+
+#[cfg(feature = "tty-udev")]
+fn refresh_portal_services() {
+    if matches!(
+        std::env::var("YAWC_SKIP_PORTAL_RESTART").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    ) {
+        return;
+    }
+
+    let services = [
+        "xdg-desktop-portal-wlr.service",
+        "xdg-desktop-portal.service",
+    ];
+
+    let mut reset = Command::new("systemctl");
+    reset.arg("--user").arg("reset-failed").args(services);
+    run_activation_command(reset, "systemctl --user reset-failed portals");
+
+    let mut restart = Command::new("systemctl");
+    restart
+        .arg("--user")
+        .arg("restart")
+        .arg("--no-block")
+        .args(services);
+    run_activation_command(restart, "systemctl --user restart portals");
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -213,7 +250,6 @@ fn default_startup_command(backend: BackendKind) -> Option<String> {
             "alacritty",
             "wezterm",
             "kitty",
-            "konsole",
             "gnome-terminal",
             "xfce4-terminal",
             "qterminal",
@@ -221,6 +257,10 @@ fn default_startup_command(backend: BackendKind) -> Option<String> {
             if let Some(path) = command_path(candidate) {
                 return Some(path.to_string_lossy().into_owned());
             }
+        }
+
+        if let Some(path) = command_path("konsole") {
+            return Some(format!("{} --separate", path.to_string_lossy()));
         }
     }
 
@@ -256,11 +296,28 @@ fn spawn_startup_client(command: String, _backend: BackendKind) {
             .env("QT_QPA_PLATFORM", "wayland")
             .env("SDL_VIDEODRIVER", "wayland")
             .env("CLUTTER_BACKEND", "wayland")
-            .env("MOZ_ENABLE_WAYLAND", "1");
+            .env("MOZ_ENABLE_WAYLAND", "1")
+            .env("EGL_PLATFORM", "wayland");
     }
 
-    if let Err(error) = child.spawn() {
-        tracing::warn!(?error, command = %command, "failed to spawn startup client");
+    match child.spawn() {
+        Ok(mut child) => {
+            thread::spawn(move || match child.wait() {
+                Ok(status) => {
+                    if status.success() {
+                        info!(command = %command, ?status, "startup client exited");
+                    } else {
+                        warn!(command = %command, ?status, "startup client exited with failure");
+                    }
+                }
+                Err(error) => {
+                    warn!(?error, command = %command, "failed to wait for startup client");
+                }
+            });
+        }
+        Err(error) => {
+            warn!(?error, command = %command, "failed to spawn startup client");
+        }
     }
 }
 

@@ -47,16 +47,18 @@ use crate::{
     state::Yawc,
     window::{WindowAnimation, WindowFrame, BUTTON_PADDING, FRAME_RADIUS, TITLEBAR_HEIGHT},
 };
-#[cfg(feature = "tty-udev")]
 use smithay::backend::renderer::{Bind, Offscreen};
 
 smithay::backend::renderer::element::render_elements! {
     pub YawcRenderElements<=GlesRenderer>;
     Space=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
+    Texture=TextureRenderElement<GlesTexture>,
     TextureShader=TextureShaderElement,
+    Shape=ShapeElement,
     TitlebarBlur=TitlebarBlurElement,
     RoundedSurface=RoundedSurfaceElement,
+    CsdRoundedSurface=CsdRoundedSurfaceElement,
     AnimatedSurface=AnimatedSurfaceElement,
 }
 
@@ -69,6 +71,13 @@ const ICON_SIZE: u32 = 20;
 const ICON_GAP: i32 = 10;
 const BLUR_PAD_X: i32 = 48;
 const BLUR_PAD_Y: i32 = 96;
+const CSD_RADIUS: i32 = 10;
+const SHADOW_PAD: i32 = 28;
+const SHADOW_OFFSET_Y: i32 = 8;
+const SHADOW_OPACITY: f32 = 0.16;
+const SHADOW_SPREAD: f32 = 18.0;
+const TITLEBAR_SHAPE_MODE: f32 = 0.0;
+const SHADOW_SHAPE_MODE: f32 = 1.0;
 const TITLEBAR_BLUR_SHADER: &str = r#"
 //_DEFINES_
 
@@ -76,7 +85,7 @@ const TITLEBAR_BLUR_SHADER: &str = r#"
 #extension GL_OES_EGL_image_external : require
 #endif
 
-precision mediump float;
+precision highp float;
 #if defined(EXTERNAL)
 uniform samplerExternalOES tex;
 #else
@@ -92,26 +101,28 @@ uniform vec2 src_size;
 uniform float flip_y;
 varying vec2 v_coords;
 
-float inside_top_round(vec2 p, vec2 size, float r) {
+float top_round_alpha(vec2 p, vec2 size, float r) {
     if (p.x < 0.0 || p.y < 0.0 || p.x >= size.x || p.y >= size.y) {
         return 0.0;
     }
-    if (p.y >= r) {
+    r = min(r, min(size.x, size.y) * 0.5);
+    if (r <= 0.0) {
         return 1.0;
     }
-    if (p.x >= r && p.x < size.x - r) {
+    if (p.y >= r || (p.x >= r && p.x < size.x - r)) {
         return 1.0;
     }
 
     vec2 center = vec2(p.x < r ? r : size.x - r, r);
-    vec2 delta = p - center;
-    return dot(delta, delta) <= r * r ? 1.0 : 0.0;
+    float dist = length(p - center) - r;
+    return 1.0 - smoothstep(-1.25, 1.25, dist);
 }
 
 void main() {
     vec2 local_coords = (v_coords - src_origin) / src_size;
     vec2 pos = local_coords * area_size;
-    if (inside_top_round(pos, area_size, radius) < 0.5) {
+    float corner_alpha = top_round_alpha(pos, area_size, radius);
+    if (corner_alpha <= 0.0) {
         gl_FragColor = vec4(0.0);
         return;
     }
@@ -119,11 +130,11 @@ void main() {
     vec2 sample_coords = vec2(v_coords.x, mix(v_coords.y, 1.0 - v_coords.y, flip_y));
     vec4 color = vec4(0.0);
     float total = 0.0;
-    const float sigma = 4.0;
-    const float blur_step = 3.0;
+    const float sigma = 3.5;
+    const float blur_step = 1.75;
 
-    for (int ix = -4; ix <= 4; ++ix) {
-        for (int iy = -4; iy <= 4; ++iy) {
+    for (int ix = -6; ix <= 6; ++ix) {
+        for (int iy = -6; iy <= 6; ++iy) {
             vec2 offset = vec2(float(ix), float(iy)) * texel_size * blur_step;
             float dist2 = float(ix * ix + iy * iy);
             float weight = exp(-dist2 / (2.0 * sigma * sigma));
@@ -133,6 +144,7 @@ void main() {
     }
 
     color /= total;
+    color.rgb = mix(color.rgb, vec3(0.42, 0.44, 0.47), 0.045);
 
 #if defined(NO_ALPHA)
     color = vec4(color.rgb, 1.0) * alpha;
@@ -140,7 +152,7 @@ void main() {
     color = color * alpha;
 #endif
 
-    gl_FragColor = color;
+    gl_FragColor = color * corner_alpha;
 }"#;
 const CLIENT_CLIP_SHADER: &str = r#"
 //_DEFINES_
@@ -149,7 +161,7 @@ const CLIENT_CLIP_SHADER: &str = r#"
 #extension GL_OES_EGL_image_external : require
 #endif
 
-precision mediump float;
+precision highp float;
 #if defined(EXTERNAL)
 uniform samplerExternalOES tex;
 #else
@@ -163,25 +175,27 @@ uniform vec2 element_size;
 uniform float radius;
 varying vec2 v_coords;
 
-float inside_bottom_round(vec2 p, vec2 size, float r) {
+float bottom_round_alpha(vec2 p, vec2 size, float r) {
     if (p.x < 0.0 || p.y < 0.0 || p.x >= size.x || p.y >= size.y) {
         return 0.0;
     }
-    if (p.y < size.y - r) {
+    r = min(r, min(size.x, size.y) * 0.5);
+    if (r <= 0.0) {
         return 1.0;
     }
-    if (p.x >= r && p.x < size.x - r) {
+    if (p.y < size.y - r || (p.x >= r && p.x < size.x - r)) {
         return 1.0;
     }
 
     vec2 center = vec2(p.x < r ? r : size.x - r, size.y - r);
-    vec2 delta = p - center;
-    return dot(delta, delta) <= r * r ? 1.0 : 0.0;
+    float dist = length(p - center) - r;
+    return 1.0 - smoothstep(-1.25, 1.25, dist);
 }
 
 void main() {
     vec2 pos = element_offset + v_coords * element_size;
-    if (inside_bottom_round(pos, client_size, radius) < 0.5) {
+    float corner_alpha = bottom_round_alpha(pos, client_size, radius);
+    if (corner_alpha <= 0.0) {
         gl_FragColor = vec4(0.0);
         return;
     }
@@ -194,7 +208,139 @@ void main() {
     color = color * alpha;
 #endif
 
-    gl_FragColor = color;
+    gl_FragColor = color * corner_alpha;
+}"#;
+const CSD_CLIP_SHADER: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+#endif
+
+precision highp float;
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+uniform float alpha;
+uniform vec2 client_size;
+uniform vec2 element_offset;
+uniform vec2 element_size;
+uniform float radius;
+varying vec2 v_coords;
+
+float rounded_distance(vec2 p, vec2 origin, vec2 size, float r) {
+    r = min(r, min(size.x, size.y) * 0.5);
+    vec2 center = origin + size * 0.5;
+    vec2 half_size = size * 0.5 - vec2(r);
+    vec2 q = abs(p - center) - half_size;
+    return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+float round_alpha(vec2 p, vec2 size, float r) {
+    if (p.x < 0.0 || p.y < 0.0 || p.x >= size.x || p.y >= size.y) {
+        return 0.0;
+    }
+    r = min(r, min(size.x, size.y) * 0.5);
+    if (r <= 0.0) {
+        return 1.0;
+    }
+
+    float dist = rounded_distance(p, vec2(0.0), size, r);
+    return 1.0 - smoothstep(-1.25, 1.25, dist);
+}
+
+void main() {
+    vec2 pos = element_offset + v_coords * element_size;
+    float corner_alpha = round_alpha(pos, client_size, radius);
+    if (corner_alpha <= 0.0) {
+        gl_FragColor = vec4(0.0);
+        return;
+    }
+
+    vec4 color = texture2D(tex, v_coords);
+
+#if defined(NO_ALPHA)
+    color = vec4(color.rgb, 1.0) * alpha;
+#else
+    color = color * alpha;
+#endif
+
+    gl_FragColor = color * corner_alpha;
+}"#;
+const SHAPE_SHADER: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+#endif
+
+precision highp float;
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+uniform float alpha;
+uniform vec2 area_size;
+uniform vec4 color;
+uniform vec4 inner_rect;
+uniform float radius;
+uniform float mode;
+uniform float spread;
+varying vec2 v_coords;
+
+float rounded_distance(vec2 p, vec2 origin, vec2 size, float r) {
+    r = min(r, min(size.x, size.y) * 0.5);
+    vec2 center = origin + size * 0.5;
+    vec2 half_size = size * 0.5 - vec2(r);
+    vec2 q = abs(p - center) - half_size;
+    return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+float top_round_alpha(vec2 p, vec2 size, float r) {
+    if (p.x < 0.0 || p.y < 0.0 || p.x >= size.x || p.y >= size.y) {
+        return 0.0;
+    }
+    r = min(r, min(size.x, size.y) * 0.5);
+    if (r <= 0.0) {
+        return 1.0;
+    }
+    if (p.y >= r || (p.x >= r && p.x < size.x - r)) {
+        return 1.0;
+    }
+
+    vec2 center = vec2(p.x < r ? r : size.x - r, r);
+    float dist = length(p - center) - r;
+    return 1.0 - smoothstep(-1.25, 1.25, dist);
+}
+
+void main() {
+    vec2 p = v_coords * area_size;
+    float coverage = 1.0;
+    if (mode < 0.5) {
+        coverage = top_round_alpha(p, area_size, radius);
+    } else {
+        vec2 origin = inner_rect.xy;
+        vec2 size = inner_rect.zw;
+        float dist = rounded_distance(p, origin, size, radius);
+        if (dist < 0.0) {
+            coverage = 0.0;
+        } else {
+            float glow = clamp(1.0 - dist / max(spread, 1.0), 0.0, 1.0);
+            coverage = glow * glow;
+        }
+    }
+
+    if (coverage <= 0.0) {
+        gl_FragColor = vec4(0.0);
+        return;
+    }
+
+    gl_FragColor = color * alpha * coverage;
 }"#;
 
 pub struct RenderState {
@@ -203,13 +349,24 @@ pub struct RenderState {
     titlebar_shader_failed: bool,
     client_clip_shader: Option<GlesTexProgram>,
     client_clip_shader_failed: bool,
+    csd_clip_shader: Option<GlesTexProgram>,
+    csd_clip_shader_failed: bool,
+    shape_shader: Option<GlesTexProgram>,
+    shape_shader_failed: bool,
+    shape_texture: Option<GlesTexture>,
     title_font: Option<Font<'static>>,
     icon_cache: HashMap<String, Option<RgbaImage>>,
     overlay_cache: HashMap<DecorationCacheKey, MemoryRenderBuffer>,
     blur_texture_cache: HashMap<WlSurface, GlesTexture>,
+    csd_snapshot_cache: HashMap<WlSurface, CsdWindowSnapshot>,
     wallpaper_source: Option<RgbaImage>,
     wallpaper_image: Option<RgbaImage>,
     wallpaper_buffer: Option<MemoryRenderBuffer>,
+}
+
+struct CsdWindowSnapshot {
+    texture: GlesTexture,
+    rect: Rectangle<i32, Logical>,
 }
 
 impl RenderState {
@@ -286,10 +443,16 @@ impl RenderState {
             titlebar_shader_failed: false,
             client_clip_shader: None,
             client_clip_shader_failed: false,
+            csd_clip_shader: None,
+            csd_clip_shader_failed: false,
+            shape_shader: None,
+            shape_shader_failed: false,
+            shape_texture: None,
             title_font,
             icon_cache: HashMap::new(),
             overlay_cache: HashMap::new(),
             blur_texture_cache: HashMap::new(),
+            csd_snapshot_cache: HashMap::new(),
             wallpaper_source,
             wallpaper_image: None,
             wallpaper_buffer: None,
@@ -342,6 +505,46 @@ impl RenderState {
     }
 
     #[cfg(feature = "tty-udev")]
+    pub fn capture_scene_into_dmabuf(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        space: &Space<Window>,
+        frames: &[WindowFrame],
+        windows: &WindowStore,
+        animation_config: crate::config::AnimationConfig,
+        region: Rectangle<i32, Logical>,
+        target: &mut smithay::backend::allocator::dmabuf::Dmabuf,
+    ) -> Result<(), GlesError> {
+        use smithay::backend::allocator::Buffer as _;
+
+        let target_size = target.size();
+        let render_size = Size::<i32, Physical>::from((target_size.w, target_size.h));
+        let expected_size = Size::<i32, Buffer>::from((region.size.w.max(1), region.size.h.max(1)));
+        if target_size != expected_size {
+            return Err(GlesError::FramebufferBindingError);
+        }
+
+        let scene = self.tty_scene_elements(renderer, space, frames, windows, animation_config)?;
+        let mut framebuffer = renderer.bind(target)?;
+
+        {
+            let mut frame = renderer.render(&mut framebuffer, render_size, Transform::Normal)?;
+            frame.clear(
+                [0.06, 0.09, 0.11, 1.0].into(),
+                &[Rectangle::from_size(render_size)],
+            )?;
+            draw_elements_back_to_front_with_offset(
+                &mut frame,
+                &scene,
+                Point::<i32, Physical>::from((region.loc.x, region.loc.y)),
+            )?;
+            let _ = frame.finish()?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "tty-udev")]
     pub fn tty_scene_elements(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -364,11 +567,14 @@ impl RenderState {
             .unwrap_or_else(|| Size::from((1, 1)));
         let titlebar_shader = self.ensure_titlebar_shader(renderer)?.cloned();
         let mut deco_by_surface = self.decoration_elements(renderer, frames)?;
+        let mut live_csd_surfaces = HashSet::new();
         let mut elements = Vec::new();
 
         for window in space.elements().rev() {
             let mut window_elements = Vec::new();
             let mut blur_element = None;
+            let mut shadow_element = None;
+            let mut csd_snapshot = None;
             let frame_meta = window
                 .toplevel()
                 .and_then(|toplevel| frame_by_surface.get(toplevel.wl_surface()));
@@ -384,6 +590,11 @@ impl RenderState {
             if let Some(toplevel) = window.toplevel() {
                 if let Some(deco) = deco_by_surface.remove(toplevel.wl_surface()) {
                     window_elements.extend(deco);
+                    if let Some(frame_meta) = frame_meta {
+                        if let Some(fill) = self.titlebar_fill_element(renderer, frame_meta)? {
+                            window_elements.push(fill);
+                        }
+                    }
                 }
 
                 if let (Some(shader), Some(capture)) = (
@@ -419,6 +630,15 @@ impl RenderState {
                 ));
                 let anchor = animation_anchor(space, window, frame_meta);
                 if let Some(frame_meta) = frame_meta {
+                    if !frame_meta.maximized && !frame_meta.fullscreen && !frame_meta.resizing {
+                        shadow_element = self.shadow_element(
+                            renderer,
+                            frame_meta.frame,
+                            FRAME_RADIUS,
+                            Some(frame_meta.frame),
+                            frame_meta.animation,
+                        )?;
+                    }
                     let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
                     let popup_elements = window_popup_elements(renderer, window, phys_loc)
                         .into_iter()
@@ -435,7 +655,33 @@ impl RenderState {
                             WaylandSurfaceRenderElement<GlesRenderer>,
                         >,
                     > = window.render_elements(renderer, phys_loc, RendererScale::from(1.0), 1.0);
-                    window_elements.extend(animated_surface_elements(surf, anchor, animation));
+                    let has_csd_surface = !surf.is_empty();
+                    let csd_rect = csd_visual_rect(window, render_loc);
+                    let tiled = window
+                        .toplevel()
+                        .map(|toplevel| {
+                            windows.is_fullscreen(toplevel.wl_surface())
+                                || windows.is_maximized(toplevel.wl_surface())
+                        })
+                        .unwrap_or(false);
+                    let resizing = window
+                        .toplevel()
+                        .map(|toplevel| windows.is_resizing(toplevel.wl_surface()))
+                        .unwrap_or(false);
+                    if !tiled && !resizing {
+                        shadow_element =
+                            self.shadow_element(renderer, csd_rect, CSD_RADIUS, anchor, animation)?;
+                    }
+                    window_elements.extend(
+                        self.csd_surface_elements(renderer, csd_rect, surf, anchor, animation)?,
+                    );
+                    if has_csd_surface {
+                        if let Some(toplevel) = window.toplevel() {
+                            csd_snapshot = Some((toplevel.wl_surface().clone(), csd_rect));
+                        }
+                    } else if let Some(toplevel) = window.toplevel() {
+                        live_csd_surfaces.insert(toplevel.wl_surface().clone());
+                    }
                 }
             }
 
@@ -445,9 +691,21 @@ impl RenderState {
             if let Some(blur_element) = blur_element {
                 window_elements.push(blur_element);
             }
+            if let Some(shadow_element) = shadow_element {
+                window_elements.push(shadow_element);
+            }
+            if let Some((surface, rect)) = csd_snapshot {
+                live_csd_surfaces.insert(surface.clone());
+                self.update_csd_snapshot(renderer, &surface, output_size, rect, &window_elements)?;
+            }
 
             elements.extend(window_elements);
         }
+
+        let destroyed = windows.destroyed_close_animations(animation_config);
+        let snapshot_elements = self.csd_snapshot_elements(renderer, &destroyed);
+        elements.splice(0..0, snapshot_elements);
+        self.retain_csd_snapshots(&live_csd_surfaces, &destroyed);
 
         elements.extend(desktop_elements(renderer, self.wallpaper_buffer.as_ref())?);
 
@@ -465,7 +723,119 @@ impl RenderState {
         self.output.set_preferred(mode);
         self.overlay_cache.clear();
         self.blur_texture_cache.clear();
+        self.csd_snapshot_cache.clear();
         self.rebuild_desktop_buffers(size);
+    }
+
+    fn update_csd_snapshot(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        surface: &WlSurface,
+        output_size: Size<i32, Physical>,
+        rect: Rectangle<i32, Logical>,
+        elements: &[YawcRenderElements],
+    ) -> Result<(), GlesError> {
+        if rect.size.w <= 0 || rect.size.h <= 0 {
+            return Ok(());
+        }
+
+        let mut texture = self.csd_snapshot_texture(renderer, surface, output_size)?;
+        {
+            let mut framebuffer = renderer.bind(&mut texture)?;
+            {
+                let mut frame =
+                    renderer.render(&mut framebuffer, output_size, Transform::Normal)?;
+                frame.clear(
+                    [0.0, 0.0, 0.0, 0.0].into(),
+                    &[Rectangle::from_size(output_size)],
+                )?;
+                draw_elements_back_to_front(&mut frame, elements)?;
+                let _ = frame.finish()?;
+            }
+        }
+
+        match self.csd_snapshot_cache.get_mut(surface) {
+            Some(snapshot) => {
+                snapshot.texture = texture;
+                snapshot.rect = rect;
+            }
+            None => {
+                self.csd_snapshot_cache
+                    .insert(surface.clone(), CsdWindowSnapshot { texture, rect });
+            }
+        }
+        Ok(())
+    }
+
+    fn csd_snapshot_texture(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        surface: &WlSurface,
+        output_size: Size<i32, Physical>,
+    ) -> Result<GlesTexture, GlesError> {
+        let buffer_size = Size::<i32, Buffer>::from((output_size.w.max(1), output_size.h.max(1)));
+        if let Some(snapshot) = self.csd_snapshot_cache.get(surface) {
+            if snapshot.texture.size() == buffer_size {
+                return Ok(snapshot.texture.clone());
+            }
+        }
+
+        renderer.create_buffer(Fourcc::Argb8888, buffer_size)
+    }
+
+    fn csd_snapshot_elements(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        destroyed: &[(WlSurface, WindowAnimation)],
+    ) -> Vec<YawcRenderElements> {
+        destroyed
+            .iter()
+            .filter_map(|(surface, animation)| {
+                let Some(snapshot) = self.csd_snapshot_cache.get_mut(surface) else {
+                    return None;
+                };
+                if snapshot.rect.size.w <= 0 || snapshot.rect.size.h <= 0 {
+                    return None;
+                }
+                let buffer = TextureBuffer::from_texture(
+                    renderer,
+                    snapshot.texture.clone(),
+                    1,
+                    Transform::Normal,
+                    None,
+                );
+                let (loc, size) = animated_rect(snapshot.rect, Some(snapshot.rect), *animation);
+                let src = Rectangle::<f64, Logical>::new(
+                    (snapshot.rect.loc.x as f64, snapshot.rect.loc.y as f64).into(),
+                    (snapshot.rect.size.w as f64, snapshot.rect.size.h as f64).into(),
+                );
+
+                Some(YawcRenderElements::from(
+                    TextureRenderElement::from_texture_buffer(
+                        loc,
+                        &buffer,
+                        Some(animation.alpha),
+                        Some(src),
+                        Some(size),
+                        Kind::Unspecified,
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    fn retain_csd_snapshots(
+        &mut self,
+        live_surfaces: &HashSet<WlSurface>,
+        destroyed: &[(WlSurface, WindowAnimation)],
+    ) {
+        let destroyed_surfaces = destroyed
+            .iter()
+            .map(|(surface, _)| surface.clone())
+            .collect::<HashSet<_>>();
+        self.csd_snapshot_cache.retain(|surface, _| {
+            live_surfaces.contains(surface) || destroyed_surfaces.contains(surface)
+        });
     }
 
     #[cfg(feature = "winit-backend")]
@@ -500,6 +870,7 @@ impl RenderState {
             self.decoration_elements(renderer, &all_frames)?
         };
         let mut used_blur_surfaces = HashSet::new();
+        let mut live_csd_surfaces = HashSet::new();
 
         {
             let (renderer, mut framebuffer) = backend.bind()?;
@@ -515,6 +886,7 @@ impl RenderState {
 
             for window in &windows {
                 let mut step_elements: Vec<YawcRenderElements> = Vec::new();
+                let mut csd_snapshot = None;
 
                 if let Some(toplevel) = window.toplevel() {
                     if let Some(frame_meta) = frame_by_surface.get(toplevel.wl_surface()) {
@@ -579,6 +951,23 @@ impl RenderState {
                         });
 
                         if let Some(deco) = deco_by_surface.remove(toplevel.wl_surface()) {
+                            if !frame_meta.maximized
+                                && !frame_meta.fullscreen
+                                && !frame_meta.resizing
+                            {
+                                if let Some(shadow) = self.shadow_element(
+                                    renderer,
+                                    frame_meta.frame,
+                                    FRAME_RADIUS,
+                                    Some(frame_meta.frame),
+                                    frame_meta.animation,
+                                )? {
+                                    step_elements.push(shadow);
+                                }
+                            }
+                            if let Some(fill) = self.titlebar_fill_element(renderer, frame_meta)? {
+                                step_elements.push(fill);
+                            }
                             step_elements.extend(deco);
                         }
 
@@ -649,18 +1038,60 @@ impl RenderState {
                             step_elements
                                 .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
                         } else {
-                            step_elements
-                                .extend(animated_surface_elements(surf, anchor, animation));
+                            let has_csd_surface = !surf.is_empty();
+                            let csd_rect = csd_visual_rect(window, render_loc);
+                            let tiled = window
+                                .toplevel()
+                                .map(|toplevel| {
+                                    state.windows.is_fullscreen(toplevel.wl_surface())
+                                        || state.windows.is_maximized(toplevel.wl_surface())
+                                })
+                                .unwrap_or(false);
+                            let resizing = window
+                                .toplevel()
+                                .map(|toplevel| state.windows.is_resizing(toplevel.wl_surface()))
+                                .unwrap_or(false);
+                            if !tiled && !resizing {
+                                if let Some(shadow) = self.shadow_element(
+                                    renderer, csd_rect, CSD_RADIUS, anchor, animation,
+                                )? {
+                                    step_elements.push(shadow);
+                                }
+                            }
+                            step_elements.extend(self.csd_surface_elements(
+                                renderer, csd_rect, surf, anchor, animation,
+                            )?);
+                            if has_csd_surface {
+                                if let Some(toplevel) = window.toplevel() {
+                                    csd_snapshot = Some((toplevel.wl_surface().clone(), csd_rect));
+                                }
+                            } else if let Some(toplevel) = window.toplevel() {
+                                live_csd_surfaces.insert(toplevel.wl_surface().clone());
+                            }
                         }
                     } else {
                         step_elements.extend(surf.into_iter().map(YawcRenderElements::from));
                     }
                 }
 
+                if let Some((surface, rect)) = csd_snapshot {
+                    live_csd_surfaces.insert(surface.clone());
+                    self.update_csd_snapshot(renderer, &surface, size, rect, &step_elements)?;
+                }
+
                 let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
                 draw_elements(&mut frame, &step_elements)?;
                 let _ = frame.finish()?;
             }
+
+            let destroyed = state.windows.destroyed_close_animations(animation_config);
+            let ghost_elements = self.csd_snapshot_elements(renderer, &destroyed);
+            if !ghost_elements.is_empty() {
+                let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                draw_elements(&mut frame, &ghost_elements)?;
+                let _ = frame.finish()?;
+            }
+            self.retain_csd_snapshots(&live_csd_surfaces, &destroyed);
 
             let dnd_icon = dnd_icon_elements(renderer, state.dnd_icon.as_ref(), pointer_location);
             if !dnd_icon.is_empty() {
@@ -703,8 +1134,7 @@ impl RenderState {
             );
         }
 
-        state.space.refresh();
-        state.prune_windows();
+        state.refresh_space_and_prune_windows();
         state.popups.cleanup();
         let _ = display_handle.flush_clients();
 
@@ -876,8 +1306,12 @@ impl RenderState {
 
             let mut frame_elements: Vec<YawcRenderElements> = Vec::new();
 
+            let overlay_rect = Rectangle::new(
+                frame.frame.loc,
+                (frame.frame.size.w, TITLEBAR_HEIGHT).into(),
+            );
             let (overlay_loc, overlay_size) =
-                animated_rect(frame.frame, Some(frame.frame), frame.animation);
+                animated_rect(overlay_rect, Some(frame.frame), frame.animation);
 
             // CPU overlay: text, icons, close button (top layer).
             frame_elements.push(YawcRenderElements::from(
@@ -886,7 +1320,7 @@ impl RenderState {
                     overlay_loc,
                     frame_buffer,
                     Some(decoration_animation_for_frame(frame).alpha),
-                    Some(Rectangle::from_size(frame.frame.size.to_f64())),
+                    Some(Rectangle::from_size(overlay_rect.size.to_f64())),
                     Some(overlay_size),
                     Kind::Unspecified,
                 )?,
@@ -938,6 +1372,198 @@ impl RenderState {
             }
         }
     }
+
+    fn ensure_csd_clip_shader(
+        &mut self,
+        renderer: &mut GlesRenderer,
+    ) -> Result<Option<&GlesTexProgram>, GlesError> {
+        if self.csd_clip_shader.is_some() || self.csd_clip_shader_failed {
+            return Ok(self.csd_clip_shader.as_ref());
+        }
+
+        match renderer.compile_custom_texture_shader(
+            CSD_CLIP_SHADER,
+            &[
+                UniformName::new("client_size", UniformType::_2f),
+                UniformName::new("element_offset", UniformType::_2f),
+                UniformName::new("element_size", UniformType::_2f),
+                UniformName::new("radius", UniformType::_1f),
+            ],
+        ) {
+            Ok(shader) => {
+                self.csd_clip_shader = Some(shader);
+                info!("compiled GPU CSD clip shader");
+                Ok(self.csd_clip_shader.as_ref())
+            }
+            Err(error) => {
+                self.csd_clip_shader_failed = true;
+                warn!(?error, "failed to compile CSD clip shader");
+                Ok(None)
+            }
+        }
+    }
+
+    fn ensure_shape_shader(
+        &mut self,
+        renderer: &mut GlesRenderer,
+    ) -> Result<Option<&GlesTexProgram>, GlesError> {
+        if self.shape_shader.is_some() || self.shape_shader_failed {
+            return Ok(self.shape_shader.as_ref());
+        }
+
+        match renderer.compile_custom_texture_shader(
+            SHAPE_SHADER,
+            &[
+                UniformName::new("area_size", UniformType::_2f),
+                UniformName::new("color", UniformType::_4f),
+                UniformName::new("inner_rect", UniformType::_4f),
+                UniformName::new("radius", UniformType::_1f),
+                UniformName::new("mode", UniformType::_1f),
+                UniformName::new("spread", UniformType::_1f),
+            ],
+        ) {
+            Ok(shader) => {
+                self.shape_shader = Some(shader);
+                info!("compiled GPU shape shader");
+                Ok(self.shape_shader.as_ref())
+            }
+            Err(error) => {
+                self.shape_shader_failed = true;
+                warn!(?error, "failed to compile shape shader");
+                Ok(None)
+            }
+        }
+    }
+
+    fn ensure_shape_texture(
+        &mut self,
+        renderer: &mut GlesRenderer,
+    ) -> Result<GlesTexture, GlesError> {
+        if let Some(texture) = self.shape_texture.as_ref() {
+            return Ok(texture.clone());
+        }
+
+        let pixel = [255_u8, 255, 255, 255];
+        let tex = renderer.with_context(|gl| unsafe {
+            let mut tex = 0;
+            gl.GenTextures(1, &mut tex);
+            gl.BindTexture(ffi::TEXTURE_2D, tex);
+            gl.TexImage2D(
+                ffi::TEXTURE_2D,
+                0,
+                ffi::RGBA8 as i32,
+                1,
+                1,
+                0,
+                ffi::RGBA,
+                ffi::UNSIGNED_BYTE,
+                pixel.as_ptr().cast(),
+            );
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_S,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_T,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.BindTexture(ffi::TEXTURE_2D, 0);
+            tex
+        })?;
+        let texture = unsafe {
+            GlesTexture::from_raw(renderer, Some(ffi::RGBA8), false, tex, Size::from((1, 1)))
+        };
+        self.shape_texture = Some(texture.clone());
+        Ok(texture)
+    }
+
+    fn titlebar_fill_element(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        frame: &WindowFrame,
+    ) -> Result<Option<YawcRenderElements>, GlesError> {
+        if frame.frame.size.w <= 0 || TITLEBAR_HEIGHT <= 0 {
+            return Ok(None);
+        }
+
+        let Some(program) = self.ensure_shape_shader(renderer)?.cloned() else {
+            return Ok(None);
+        };
+        let texture = self.ensure_shape_texture(renderer)?;
+        let rect = Rectangle::new(
+            frame.frame.loc,
+            (frame.frame.size.w, TITLEBAR_HEIGHT).into(),
+        );
+        let (animated_loc, animated_size) = animated_rect(rect, Some(frame.frame), frame.animation);
+
+        Ok(Some(YawcRenderElements::from(ShapeElement::new(
+            texture,
+            program,
+            animated_loc.to_i32_round(),
+            Size::from((animated_size.w.max(1), animated_size.h.max(1))),
+            titlebar_fill_color(frame.close_tint),
+            (
+                0.0,
+                0.0,
+                animated_size.w.max(1) as f32,
+                animated_size.h.max(1) as f32,
+            ),
+            FRAME_RADIUS as f32,
+            TITLEBAR_SHAPE_MODE,
+            1.0,
+            decoration_animation_for_frame(frame).alpha,
+        ))))
+    }
+
+    fn shadow_element(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        rect: Rectangle<i32, Logical>,
+        radius: i32,
+        anchor: Option<Rectangle<i32, Logical>>,
+        animation: WindowAnimation,
+    ) -> Result<Option<YawcRenderElements>, GlesError> {
+        if rect.size.w <= 0 || rect.size.h <= 0 {
+            return Ok(None);
+        }
+
+        let Some(program) = self.ensure_shape_shader(renderer)?.cloned() else {
+            return Ok(None);
+        };
+        let texture = self.ensure_shape_texture(renderer)?;
+        let (animated_loc, animated_size) = animated_rect(rect, anchor, animation);
+        let shadow_loc = Point::<i32, Physical>::from((
+            (animated_loc.x - SHADOW_PAD as f64).round() as i32,
+            (animated_loc.y - SHADOW_PAD as f64 + SHADOW_OFFSET_Y as f64).round() as i32,
+        ));
+        let shadow_size = Size::<i32, Physical>::from((
+            (animated_size.w + SHADOW_PAD * 2).max(1),
+            (animated_size.h + SHADOW_PAD * 2).max(1),
+        ));
+
+        Ok(Some(YawcRenderElements::from(ShapeElement::new(
+            texture,
+            program,
+            shadow_loc,
+            shadow_size,
+            (0.0, 0.0, 0.0, SHADOW_OPACITY),
+            (
+                SHADOW_PAD as f32,
+                (SHADOW_PAD - SHADOW_OFFSET_Y) as f32,
+                animated_size.w.max(1) as f32,
+                animated_size.h.max(1) as f32,
+            ),
+            radius.max(0) as f32,
+            SHADOW_SHAPE_MODE,
+            SHADOW_SPREAD,
+            animation.alpha,
+        ))))
+    }
+
     fn client_surface_elements(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -978,6 +1604,41 @@ impl RenderState {
         Ok(elements)
     }
 
+    fn csd_surface_elements(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        visual_rect: Rectangle<i32, Logical>,
+        surfaces: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>,
+        anchor: Option<Rectangle<i32, Logical>>,
+        animation: WindowAnimation,
+    ) -> Result<Vec<YawcRenderElements>, GlesError> {
+        let shader = self.ensure_csd_clip_shader(renderer)?.cloned();
+        let (visual_loc, visual_size_logical) = animated_rect(visual_rect, anchor, animation);
+        let visual_size =
+            Size::<i32, Physical>::from((visual_size_logical.w, visual_size_logical.h));
+
+        let mut elements = Vec::with_capacity(surfaces.len());
+        for surface in surfaces {
+            match (shader.as_ref(), surface) {
+                (Some(shader), SpaceRenderElements::Surface(surface)) if visual_size.h > 0 => {
+                    elements.push(YawcRenderElements::from(CsdRoundedSurfaceElement::new(
+                        surface,
+                        shader.clone(),
+                        visual_loc.to_i32_round(),
+                        visual_size,
+                        anchor,
+                        animation,
+                    )));
+                }
+                (_, surface) => {
+                    elements.extend(animated_surface_elements(vec![surface], anchor, animation));
+                }
+            }
+        }
+
+        Ok(elements)
+    }
+
     fn cached_icon(&mut self, app_id: &str) -> Option<RgbaImage> {
         if let Some(icon) = self.icon_cache.get(app_id) {
             return icon.clone();
@@ -986,6 +1647,131 @@ impl RenderState {
         let icon = load_app_icon(app_id);
         self.icon_cache.insert(app_id.to_string(), icon.clone());
         icon
+    }
+}
+
+#[derive(Debug)]
+struct ShapeElement {
+    texture: GlesTexture,
+    program: GlesTexProgram,
+    id: Id,
+    loc: Point<i32, Physical>,
+    size: Size<i32, Physical>,
+    color: (f32, f32, f32, f32),
+    inner_rect: (f32, f32, f32, f32),
+    radius: f32,
+    mode: f32,
+    spread: f32,
+    alpha: f32,
+}
+
+impl ShapeElement {
+    fn new(
+        texture: GlesTexture,
+        program: GlesTexProgram,
+        loc: Point<i32, Physical>,
+        size: Size<i32, Physical>,
+        color: (f32, f32, f32, f32),
+        inner_rect: (f32, f32, f32, f32),
+        radius: f32,
+        mode: f32,
+        spread: f32,
+        alpha: f32,
+    ) -> Self {
+        Self {
+            texture,
+            program,
+            id: Id::new(),
+            loc,
+            size,
+            color,
+            inner_rect,
+            radius,
+            mode,
+            spread,
+            alpha,
+        }
+    }
+}
+
+impl Element for ShapeElement {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        CommitCounter::default()
+    }
+
+    fn geometry(&self, _scale: RendererScale<f64>) -> Rectangle<i32, Physical> {
+        Rectangle::new(self.loc, self.size)
+    }
+
+    fn transform(&self) -> Transform {
+        Transform::Normal
+    }
+
+    fn src(&self) -> Rectangle<f64, smithay::utils::Buffer> {
+        Rectangle::new((0.0, 0.0).into(), (1.0, 1.0).into())
+    }
+
+    fn damage_since(
+        &self,
+        _scale: RendererScale<f64>,
+        _commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        DamageSet::from_slice(&[Rectangle::from_size(self.size)])
+    }
+
+    fn opaque_regions(&self, _scale: RendererScale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
+    }
+
+    fn alpha(&self) -> f32 {
+        self.alpha
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Unspecified
+    }
+
+    fn location(&self, _scale: RendererScale<f64>) -> Point<i32, Physical> {
+        self.loc
+    }
+}
+
+impl RenderElement<GlesRenderer> for ShapeElement {
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+        src: Rectangle<f64, smithay::utils::Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        let uniforms = vec![
+            Uniform::new(
+                "area_size",
+                (dst.size.w.max(1) as f32, dst.size.h.max(1) as f32),
+            ),
+            Uniform::new("color", self.color),
+            Uniform::new("inner_rect", self.inner_rect),
+            Uniform::new("radius", self.radius),
+            Uniform::new("mode", self.mode),
+            Uniform::new("spread", self.spread),
+        ];
+
+        frame.render_texture_from_to(
+            &self.texture,
+            src,
+            dst,
+            damage,
+            &[],
+            Transform::Normal,
+            self.alpha(),
+            Some(&self.program),
+            &uniforms,
+        )
     }
 }
 
@@ -1229,6 +2015,131 @@ impl RenderElement<GlesRenderer> for RoundedSurfaceElement {
                     ),
                     Uniform::new("element_size", (dst.size.w as f32, dst.size.h as f32)),
                     Uniform::new("radius", FRAME_RADIUS as f32),
+                ];
+
+                frame.render_texture_from_to(
+                    texture,
+                    src,
+                    dst,
+                    damage,
+                    &[],
+                    self.transform(),
+                    self.alpha(),
+                    Some(&self.program),
+                    &uniforms,
+                )
+            }
+            WaylandSurfaceTexture::SolidColor(color) => frame.draw_solid(dst, damage, *color),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CsdRoundedSurfaceElement {
+    inner: WaylandSurfaceRenderElement<GlesRenderer>,
+    program: GlesTexProgram,
+    id: Id,
+    visual_loc: Point<i32, Physical>,
+    visual_size: Size<i32, Physical>,
+    anchor: Option<Rectangle<i32, Logical>>,
+    animation: WindowAnimation,
+}
+
+impl CsdRoundedSurfaceElement {
+    fn new(
+        inner: WaylandSurfaceRenderElement<GlesRenderer>,
+        program: GlesTexProgram,
+        visual_loc: Point<i32, Physical>,
+        visual_size: Size<i32, Physical>,
+        anchor: Option<Rectangle<i32, Logical>>,
+        animation: WindowAnimation,
+    ) -> Self {
+        Self {
+            inner,
+            program,
+            id: Id::new(),
+            visual_loc,
+            visual_size,
+            anchor,
+            animation,
+        }
+    }
+}
+
+impl Element for CsdRoundedSurfaceElement {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+
+    fn geometry(&self, scale: RendererScale<f64>) -> Rectangle<i32, Physical> {
+        animated_physical_rect(self.inner.geometry(scale), self.anchor, self.animation)
+    }
+
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+
+    fn src(&self) -> Rectangle<f64, smithay::utils::Buffer> {
+        self.inner.src()
+    }
+
+    fn damage_since(
+        &self,
+        scale: RendererScale<f64>,
+        _commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        DamageSet::from_slice(&[self.geometry(scale)])
+    }
+
+    fn opaque_regions(&self, _scale: RendererScale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
+    }
+
+    fn alpha(&self) -> f32 {
+        self.inner.alpha() * self.animation.alpha
+    }
+
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+
+    fn location(&self, scale: RendererScale<f64>) -> Point<i32, Physical> {
+        self.geometry(scale).loc
+    }
+}
+
+impl RenderElement<GlesRenderer> for CsdRoundedSurfaceElement {
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+        src: Rectangle<f64, smithay::utils::Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        match self.inner.texture() {
+            WaylandSurfaceTexture::Texture(texture) => {
+                let uniforms = vec![
+                    Uniform::new(
+                        "client_size",
+                        (
+                            self.visual_size.w.max(1) as f32,
+                            self.visual_size.h.max(1) as f32,
+                        ),
+                    ),
+                    Uniform::new(
+                        "element_offset",
+                        (
+                            (dst.loc.x - self.visual_loc.x) as f32,
+                            (dst.loc.y - self.visual_loc.y) as f32,
+                        ),
+                    ),
+                    Uniform::new("element_size", (dst.size.w as f32, dst.size.h as f32)),
+                    Uniform::new("radius", CSD_RADIUS as f32),
                 ];
 
                 frame.render_texture_from_to(
@@ -1515,7 +2426,6 @@ fn read_xrgb_framebuffer(
     })
 }
 
-#[cfg(feature = "tty-udev")]
 fn draw_elements_back_to_front(
     frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
     elements: &[YawcRenderElements],
@@ -1525,6 +2435,29 @@ fn draw_elements_back_to_front(
         if geometry.size.w <= 0 || geometry.size.h <= 0 {
             continue;
         }
+        let local_damage = [Rectangle::from_size(geometry.size)];
+        element.draw(frame, element.src(), geometry, &local_damage, &[])?;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "tty-udev")]
+fn draw_elements_back_to_front_with_offset(
+    frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+    elements: &[YawcRenderElements],
+    offset: Point<i32, Physical>,
+) -> Result<(), GlesError> {
+    for element in elements.iter().rev() {
+        let geometry = element.geometry(RendererScale::from(1.0));
+        if geometry.size.w <= 0 || geometry.size.h <= 0 {
+            continue;
+        }
+
+        let geometry = Rectangle::new(
+            (geometry.loc.x - offset.x, geometry.loc.y - offset.y).into(),
+            geometry.size,
+        );
         let local_damage = [Rectangle::from_size(geometry.size)];
         element.draw(frame, element.src(), geometry, &local_damage, &[])?;
     }
@@ -1581,6 +2514,23 @@ fn window_popup_elements(
             )
         })
         .collect()
+}
+
+fn csd_visual_rect(window: &Window, render_loc: Point<i32, Logical>) -> Rectangle<i32, Logical> {
+    let bbox = window.bbox();
+    let geometry = window.geometry();
+    let size = if bbox.size.w > 0 && bbox.size.h > 0 {
+        bbox.size
+    } else if geometry.size.w > 0 && geometry.size.h > 0 {
+        geometry.size
+    } else {
+        (1, 1).into()
+    };
+
+    Rectangle::new(
+        (render_loc.x + bbox.loc.x, render_loc.y + bbox.loc.y).into(),
+        size,
+    )
 }
 
 pub fn dnd_icon_elements(
@@ -1647,17 +2597,15 @@ fn round_blur_texture_extent(value: i32) -> i32 {
     ((value.max(1) + STEP - 1) / STEP) * STEP
 }
 
-// Overlay with the titlebar tint, text, icon, and SSD buttons.
+// Overlay with text, icon, and SSD buttons. The tint below it is GPU-rendered.
 fn overlay_buffer(
     frame: &WindowFrame,
     title_font: Option<&Font<'static>>,
     app_icon: Option<&RgbaImage>,
 ) -> MemoryRenderBuffer {
     let width = frame.frame.size.w.max(1) as u32;
-    let height = frame.frame.size.h.max(1) as u32;
+    let height = TITLEBAR_HEIGHT.max(1) as u32;
     let mut image = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 0]));
-
-    draw_titlebar_fill(&mut image, frame.close_tint);
 
     let title = if frame.title.trim().is_empty() {
         "Untitled"
@@ -1744,22 +2692,7 @@ fn overlay_buffer(
     rgba_to_buffer(&image)
 }
 
-// Draw the rounded-top translucent fill that sits above the blur backdrop.
-fn draw_titlebar_fill(image: &mut RgbaImage, close_tint: f32) {
-    let width = image.width() as i32;
-    let height = image.height() as i32;
-    let fill = titlebar_fill_color(close_tint);
-
-    for y in 0..TITLEBAR_HEIGHT.min(height) {
-        for x in 0..width {
-            if inside_rounded_rect(x, y, 0, 0, width, height, FRAME_RADIUS) {
-                image.put_pixel(x as u32, y as u32, fill);
-            }
-        }
-    }
-}
-
-fn titlebar_fill_color(close_tint: f32) -> Rgba<u8> {
+fn titlebar_fill_color(close_tint: f32) -> (f32, f32, f32, f32) {
     let red = [182, 86, 92, 158];
     let tint = close_tint.clamp(0.0, 1.0);
     let mut color = [0_u8; 4];
@@ -1769,7 +2702,12 @@ fn titlebar_fill_color(close_tint: f32) -> Rgba<u8> {
             .round()
             .clamp(0.0, 255.0) as u8;
     }
-    Rgba(color)
+    (
+        color[0] as f32 / 255.0,
+        color[1] as f32 / 255.0,
+        color[2] as f32 / 255.0,
+        color[3] as f32 / 255.0,
+    )
 }
 
 fn draw_text(
@@ -1875,56 +2813,6 @@ fn load_png(path: &Path) -> Option<RgbaImage> {
             None
         }
     }
-}
-
-fn inside_rounded_rect(
-    x: i32,
-    y: i32,
-    left: i32,
-    top: i32,
-    width: i32,
-    height: i32,
-    radius: i32,
-) -> bool {
-    if width <= 0 || height <= 0 {
-        return false;
-    }
-
-    let radius = radius.max(0).min(width / 2).min(height / 2) as f32;
-    let px = x as f32 + 0.5;
-    let py = y as f32 + 0.5;
-    let left = left as f32;
-    let top = top as f32;
-    let right = (left as i32 + width) as f32;
-    let bottom = (top as i32 + height) as f32;
-
-    if px < left || px >= right || py < top || py >= bottom {
-        return false;
-    }
-
-    if radius <= 0.0 {
-        return true;
-    }
-
-    if (px >= left + radius && px < right - radius) || (py >= top + radius && py < bottom - radius)
-    {
-        return true;
-    }
-
-    let center_x = if px < left + radius {
-        left + radius
-    } else {
-        right - radius
-    };
-    let center_y = if py < top + radius {
-        top + radius
-    } else {
-        bottom - radius
-    };
-    let dx = px - center_x;
-    let dy = py - center_y;
-
-    dx * dx + dy * dy <= radius * radius
 }
 
 fn draw_minimize_button(image: &mut RgbaImage, rect: Rectangle<i32, Logical>, color: Rgba<u8>) {

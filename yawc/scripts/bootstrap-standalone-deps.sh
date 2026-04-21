@@ -21,6 +21,7 @@ mkdir -p "$DEB_DIR" "$ROOTFS_DIR"
 cd "$DEB_DIR"
 apt-get download \
   pkg-config pkgconf pkgconf-bin libpkgconf3 \
+  libwayland-dev libwayland-server0 libwayland-client0 libffi-dev \
   libinput-dev libgbm-dev libgbm1 libdrm-dev libseat-dev libudev-dev libudev1 seatd \
   libmtdev-dev libevdev-dev libwacom-dev libpciaccess-dev libcap-dev \
   libseat1 libinput10

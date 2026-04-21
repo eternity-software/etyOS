@@ -11,13 +11,13 @@ use smithay::{
     backend::{
         allocator::{
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
-            Fourcc,
+            Format, Fourcc, Modifier,
         },
         drm::{
             compositor::FrameFlags,
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
-            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, Planes,
+            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType, Planes,
         },
         egl::context::ContextPriority,
         input::{InputEvent, KeyState, KeyboardKeyEvent},
@@ -32,7 +32,7 @@ use smithay::{
             gles::GlesRenderer,
             multigpu::{gbm::GbmGlesBackend, GpuManager, MultiRenderer},
             utils::{CommitCounter, DamageSet, OpaqueRegions},
-            Color32F, ImportDma, ImportMemWl, RendererSuper,
+            Color32F, ImportDma, ImportEgl, ImportMemWl, RendererSuper,
         },
         session::{libseat::LibSeatSession, Event as SessionEvent, Session},
         udev::{UdevBackend, UdevEvent},
@@ -168,6 +168,7 @@ struct TtyRuntime {
     active: bool,
     frame_pending: bool,
     last_frame_queued: Option<Instant>,
+    last_screencopy_frame: Option<Instant>,
     missed_vblank_warned: bool,
     reset_buffers_each_frame: bool,
     ctrl_down: bool,
@@ -224,94 +225,106 @@ impl TtyRuntime {
         data.state.reload_config_if_changed();
         data.state.finish_close_animations();
         let animation_config = data.state.config.animations();
+        let render_requested = data.state.take_render_requested();
+        let screencopy_pending = data.state.screencopy_state.has_pending();
+        let animation_pending = data.state.windows.needs_animation_frame(animation_config);
+        let should_render = render_requested || screencopy_pending || animation_pending;
+        if !should_render {
+            return;
+        }
+
         let controls_mode = data.state.config.window_controls();
         let frames = data
             .state
             .windows
             .frames(&data.state.space, animation_config, controls_mode);
-        let elements = render_elements(
-            &mut renderer,
-            &mut self.render_state,
-            &data.state.space,
-            &frames,
-            &data.state.windows,
-            animation_config,
-            &self.background,
-            &mut self.cursor_theme,
-            &cursor_image,
-            pointer_location,
-            data.state.dnd_icon.as_ref(),
-        );
+        let drew_display_frame = render_requested || animation_pending;
+        if drew_display_frame {
+            let elements = render_elements(
+                &mut renderer,
+                &mut self.render_state,
+                &data.state.space,
+                &frames,
+                &data.state.windows,
+                animation_config,
+                &self.background,
+                &mut self.cursor_theme,
+                &cursor_image,
+                pointer_location,
+                data.state.dnd_icon.as_ref(),
+            );
 
-        if self.reset_buffers_each_frame {
-            self.drm_output.reset_buffers();
-        }
+            if self.reset_buffers_each_frame {
+                self.drm_output.reset_buffers();
+            }
 
-        match self.drm_output.render_frame(
-            &mut renderer,
-            &elements,
-            [0.06, 0.09, 0.11, 1.0],
-            // The early standalone backend should be predictable before it is clever:
-            // force a fully composited frame instead of allowing direct scanout planes.
-            FrameFlags::empty(),
-        ) {
-            Ok(result) => {
-                if !result.is_empty {
-                    if let Err(error) = self.drm_output.queue_frame(()) {
-                        warn!(?error, "failed to queue drm frame");
-                    } else {
-                        self.frame_pending = true;
-                        self.last_frame_queued = Some(Instant::now());
-                        self.missed_vblank_warned = false;
+            match self.drm_output.render_frame(
+                &mut renderer,
+                &elements,
+                [0.06, 0.09, 0.11, 1.0],
+                // The early standalone backend should be predictable before it is clever:
+                // force a fully composited frame instead of allowing direct scanout planes.
+                FrameFlags::empty(),
+            ) {
+                Ok(result) => {
+                    if !result.is_empty {
+                        if let Err(error) = self.drm_output.queue_frame(()) {
+                            warn!(?error, "failed to queue drm frame");
+                        } else {
+                            self.frame_pending = true;
+                            self.last_frame_queued = Some(Instant::now());
+                            self.missed_vblank_warned = false;
+                        }
                     }
                 }
+                Err(error) => {
+                    warn!(?error, "standalone render_frame failed");
+                }
             }
-            Err(error) => {
-                warn!(?error, "standalone render_frame failed");
-            }
-        }
-        drop(elements);
-
-        if data.state.screencopy_state.has_pending() {
-            let requests = data.state.screencopy_state.take_pending();
-            for request in requests {
-                let region = request.region();
-                let captured = self
-                    .render_state
-                    .capture_scene_xrgb8888(
-                        renderer.as_mut(),
-                        &data.state.space,
-                        &frames,
-                        &data.state.windows,
-                        animation_config,
-                        region,
-                    )
-                    .map_err(|error| format!("{error:?}"));
-                request.finish(captured);
-            }
+            drop(elements);
         }
 
-        let output = self.render_state.output().clone();
-        data.state.space.elements().for_each(|window| {
-            window.send_frame(
-                &output,
-                data.state.start_time.elapsed(),
-                Some(Duration::ZERO),
-                |_, _| Some(output.clone()),
-            );
-        });
-        if let Some(icon) = data.state.dnd_icon.as_ref() {
-            send_frames_surface_tree(
-                icon,
-                &output,
-                data.state.start_time.elapsed(),
-                Some(Duration::ZERO),
-                |_, _| Some(output.clone()),
-            );
+        let screencopy_interval = self.refresh_interval.max(Duration::from_millis(1));
+        let can_service_screencopy = self
+            .last_screencopy_frame
+            .map(|last_frame| last_frame.elapsed() >= screencopy_interval)
+            .unwrap_or(true);
+        if can_service_screencopy {
+            if let Some(request) = data.state.screencopy_state.pop_pending() {
+                self.last_screencopy_frame = Some(Instant::now());
+                capture_screencopy(
+                    &mut self.render_state,
+                    request,
+                    renderer.as_mut(),
+                    data,
+                    &frames,
+                    animation_config,
+                );
+            }
         }
 
-        data.state.space.refresh();
-        data.state.prune_windows();
+        if drew_display_frame {
+            let output = self.render_state.output().clone();
+            data.state.space.elements().for_each(|window| {
+                window.send_frame(
+                    &output,
+                    data.state.start_time.elapsed(),
+                    Some(Duration::ZERO),
+                    |_, _| Some(output.clone()),
+                );
+            });
+            if let Some(icon) = data.state.dnd_icon.as_ref() {
+                send_frames_surface_tree(
+                    icon,
+                    &output,
+                    data.state.start_time.elapsed(),
+                    Some(Duration::ZERO),
+                    |_, _| Some(output.clone()),
+                );
+            }
+        }
+
+        data.state.refresh_space_and_prune_windows();
         data.state.popups.cleanup();
         let _ = data.display_handle.flush_clients();
     }
@@ -398,6 +411,31 @@ pub fn init(
         )
         .map_err(|error| format!("failed to open drm device {:?}: {error:?}", device_path))?;
     let device_fd = DrmDeviceFd::new(DeviceFd::from(opened_fd));
+    let main_device = node
+        .node_with_type(NodeType::Render)
+        .and_then(Result::ok)
+        .map(|render_node| render_node.dev_id())
+        .or_else(|| match device_fd.dev_id() {
+            Ok(device_id) => Some(device_id),
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "failed to read DRM device id; linux-dmabuf feedback will be downgraded"
+                );
+                None
+            }
+        });
+    if main_device.is_none() {
+        warn!(
+            ?node,
+            "failed to resolve DRM render device id; linux-dmabuf feedback will be downgraded"
+        );
+    } else if node.ty() != NodeType::Render {
+        info!(
+            ?node,
+            "using matching DRM render node for linux-dmabuf feedback"
+        );
+    }
     let (drm_device, drm_notifier) = DrmDevice::new(device_fd.clone(), true)
         .map_err(|error| format!("failed to initialize drm device: {error}"))?;
 
@@ -420,7 +458,44 @@ pub fn init(
     let mut renderer = gpus
         .single_renderer(&node)
         .map_err(|error| format!("failed to create renderer for standalone backend: {error}"))?;
+    match renderer.bind_wl_display(&data.display_handle) {
+        Ok(()) => info!("bound EGL display to Wayland display for wl_drm client buffers"),
+        Err(error) => warn!(
+            ?error,
+            "failed to bind EGL display to Wayland display; clients may fall back to software EGL"
+        ),
+    }
     data.state.shm_state.update_formats(renderer.shm_formats());
+    let renderer_dmabuf_formats = renderer.dmabuf_formats();
+    let raw_dmabuf_formats = renderer_dmabuf_formats.iter().copied().collect::<Vec<_>>();
+    let dmabuf_format_count = raw_dmabuf_formats.len();
+    if !env_flag("YAWC_DISABLE_CLIENT_DMABUF") {
+        let client_dmabuf_formats = if env_flag("YAWC_ENABLE_DMABUF_PROBE")
+            && !env_flag("YAWC_ENABLE_CLIENT_DMABUF")
+            && !data.state.config.screencopy_dmabuf()
+        {
+            raw_dmabuf_formats
+                .iter()
+                .copied()
+                .filter(is_safe_probe_dmabuf_format)
+                .collect::<Vec<_>>()
+        } else {
+            raw_dmabuf_formats.clone()
+        };
+
+        info!(
+            raw_count = dmabuf_format_count,
+            client_count = client_dmabuf_formats.len(),
+            "enabling linux-dmabuf global"
+        );
+        data.state
+            .init_dmabuf_global(client_dmabuf_formats, main_device);
+    } else {
+        info!(
+            count = dmabuf_format_count,
+            "linux-dmabuf global disabled by YAWC_DISABLE_CLIENT_DMABUF"
+        );
+    }
 
     let mut drm_output_manager = TtyOutputManager::new(
         drm_device,
@@ -433,7 +508,7 @@ pub fn init(
             Fourcc::Argb8888,
             Fourcc::Abgr8888,
         ],
-        renderer.dmabuf_formats(),
+        renderer_dmabuf_formats,
     );
 
     let (connector_info, crtc, mode) = select_connector_and_mode(drm_output_manager.device())?;
@@ -503,6 +578,7 @@ pub fn init(
         active: true,
         frame_pending: false,
         last_frame_queued: None,
+        last_screencopy_frame: None,
         missed_vblank_warned: false,
         reset_buffers_each_frame,
         ctrl_down: false,
@@ -591,6 +667,7 @@ pub fn init(
             }
 
             data.state.process_input_event(event);
+            data.state.request_render();
         })?;
 
     {
@@ -631,12 +708,60 @@ pub fn init(
     Ok(())
 }
 
+fn is_safe_probe_dmabuf_format(format: &Format) -> bool {
+    format.modifier == Modifier::Linear
+        && matches!(
+            format.code,
+            Fourcc::Xrgb8888 | Fourcc::Xbgr8888 | Fourcc::Argb8888 | Fourcc::Abgr8888
+        )
+}
+
 fn function_key_to_vt(key_code: u32) -> Option<i32> {
     // Linux KEY_F1..KEY_F12 are 59..88; Smithay/libinput adds the xkb offset of 8.
     match key_code {
         67..=76 => Some((key_code - 66) as i32),
         95 | 96 => Some((key_code - 83) as i32),
         _ => None,
+    }
+}
+
+fn capture_screencopy(
+    render_state: &mut RenderState,
+    request: crate::screencopy::PendingScreencopy,
+    renderer: &mut GlesRenderer,
+    data: &mut CalloopData,
+    frames: &[WindowFrame],
+    animation_config: crate::config::AnimationConfig,
+) {
+    let region = request.region();
+    if let Some(mut dmabuf) = request
+        .dmabuf()
+        .filter(|_| data.state.config.screencopy_dmabuf())
+    {
+        let captured = render_state
+            .capture_scene_into_dmabuf(
+                renderer,
+                &data.state.space,
+                frames,
+                &data.state.windows,
+                animation_config,
+                region,
+                &mut dmabuf,
+            )
+            .map_err(|error| format!("{error:?}"));
+        request.finish_dmabuf(captured);
+    } else {
+        let captured = render_state
+            .capture_scene_xrgb8888(
+                renderer,
+                &data.state.space,
+                frames,
+                &data.state.windows,
+                animation_config,
+                region,
+            )
+            .map_err(|error| format!("{error:?}"));
+        request.finish(captured);
     }
 }
 
@@ -952,6 +1077,17 @@ fn select_drm_device(udev_backend: &UdevBackend) -> Result<PathBuf, Box<dyn std:
         .next()
         .map(|(_, path)| path.to_path_buf())
         .ok_or_else(|| "no drm device available for standalone backend".into())
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn select_connector_and_mode(

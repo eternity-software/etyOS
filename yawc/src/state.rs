@@ -1,6 +1,7 @@
 use std::{ffi::OsString, process::Command, sync::Arc, time::Instant};
 
 use smithay::{
+    backend::allocator::Format,
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{
         pointer::{CursorIcon, CursorImageStatus},
@@ -13,18 +14,20 @@ use smithay::{
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::{wl_output::WlOutput, wl_surface::WlSurface},
-            Display, DisplayHandle, Resource,
+            Client, Display, DisplayHandle, Resource,
         },
     },
     utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         cursor_shape::CursorShapeManagerState,
+        dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::xdg::{decoration::XdgDecorationState, XdgShellState},
         shm::ShmState,
         socket::ListeningSocketSource,
+        viewporter::ViewporterState,
     },
 };
 use tracing::{info, warn};
@@ -56,9 +59,13 @@ pub struct Yawc {
     pub xdg_decoration_state: XdgDecorationState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
+    pub viewporter_state: ViewporterState,
     pub cursor_shape_state: CursorShapeManagerState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
+    pub dmabuf_state: DmabufState,
+    pub dmabuf_formats: Vec<Format>,
+    dmabuf_global: Option<DmabufGlobal>,
     pub screencopy_state: ScreencopyState,
     pub popups: PopupManager,
     pub seat: Seat<Self>,
@@ -69,6 +76,8 @@ pub struct Yawc {
     pub config: Config,
     pub titlebar_right_press: Option<WlSurface>,
     pub last_titlebar_click: Option<TitlebarClick>,
+    pub last_snap_side: Option<SnapSide>,
+    pub render_requested: bool,
     applied_keyboard_config: Option<KeyboardConfig>,
 }
 
@@ -81,9 +90,11 @@ impl Yawc {
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
+        let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let cursor_shape_state = CursorShapeManagerState::new::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let dmabuf_state = DmabufState::new();
         let screencopy_state = ScreencopyState::new(&display_handle);
         let popups = PopupManager::default();
         let windows = WindowStore::default();
@@ -109,9 +120,13 @@ impl Yawc {
             xdg_decoration_state,
             shm_state,
             output_manager_state,
+            viewporter_state,
             cursor_shape_state,
             seat_state,
             data_device_state,
+            dmabuf_state,
+            dmabuf_formats: Vec::new(),
+            dmabuf_global: None,
             screencopy_state,
             popups,
             seat,
@@ -122,10 +137,56 @@ impl Yawc {
             config,
             titlebar_right_press: None,
             last_titlebar_click: None,
+            last_snap_side: None,
+            render_requested: true,
             applied_keyboard_config: None,
         };
         state.apply_keyboard_config();
         state
+    }
+
+    pub fn init_dmabuf_global(&mut self, formats: Vec<Format>, main_device: Option<libc::dev_t>) {
+        if formats.is_empty() || self.dmabuf_global.is_some() {
+            return;
+        }
+
+        self.dmabuf_formats = formats.clone();
+        let display_handle = self.display_handle.clone();
+        let filter_display = display_handle.clone();
+        let hide_portal_bridge = !self.config.screencopy_dmabuf();
+        let filter = move |client: &Client| {
+            should_show_dmabuf_global(client, &filter_display, hide_portal_bridge)
+        };
+        let global = if let Some(main_device) = main_device {
+            match DmabufFeedbackBuilder::new(main_device, formats.clone()).build() {
+                Ok(default_feedback) => self
+                    .dmabuf_state
+                    .create_global_with_filter_and_default_feedback::<Self, _>(
+                        &display_handle,
+                        &default_feedback,
+                        filter,
+                    ),
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "failed to build dmabuf feedback; falling back to v3 linux-dmabuf"
+                    );
+                    let filter_display = display_handle.clone();
+                    self.dmabuf_state.create_global_with_filter::<Self, _>(
+                        &display_handle,
+                        formats,
+                        move |client| {
+                            should_show_dmabuf_global(client, &filter_display, hide_portal_bridge)
+                        },
+                    )
+                }
+            }
+        } else {
+            warn!("missing DRM device id; creating v3 linux-dmabuf without feedback");
+            self.dmabuf_state
+                .create_global_with_filter::<Self, _>(&display_handle, formats, filter)
+        };
+        self.dmabuf_global = Some(global);
     }
 
     fn init_wayland_listener(
@@ -193,6 +254,14 @@ impl Yawc {
         }
     }
 
+    pub fn request_render(&mut self) {
+        self.render_requested = true;
+    }
+
+    pub fn take_render_requested(&mut self) -> bool {
+        std::mem::take(&mut self.render_requested)
+    }
+
     pub(crate) fn initial_window_location(&self, window: &Window) -> Point<i32, Logical> {
         let Some(surface) = window
             .toplevel()
@@ -218,6 +287,35 @@ impl Yawc {
         }
 
         let uses_server_decoration = self.windows.uses_server_decoration(surface);
+        if let Some(side) = self
+            .last_snap_side
+            .filter(|_| !is_transient_toplevel(window))
+        {
+            if let Some((_, location, size)) = self.snap_layout(side, uses_server_decoration) {
+                if let Some(toplevel) = window.toplevel() {
+                    self.windows.set_snap(surface, side, None);
+                    self.space.map_element(window.clone(), location, false);
+                    toplevel.with_pending_state(|state| {
+                        state.states.unset(xdg_toplevel::State::Maximized);
+                        state.states.unset(xdg_toplevel::State::Fullscreen);
+                        state.fullscreen_output = None;
+                        state.bounds = Some(size);
+                        state.size = Some(size);
+                    });
+                    toplevel.send_pending_configure();
+                    info!(
+                        ?side,
+                        x = location.x,
+                        y = location.y,
+                        width = size.w,
+                        height = size.h,
+                        "placed new window using last snap side"
+                    );
+                    return;
+                }
+            }
+        }
+
         let location = self
             .centered_content_location(content_size, uses_server_decoration)
             .unwrap_or_else(|| Point::from((48, 48)));
@@ -272,7 +370,10 @@ impl Yawc {
         }
 
         let bbox = window.bbox();
-        Some(Rectangle::new(location + bbox.loc, bbox.size))
+        Some(Rectangle::new(
+            location + bbox.loc,
+            non_empty_size(bbox.size, window.geometry().size),
+        ))
     }
 
     fn visual_rect_from_content(
@@ -280,7 +381,10 @@ impl Yawc {
         uses_server_decoration: bool,
     ) -> Rectangle<i32, Logical> {
         if !uses_server_decoration {
-            return content_rect;
+            return Rectangle::new(
+                content_rect.loc,
+                non_empty_size(content_rect.size, (1, 1).into()),
+            );
         }
 
         Rectangle::new(
@@ -290,8 +394,8 @@ impl Yawc {
             )
                 .into(),
             (
-                content_rect.size.w,
-                content_rect.size.h + crate::window::TITLEBAR_HEIGHT,
+                content_rect.size.w.max(1),
+                content_rect.size.h.max(1) + crate::window::TITLEBAR_HEIGHT,
             )
                 .into(),
         )
@@ -311,8 +415,45 @@ impl Yawc {
         }
     }
 
+    fn snap_layout(
+        &self,
+        side: SnapSide,
+        uses_server_decoration: bool,
+    ) -> Option<(
+        Rectangle<i32, Logical>,
+        Point<i32, Logical>,
+        Size<i32, Logical>,
+    )> {
+        let output_geometry = self.output_geometry_for(None)?;
+        let titlebar_height = if uses_server_decoration {
+            crate::window::TITLEBAR_HEIGHT
+        } else {
+            0
+        };
+        let content_width = (output_geometry.size.w / 2).max(1);
+        let content_height = (output_geometry.size.h - titlebar_height).max(1);
+        let visual_x = match side {
+            SnapSide::Left => output_geometry.loc.x,
+            SnapSide::Right => output_geometry.loc.x + output_geometry.size.w - content_width,
+        };
+        let visual_rect = Rectangle::new(
+            (visual_x, output_geometry.loc.y).into(),
+            (content_width, output_geometry.size.h).into(),
+        );
+        let location = Self::content_location_from_visual(visual_rect, uses_server_decoration);
+        let size = (content_width, content_height).into();
+
+        Some((visual_rect, location, size))
+    }
+
     pub fn prune_windows(&mut self) {
         self.windows.prune_dead(self.config.animations());
+    }
+
+    pub fn refresh_space_and_prune_windows(&mut self) {
+        let animations = self.config.animations();
+        self.space.refresh();
+        self.windows.prune_dead(animations);
     }
 
     pub fn finish_close_animations(&mut self) {
@@ -452,9 +593,11 @@ impl Yawc {
                 .or_else(|| {
                     self.space
                         .element_location(window)
-                        .map(|location| Rectangle::new(location, window.geometry().size))
+                        .map(|location| window_content_rect(window, location))
                 })
-                .unwrap_or_else(|| Rectangle::from_size(window.geometry().size));
+                .unwrap_or_else(|| {
+                    Rectangle::from_size(non_empty_size(window.geometry().size, window.bbox().size))
+                });
 
             self.windows.clear_snap(&surface);
             if let Some(from_rect) = self.window_visual_rect(window) {
@@ -485,34 +628,17 @@ impl Yawc {
             return;
         }
 
-        let Some(output_geometry) = self.output_geometry_for(None) else {
-            return;
-        };
-
         let restore_rect = self.windows.snap_restore_rect(&surface).or_else(|| {
             self.space
                 .element_location(window)
-                .map(|location| Rectangle::new(location, window.geometry().size))
+                .map(|location| window_content_rect(window, location))
         });
         let uses_server_decoration = self.windows.uses_server_decoration(&surface);
-        let titlebar_height = if uses_server_decoration {
-            crate::window::TITLEBAR_HEIGHT
-        } else {
-            0
+        let Some((target_visual_rect, window_location, window_size)) =
+            self.snap_layout(side, uses_server_decoration)
+        else {
+            return;
         };
-        let content_width = (output_geometry.size.w / 2).max(1);
-        let content_height = (output_geometry.size.h - titlebar_height).max(1);
-        let visual_x = match side {
-            SnapSide::Left => output_geometry.loc.x,
-            SnapSide::Right => output_geometry.loc.x + output_geometry.size.w - content_width,
-        };
-        let target_visual_rect = Rectangle::new(
-            (visual_x, output_geometry.loc.y).into(),
-            (content_width, output_geometry.size.h).into(),
-        );
-        let window_location =
-            Self::content_location_from_visual(target_visual_rect, uses_server_decoration);
-        let window_size = (content_width, content_height).into();
 
         if let Some(from_rect) = self.window_visual_rect(window) {
             self.windows
@@ -520,6 +646,7 @@ impl Yawc {
         }
 
         self.windows.set_snap(&surface, side, restore_rect);
+        self.last_snap_side = Some(side);
         self.space.raise_element(window, true);
         self.space
             .map_element(window.clone(), window_location, false);
@@ -556,7 +683,7 @@ impl Yawc {
             } else {
                 self.space
                     .element_location(window)
-                    .map(|location| Rectangle::new(location, window.geometry().size))
+                    .map(|location| window_content_rect(window, location))
             };
 
             let uses_server_decoration = self.windows.uses_server_decoration(&surface);
@@ -632,9 +759,11 @@ impl Yawc {
                 .or_else(|| {
                     self.space
                         .element_location(window)
-                        .map(|location| Rectangle::new(location, window.geometry().size))
+                        .map(|location| window_content_rect(window, location))
                 })
-                .unwrap_or_else(|| Rectangle::from_size(window.geometry().size));
+                .unwrap_or_else(|| {
+                    Rectangle::from_size(non_empty_size(window.geometry().size, window.bbox().size))
+                });
 
             if let Some(from_rect) = self.window_visual_rect(window) {
                 let uses_server_decoration = self.windows.uses_server_decoration(&surface);
@@ -669,7 +798,7 @@ impl Yawc {
         let restore_rect = self
             .space
             .element_location(window)
-            .map(|location| Rectangle::new(location, window.geometry().size));
+            .map(|location| window_content_rect(window, location));
 
         self.windows.set_minimized(&surface, true, restore_rect);
         self.space.unmap_elem(window);
@@ -693,7 +822,9 @@ impl Yawc {
             .windows
             .minimized_rect(&surface)
             .or_else(|| self.windows.restore_rect(&surface))
-            .unwrap_or_else(|| Rectangle::from_size(window.geometry().size));
+            .unwrap_or_else(|| {
+                Rectangle::from_size(non_empty_size(window.geometry().size, window.bbox().size))
+            });
 
         self.windows.set_minimized(&surface, false, None);
         self.windows.activate(&surface);
@@ -772,7 +903,7 @@ impl Yawc {
             } else {
                 self.space
                     .element_location(window)
-                    .map(|location| Rectangle::new(location, window.geometry().size))
+                    .map(|location| window_content_rect(window, location))
             };
 
             self.windows.set_fullscreen(&surface, true, restore_rect);
@@ -812,9 +943,11 @@ impl Yawc {
                 .or_else(|| {
                     self.space
                         .element_location(window)
-                        .map(|location| Rectangle::new(location, window.geometry().size))
+                        .map(|location| window_content_rect(window, location))
                 })
-                .unwrap_or_else(|| Rectangle::from_size(window.geometry().size));
+                .unwrap_or_else(|| {
+                    Rectangle::from_size(non_empty_size(window.geometry().size, window.bbox().size))
+                });
 
             self.windows.set_fullscreen(&surface, false, None);
             self.space
@@ -862,6 +995,20 @@ fn default_initial_window_size() -> Size<i32, Logical> {
     (900, 640).into()
 }
 
+fn is_transient_toplevel(window: &Window) -> bool {
+    window
+        .toplevel()
+        .and_then(|toplevel| toplevel.parent())
+        .is_some()
+}
+
+fn window_content_rect(window: &Window, location: Point<i32, Logical>) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        location,
+        non_empty_size(window.geometry().size, window.bbox().size),
+    )
+}
+
 fn non_empty_size(
     preferred: Size<i32, Logical>,
     fallback: Size<i32, Logical>,
@@ -884,4 +1031,84 @@ impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
 
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+fn should_show_dmabuf_global(
+    client: &Client,
+    display_handle: &DisplayHandle,
+    hide_portal_bridge: bool,
+) -> bool {
+    if env_flag("YAWC_DISABLE_CLIENT_DMABUF") {
+        return false;
+    }
+
+    let Some(command) = client_command_name(client, display_handle) else {
+        return true;
+    };
+
+    if hide_portal_bridge && command.contains("xdg-desktop-portal-wlr") {
+        info!(client = %command, "hiding linux-dmabuf global from portal bridge");
+        return false;
+    }
+
+    if env_flag("YAWC_ENABLE_DMABUF_PROBE") && !env_flag("YAWC_ENABLE_CLIENT_DMABUF") {
+        let visible = is_dmabuf_probe_client(&command);
+        info!(
+            client = %command,
+            visible,
+            "evaluated linux-dmabuf probe visibility"
+        );
+        return visible;
+    }
+
+    true
+}
+
+fn is_dmabuf_probe_client(command: &str) -> bool {
+    [
+        "obs",
+        "obs-studio",
+        "eglinfo",
+        "weston-simple-dmabuf",
+        "weston-simple-egl",
+    ]
+    .iter()
+    .any(|name| command.contains(name))
+}
+
+fn client_command_name(client: &Client, display_handle: &DisplayHandle) -> Option<String> {
+    let Ok(credentials) = client.get_credentials(display_handle) else {
+        return None;
+    };
+    let pid = credentials.pid;
+    if pid <= 0 {
+        return None;
+    }
+
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    if let Ok(cmdline) = std::fs::read(&cmdline_path) {
+        let command = String::from_utf8_lossy(&cmdline)
+            .replace('\0', " ")
+            .trim()
+            .to_string();
+        if !command.is_empty() {
+            return Some(command);
+        }
+    }
+
+    let comm_path = format!("/proc/{pid}/comm");
+    std::fs::read_to_string(comm_path)
+        .ok()
+        .map(|comm| comm.trim().to_string())
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
 }

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=YAWC dmabuf probe
+Comment=Diagnostic YAWC session for testing client linux-dmabuf
+Exec=@PREFIX@/bin/yawc-dmabuf-probe-session
+TryExec=@PREFIX@/bin/yawc-dmabuf-probe-session
+Type=Application
+DesktopNames=YAWC;etyDE;

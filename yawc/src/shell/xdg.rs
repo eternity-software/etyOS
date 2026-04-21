@@ -251,7 +251,8 @@ impl XdgShellHandler for Yawc {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        self.windows.remove(surface.wl_surface());
+        self.windows
+            .request_destroy_close(surface.wl_surface(), self.config.animations());
     }
 
     fn grab(

@@ -54,6 +54,7 @@ impl From<xdg_toplevel::ResizeEdge> for ResizeEdge {
 #[derive(Clone)]
 pub struct TrackedWindow {
     pub window: Window,
+    pub surface: WlSurface,
     pub active: bool,
     pub title: String,
     pub app_id: Option<String>,
@@ -82,6 +83,7 @@ pub struct TrackedWindow {
     pub titlebar_close_tint_started_at: Instant,
     pub close_animating: bool,
     pub close_sent: bool,
+    pub close_destroyed: bool,
     pub close_restoring: bool,
     pub close_started_at: Instant,
     pub close_restore_started_at: Instant,
@@ -169,10 +171,16 @@ impl WindowStore {
     pub fn insert(&mut self, window: Window) -> Point<i32, Logical> {
         let index = self.windows.len() as i32;
         let location = Point::from((48 + 48 * index, 48 + 48 * index));
+        let surface = window
+            .toplevel()
+            .expect("tracked windows must have an xdg toplevel")
+            .wl_surface()
+            .clone();
 
         let now = Instant::now();
         self.windows.push(TrackedWindow {
             window,
+            surface,
             active: false,
             title: "Untitled".to_string(),
             app_id: None,
@@ -201,6 +209,7 @@ impl WindowStore {
             titlebar_close_tint_started_at: now,
             close_animating: false,
             close_sent: false,
+            close_destroyed: false,
             close_restoring: false,
             close_started_at: now,
             close_restore_started_at: now,
@@ -276,11 +285,12 @@ impl WindowStore {
         let close_duration = Duration::from_millis(config.close_ms);
         self.windows.retain(|tracked| {
             if tracked.close_animating {
-                if tracked
-                    .window
-                    .toplevel()
-                    .map(|toplevel| toplevel.wl_surface().is_alive())
-                    .unwrap_or(false)
+                if !tracked.close_destroyed
+                    && tracked
+                        .window
+                        .toplevel()
+                        .map(|toplevel| toplevel.wl_surface().is_alive())
+                        .unwrap_or(false)
                 {
                     return true;
                 }
@@ -288,7 +298,7 @@ impl WindowStore {
                 return config.enabled
                     && config.close_ms > 0
                     && tracked.close_started_at.elapsed() < close_duration
-                    && !tracked.close_sent;
+                    && (tracked.close_destroyed || !tracked.close_sent);
             }
 
             tracked
@@ -311,6 +321,43 @@ impl WindowStore {
             .retain(|tracked| !same_surface(tracked, surface));
     }
 
+    pub fn request_destroy_close(&mut self, surface: &WlSurface, config: AnimationConfig) -> bool {
+        if !config.enabled || config.close_ms == 0 {
+            self.remove(surface);
+            return false;
+        }
+
+        let now = Instant::now();
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|tracked| same_surface(tracked, surface))
+        else {
+            return false;
+        };
+
+        let tracked = &mut self.windows[index];
+        if tracked.close_animating && tracked.close_sent && !tracked.close_destroyed {
+            self.windows.remove(index);
+            return false;
+        }
+
+        {
+            tracked.close_animating = true;
+            tracked.close_sent = true;
+            tracked.close_destroyed = true;
+            tracked.close_restoring = false;
+            tracked.active = false;
+            tracked.decoration_pressed = false;
+            tracked.titlebar_close_pressed = false;
+            tracked.close_started_at = now;
+            set_decoration_opacity_target(tracked, DECORATION_INACTIVE_OPACITY);
+            set_titlebar_close_tint_target(tracked, 0.0);
+        }
+
+        true
+    }
+
     pub fn request_close(&mut self, surface: &WlSurface, config: AnimationConfig) -> bool {
         if !config.enabled || config.close_ms == 0 {
             return true;
@@ -320,6 +367,7 @@ impl WindowStore {
         if let Some(tracked) = self.find_mut(surface) {
             tracked.close_animating = true;
             tracked.close_sent = false;
+            tracked.close_destroyed = false;
             tracked.close_restoring = false;
             tracked.active = false;
             tracked.decoration_pressed = false;
@@ -338,6 +386,7 @@ impl WindowStore {
                 if tracked.close_animating || tracked.close_restoring {
                     tracked.close_animating = false;
                     tracked.close_sent = false;
+                    tracked.close_destroyed = false;
                     tracked.close_restoring = false;
                     set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
                     set_titlebar_close_tint_target(tracked, 0.0);
@@ -351,6 +400,7 @@ impl WindowStore {
         let mut windows = Vec::new();
         for tracked in &mut self.windows {
             if tracked.close_animating
+                && !tracked.close_destroyed
                 && !tracked.close_sent
                 && tracked.close_started_at.elapsed() >= close_duration
             {
@@ -359,10 +409,12 @@ impl WindowStore {
                 windows.push(tracked.window.clone());
             } else if tracked.close_animating
                 && tracked.close_sent
+                && !tracked.close_destroyed
                 && tracked.close_started_at.elapsed() >= restore_duration
             {
                 tracked.close_animating = false;
                 tracked.close_sent = false;
+                tracked.close_destroyed = false;
                 tracked.close_restoring = true;
                 tracked.close_restore_started_at = Instant::now();
                 set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
@@ -374,6 +426,31 @@ impl WindowStore {
             }
         }
         windows
+    }
+
+    pub fn destroyed_close_animations(
+        &self,
+        config: AnimationConfig,
+    ) -> Vec<(WlSurface, WindowAnimation)> {
+        if !config.enabled || config.close_ms == 0 {
+            return Vec::new();
+        }
+
+        let duration = Duration::from_millis(config.close_ms);
+        self.windows
+            .iter()
+            .filter(|tracked| {
+                tracked.close_animating
+                    && tracked.close_destroyed
+                    && tracked.close_started_at.elapsed() < duration
+            })
+            .filter_map(|tracked| {
+                Some((
+                    tracked.surface.clone(),
+                    close_animation_for_elapsed(tracked.close_started_at.elapsed(), config),
+                ))
+            })
+            .collect()
     }
 
     pub fn set_server_decoration(&mut self, surface: &WlSurface, enabled: bool) {
@@ -454,6 +531,12 @@ impl WindowStore {
         if let Some(tracked) = self.find_mut(surface) {
             tracked.resizing = resizing;
         }
+    }
+
+    pub fn is_resizing(&self, surface: &WlSurface) -> bool {
+        self.find(surface)
+            .map(|tracked| tracked.resizing)
+            .unwrap_or(false)
     }
 
     pub fn set_decoration_pressed(&mut self, surface: &WlSurface, pressed: bool) {
@@ -550,6 +633,16 @@ impl WindowStore {
             .unwrap_or_default()
     }
 
+    pub fn needs_animation_frame(&self, config: AnimationConfig) -> bool {
+        if !config.enabled {
+            return false;
+        }
+
+        self.windows
+            .iter()
+            .any(|tracked| tracked_needs_animation_frame(tracked, config))
+    }
+
     pub fn start_map_animation_if_needed(&mut self, surface: &WlSurface) {
         if let Some(tracked) = self.find_mut(surface) {
             if !tracked.map_animation_started {
@@ -565,11 +658,12 @@ impl WindowStore {
         from: Rectangle<i32, Logical>,
         to: Rectangle<i32, Logical>,
     ) {
-        if from == to {
-            return;
-        }
-
         if let Some(tracked) = self.find_mut(surface) {
+            if from == to || !valid_animation_rect(from) || !valid_animation_rect(to) {
+                tracked.geometry_animation = None;
+                return;
+            }
+
             tracked.geometry_animation = Some(GeometryAnimation {
                 from,
                 to,
@@ -806,12 +900,12 @@ impl WindowStore {
     }
 }
 
+fn valid_animation_rect(rect: Rectangle<i32, Logical>) -> bool {
+    rect.size.w > 1 && rect.size.h > 1
+}
+
 fn same_surface(tracked: &TrackedWindow, surface: &WlSurface) -> bool {
-    tracked
-        .window
-        .toplevel()
-        .map(|toplevel| toplevel.wl_surface() == surface)
-        .unwrap_or(false)
+    tracked.surface == *surface
 }
 
 fn animation_for_tracked(tracked: &TrackedWindow, config: AnimationConfig) -> WindowAnimation {
@@ -827,6 +921,9 @@ fn animation_for_tracked(tracked: &TrackedWindow, config: AnimationConfig) -> Wi
             tracked.close_restore_started_at.elapsed(),
             config,
         );
+    }
+    if tracked.resizing {
+        return WindowAnimation::default();
     }
 
     let mut animation = if tracked.map_animation_started {
@@ -850,6 +947,41 @@ fn animation_for_tracked(tracked: &TrackedWindow, config: AnimationConfig) -> Wi
     });
 
     animation
+}
+
+fn tracked_needs_animation_frame(tracked: &TrackedWindow, config: AnimationConfig) -> bool {
+    if tracked.resizing {
+        return false;
+    }
+    if tracked.close_animating {
+        return config.close_ms > 0
+            && tracked.close_started_at.elapsed()
+                < Duration::from_millis(config.close_ms + CLOSE_RESTORE_GRACE_MS);
+    }
+    if tracked.close_restoring {
+        return config.close_ms > 0
+            && tracked.close_restore_started_at.elapsed() < Duration::from_millis(config.close_ms);
+    }
+    if tracked.map_animation_started
+        && config.popup_ms > 0
+        && tracked.mapped_at.elapsed() < Duration::from_millis(config.popup_ms)
+    {
+        return true;
+    }
+    if tracked.geometry_animation.is_some_and(|geometry| {
+        config.geometry_ms > 0
+            && geometry.started_at.elapsed() < Duration::from_millis(config.geometry_ms)
+    }) {
+        return true;
+    }
+    if config.decoration_ms > 0
+        && tracked.decoration_opacity_started_at.elapsed()
+            < Duration::from_millis(config.decoration_ms)
+    {
+        return true;
+    }
+
+    tracked.titlebar_close_tint_started_at.elapsed() < Duration::from_millis(TITLEBAR_CLOSE_TINT_MS)
 }
 
 fn close_animation_for_elapsed(elapsed: Duration, config: AnimationConfig) -> WindowAnimation {

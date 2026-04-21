@@ -29,6 +29,7 @@ pub struct Config {
     animations: AnimationConfig,
     keyboard: KeyboardConfig,
     window_controls: WindowControlsMode,
+    screencopy_dmabuf: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -104,7 +105,7 @@ impl Default for WindowControlsMode {
 impl Default for KeyboardConfig {
     fn default() -> Self {
         Self {
-            layouts: "us".to_string(),
+            layouts: "us,ru".to_string(),
             model: String::new(),
             variant: String::new(),
             options: None,
@@ -161,6 +162,7 @@ impl Config {
             animations: AnimationConfig::default(),
             keyboard: KeyboardConfig::default(),
             window_controls: WindowControlsMode::default(),
+            screencopy_dmabuf: false,
         };
         config.reload();
         config
@@ -206,6 +208,10 @@ impl Config {
         self.window_controls
     }
 
+    pub fn screencopy_dmabuf(&self) -> bool {
+        self.screencopy_dmabuf
+    }
+
     fn reload(&mut self) -> bool {
         let contents = match fs::read_to_string(&self.path) {
             Ok(contents) => contents,
@@ -224,6 +230,7 @@ impl Config {
         self.animations = parsed.animations;
         self.keyboard = parsed.keyboard;
         self.window_controls = parsed.window_controls;
+        self.screencopy_dmabuf = parsed.screencopy_dmabuf;
         self.modified = fs::metadata(&self.path)
             .and_then(|metadata| metadata.modified())
             .ok();
@@ -238,6 +245,7 @@ struct ParsedConfig {
     animations: AnimationConfig,
     keyboard: KeyboardConfig,
     window_controls: WindowControlsMode,
+    screencopy_dmabuf: bool,
 }
 
 impl Hotkeys {
@@ -290,6 +298,7 @@ fn parse_config(contents: &str) -> ParsedConfig {
     let mut animations = AnimationConfig::default();
     let mut keyboard = KeyboardConfig::default();
     let mut window_controls = WindowControlsMode::default();
+    let mut screencopy_dmabuf = false;
 
     for (line_number, raw_line) in contents.lines().enumerate() {
         let line = raw_line
@@ -393,6 +402,16 @@ fn parse_config(contents: &str) -> ParsedConfig {
                     );
                 }
             }
+            "screencopydmabuf" | "screencopydmabufs" | "dmabufscreencopy" => {
+                if let Some(enabled) = parse_bool(value) {
+                    screencopy_dmabuf = enabled;
+                } else {
+                    warn!(
+                        line = line_number + 1,
+                        value, "ignoring invalid screencopy dmabuf boolean"
+                    );
+                }
+            }
             "keyboardlayouts" | "xkblayout" | "layouts" => {
                 keyboard.layouts = value.trim().to_string();
             }
@@ -411,8 +430,8 @@ fn parse_config(contents: &str) -> ParsedConfig {
     }
 
     if keyboard.layouts.trim().is_empty() {
-        warn!("keyboard_layouts is empty; falling back to us");
-        keyboard.layouts = "us".to_string();
+        warn!("keyboard_layouts is empty; falling back to us,ru");
+        keyboard.layouts = "us,ru".to_string();
     }
 
     ParsedConfig {
@@ -420,6 +439,7 @@ fn parse_config(contents: &str) -> ParsedConfig {
         animations,
         keyboard,
         window_controls,
+        screencopy_dmabuf,
     }
 }
 
@@ -610,7 +630,7 @@ layout_switch = Alt+Shift
 # Keyboard:
 #   keyboard_layouts is an XKB comma-separated layout list, for example: us,ru
 #   keyboard_model, keyboard_variant, and keyboard_options are passed to xkbcommon.
-keyboard_layouts = us
+keyboard_layouts = us,ru
 keyboard_model =
 keyboard_variant =
 keyboard_options =
@@ -629,4 +649,5 @@ close_animation_ms = 220
 #   gestures: no titlebar buttons, right-click titlebar to close, double-click titlebar to maximize.
 #   buttons/windows/classic: show close/maximize/minimize buttons.
 window_controls = gestures
+screencopy_dmabuf = false
 "#;

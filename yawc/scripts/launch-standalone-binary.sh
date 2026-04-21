@@ -124,13 +124,76 @@ EOF
   done
 }
 
+reset_stale_portal_services() {
+  if [ "${YAWC_SKIP_PORTAL_RESTART:-0}" = "1" ]; then
+    return 0
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  systemctl --user stop \
+    xdg-desktop-portal.service \
+    xdg-desktop-portal-wlr.service >/dev/null 2>&1 || true
+  systemctl --user reset-failed \
+    xdg-desktop-portal.service \
+    xdg-desktop-portal-wlr.service >/dev/null 2>&1 || true
+}
+
 ensure_portal_config
 ensure_portal_descriptors
 ensure_wlr_config
+reset_stale_portal_services
 
 if [ ! -e /usr/share/xdg-desktop-portal/portals/wlr.portal ]; then
   echo "warning: xdg-desktop-portal-wlr is not installed; OBS screen capture will not be available" >&2
 fi
+
+avoid_software_gl_overrides() {
+  case "${LIBGL_ALWAYS_SOFTWARE:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      echo "warning: unsetting LIBGL_ALWAYS_SOFTWARE so Wayland/EGL clients can use hardware GL" >&2
+      unset LIBGL_ALWAYS_SOFTWARE
+      ;;
+  esac
+
+  case "${MESA_LOADER_DRIVER_OVERRIDE:-}" in
+    llvmpipe|softpipe|swrast)
+      echo "warning: unsetting MESA_LOADER_DRIVER_OVERRIDE=$MESA_LOADER_DRIVER_OVERRIDE" >&2
+      unset MESA_LOADER_DRIVER_OVERRIDE
+      ;;
+  esac
+}
+
+configure_gpu_vendor_overrides() {
+  gpu_vendor="${YAWC_GPU_VENDOR:-${YAWC_DEFAULT_GPU_VENDOR:-auto}}"
+  case "$gpu_vendor" in
+    auto|"")
+      ;;
+    nvidia)
+      if [ -e /usr/share/glvnd/egl_vendor.d/10_nvidia.json ]; then
+        export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}"
+        export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+        export GBM_BACKEND="${GBM_BACKEND:-nvidia-drm}"
+      else
+        echo "warning: YAWC_GPU_VENDOR=nvidia was requested but the NVIDIA EGL vendor file is missing" >&2
+      fi
+      ;;
+    mesa)
+      if [ -e /usr/share/glvnd/egl_vendor.d/50_mesa.json ]; then
+        export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/50_mesa.json}"
+      fi
+      ;;
+    *)
+      echo "warning: unknown YAWC_GPU_VENDOR=$gpu_vendor; expected auto, mesa, or nvidia" >&2
+      ;;
+  esac
+}
+
+avoid_software_gl_overrides
+configure_gpu_vendor_overrides
+export EGL_PLATFORM="${EGL_PLATFORM:-wayland}"
 
 exec env \
   HOME="$USER_HOME" \
@@ -149,6 +212,7 @@ exec env \
   SDL_VIDEODRIVER="wayland" \
   CLUTTER_BACKEND="wayland" \
   MOZ_ENABLE_WAYLAND="1" \
+  EGL_PLATFORM="$EGL_PLATFORM" \
   LIBSEAT_BACKEND="${YAWC_LIBSEAT_BACKEND:-logind}" \
   SMITHAY_USE_LEGACY="${YAWC_DRM_LEGACY:-1}" \
   YAWC_STANDALONE_LOG="$LOG_FILE" \

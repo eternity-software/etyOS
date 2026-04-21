@@ -17,7 +17,10 @@ else
 fi
 
 $SUDO rm -f "$SESSION_DIR/yawc.desktop"
+$SUDO rm -f "$SESSION_DIR/yawc-dmabuf-probe.desktop"
 $SUDO rm -f "$PREFIX/bin/yawc-session"
+$SUDO rm -f "$PREFIX/bin/yawc-dmabuf-probe-session"
+$SUDO rm -f "$PREFIX/bin/yawc-debug-gpu-env"
 $SUDO rm -f "$PREFIX/bin/yawc"
 
 echo "Removed YAWC login session files."

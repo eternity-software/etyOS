@@ -16,11 +16,13 @@ tty-udev = [
   "smithay/backend_session_libseat",
   "smithay/renderer_gl",
   "smithay/renderer_multi",
+  "smithay/use_system_lib",
 ]
 
 [dependencies]
 bitflags = "2.10.0"
 image = { version = "0.25.8", default-features = false, features = ["png", "jpeg"] }
+libc = "0.2.177"
 rusttype = "0.9.3"
 smithay = { version = "0.7.0", default-features = false, features = ["desktop", "wayland_frontend"] }
 tracing = { version = "0.1.41", features = ["max_level_trace", "release_max_level_debug"] }

@@ -28,6 +28,8 @@ The design favors direct Wayland/Smithay integration over borrowing behavior fro
 - `xdg-shell` toplevel window support
 - `xdg-shell` popup tracking and unconstraining
 - `xdg-decoration` handling with server-side decorations
+- `wp_viewporter` support for client-side scaled subsurfaces
+- `linux-dmabuf` feedback for native Wayland GPU buffers
 - YAWC-owned `wlr-screencopy` support for portal screen capture
 - explicit window tracking with title and `app_id` metadata
 - focus, raise-on-click, and active window state
@@ -247,6 +249,8 @@ After installation, log out, open the session selector on the login screen, and 
 The session launcher starts YAWC with the standalone backend and opens the first available terminal emulator.
 Login-screen session output is saved to `~/.local/state/yawc/session.log`.
 
+The installer removes the old `YAWC dmabuf probe` login entry by default. The normal YAWC session now advertises GPU buffer support directly; the probe entry can still be installed explicitly with `YAWC_INSTALL_DMABUF_PROBE=1 ./scripts/install-session.sh` when diagnosing vendor-specific EGL behavior.
+
 Fast development loop from inside a running YAWC session:
 
 ```bash
@@ -279,7 +283,7 @@ close = Super+W
 kill = Super+Q
 layout_switch = Alt+Shift
 
-keyboard_layouts = us
+keyboard_layouts = us,ru
 keyboard_model =
 keyboard_variant =
 keyboard_options =
@@ -291,6 +295,7 @@ decoration_animation_ms = 140
 close_animation_ms = 220
 
 window_controls = gestures
+screencopy_dmabuf = false
 ```
 
 Pressing the same snap binding again restores the window to the position and size it had before snapping.
@@ -303,16 +308,22 @@ Supported modifiers are `Super`, `Ctrl`, `Alt`, and `Shift`. Supported keys are 
 `window_controls = gestures` hides titlebar buttons. In gesture mode, right-clicking the titlebar arms a close action and double-clicking the titlebar toggles maximize. Use `window_controls = buttons` or `window_controls = windows` for classic close/maximize/minimize buttons.
 
 Animation values are in milliseconds and reload live. Set `animations = false` to disable popup, geometry, decoration, and close animations.
+`screencopy_dmabuf = false` keeps portal screen capture on the SHM-compatible path used by `xdg-desktop-portal-wlr`; compositor-side client `linux-dmabuf` support remains enabled separately for native Wayland EGL clients.
 
 Useful session overrides:
 
 ```bash
 YAWC_STARTUP_COMMAND=foot yawc-session
 YAWC_DRM_LEGACY=1 yawc-session
+YAWC_GPU_VENDOR=nvidia yawc-session
+YAWC_DISABLE_CLIENT_DMABUF=1 yawc-session
 YAWC_SKIP_PORTAL_CONFIG=1 yawc-session
+YAWC_SKIP_PORTAL_RESTART=1 yawc-session
 YAWC_SESSION_LOG=/tmp/yawc-session.log yawc-session
 RUST_LOG=yawc=trace,smithay=debug yawc-session
 ```
+
+YAWC advertises `linux-dmabuf` with default feedback in standalone sessions so native Wayland EGL clients can use GPU buffers. `YAWC_DISABLE_CLIENT_DMABUF=1` is a diagnostic fallback if a driver-specific dmabuf path needs to be bypassed temporarily.
 
 To remove the login session entry:
 
@@ -397,6 +408,34 @@ Portal debugging is usually done through the user journal:
 
 ```bash
 journalctl --user -b -u xdg-desktop-portal -u xdg-desktop-portal-wlr --no-pager
+```
+
+GPU/EGL diagnostics for pure Wayland sessions:
+
+```bash
+yawc-debug-gpu-env
+./scripts/debug-gpu-env.sh
+obs --verbose 2>&1 | grep -Ei 'OpenGL|adapter|renderer|EGL|llvmpipe|nvidia|mesa'
+```
+
+`yawc-debug-gpu-env` is installed with the login session. `./scripts/debug-gpu-env.sh` is the repository-local equivalent.
+`glxinfo` requires X11/GLX and is not useful in a pure YAWC Wayland session without `DISPLAY`.
+
+If explicitly installed with `YAWC_INSTALL_DMABUF_PROBE=1`, the `YAWC dmabuf probe` login session writes:
+
+```text
+~/.local/state/yawc/dmabuf-probe.log
+~/.local/state/yawc/dmabuf-probe-eglinfo.log
+~/.local/state/yawc/dmabuf-probe-obs.log
+~/.local/state/yawc/dmabuf-probe-session.log
+```
+
+The probe can force a client EGL vendor for diagnosis through a small persistent env file:
+
+```bash
+mkdir -p ~/.config/yawc
+printf 'YAWC_DMABUF_PROBE_EGL_VENDOR=mesa\n' > ~/.config/yawc/dmabuf-probe-env
+printf 'YAWC_DMABUF_PROBE_EGL_VENDOR=nvidia\n' > ~/.config/yawc/dmabuf-probe-env
 ```
 
 ## OBS And Screen Capture

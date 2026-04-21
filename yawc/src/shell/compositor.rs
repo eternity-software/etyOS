@@ -1,6 +1,7 @@
 use smithay::{
+    backend::allocator::{dmabuf::Dmabuf, Buffer},
     backend::renderer::utils::on_commit_buffer_handler,
-    delegate_compositor, delegate_shm,
+    delegate_compositor, delegate_dmabuf, delegate_shm, delegate_viewporter,
     reexports::wayland_server::{
         protocol::{wl_buffer, wl_surface::WlSurface},
         Client,
@@ -11,6 +12,7 @@ use smithay::{
             get_parent, is_sync_subsurface, CompositorClientState, CompositorHandler,
             CompositorState,
         },
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         shm::{ShmHandler, ShmState},
     },
 };
@@ -32,6 +34,7 @@ impl CompositorHandler for Yawc {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        self.request_render();
         on_commit_buffer_handler::<Self>(surface);
 
         if !is_sync_subsurface(surface) {
@@ -71,5 +74,30 @@ impl ShmHandler for Yawc {
     }
 }
 
+impl DmabufHandler for Yawc {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        if self
+            .dmabuf_formats
+            .iter()
+            .any(|format| *format == dmabuf.format())
+        {
+            let _ = notifier.successful::<Self>();
+        } else {
+            notifier.failed();
+        }
+    }
+}
+
 delegate_compositor!(Yawc);
+delegate_dmabuf!(Yawc);
 delegate_shm!(Yawc);
+delegate_viewporter!(Yawc);
