@@ -15,7 +15,10 @@ use smithay::{
         renderer::{
             element::{
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
-                surface::{WaylandSurfaceRenderElement, WaylandSurfaceTexture},
+                surface::{
+                    render_elements_from_surface_tree, WaylandSurfaceRenderElement,
+                    WaylandSurfaceTexture,
+                },
                 texture::{TextureBuffer, TextureRenderElement},
                 Element, Id, Kind, RenderElement,
             },
@@ -27,7 +30,9 @@ use smithay::{
             Frame, Renderer, Texture,
         },
     },
-    desktop::{space::SpaceRenderElements, Space, Window},
+    desktop::{
+        space::SpaceRenderElements, utils::send_frames_surface_tree, PopupManager, Space, Window,
+    },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::wayland_server::{protocol::wl_surface::WlSurface, DisplayHandle},
     utils::{Logical, Physical, Point, Rectangle, Scale as RendererScale, Size, Transform},
@@ -363,7 +368,9 @@ impl RenderState {
                         capture.dst_size(),
                         capture,
                         frame_meta.map(|frame| frame.frame),
-                        animation,
+                        frame_meta
+                            .map(decoration_animation_for_frame)
+                            .unwrap_or(animation),
                     )));
                 }
             }
@@ -374,15 +381,23 @@ impl RenderState {
                     loc.y - window.geometry().loc.y,
                 ));
                 let anchor = animation_anchor(space, window, frame_meta);
-                let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
-                let surf: Vec<
-                    SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
-                > = window.render_elements(renderer, phys_loc, RendererScale::from(1.0), 1.0);
-
                 if let Some(frame_meta) = frame_meta {
+                    let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
+                    let popup_elements = window_popup_elements(renderer, window, phys_loc)
+                        .into_iter()
+                        .map(YawcRenderElements::from);
+                    window_elements.splice(0..0, popup_elements);
+                    let surf = window_root_elements(renderer, window, phys_loc);
                     window_elements
                         .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
                 } else {
+                    let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
+                    let surf: Vec<
+                        SpaceRenderElements<
+                            GlesRenderer,
+                            WaylandSurfaceRenderElement<GlesRenderer>,
+                        >,
+                    > = window.render_elements(renderer, phys_loc, RendererScale::from(1.0), 1.0);
                     window_elements.extend(animated_surface_elements(surf, anchor, animation));
                 }
             }
@@ -423,8 +438,12 @@ impl RenderState {
         state: &mut Yawc,
         display_handle: &mut DisplayHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        state.config.reload_if_changed();
+        state.reload_config_if_changed();
         let animation_config = state.config.animations();
+        let pointer_location = state
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location());
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
         let all_frames = state.windows.frames(&state.space, animation_config);
@@ -486,7 +505,7 @@ impl RenderState {
                             let (blur_loc, blur_size) = animated_rect(
                                 capture_rect,
                                 Some(frame_meta.frame),
-                                frame_meta.animation,
+                                decoration_animation_for_frame(frame_meta),
                             );
                             (
                                 blur_texture,
@@ -494,7 +513,7 @@ impl RenderState {
                                     TextureRenderElement::from_texture_buffer(
                                         blur_loc,
                                         &blur_buffer,
-                                        Some(frame_meta.animation.alpha),
+                                        Some(decoration_animation_for_frame(frame_meta).alpha),
                                         Some(Rectangle::new(
                                             (capture.src_x as f64, capture.src_y as f64).into(),
                                             (capture.dst_w as f64, capture.dst_h as f64).into(),
@@ -529,19 +548,14 @@ impl RenderState {
                             ));
                             let phys_loc =
                                 Point::<i32, Physical>::from((render_loc.x, render_loc.y));
-                            let surf: Vec<
-                                SpaceRenderElements<
-                                    GlesRenderer,
-                                    WaylandSurfaceRenderElement<GlesRenderer>,
-                                >,
-                            > = window.render_elements(
-                                renderer,
-                                phys_loc,
-                                RendererScale::from(1.0),
-                                1.0,
-                            );
+                            let surf = window_root_elements(renderer, window, phys_loc);
                             step_elements
                                 .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
+                            step_elements.extend(
+                                window_popup_elements(renderer, window, phys_loc)
+                                    .into_iter()
+                                    .map(YawcRenderElements::from),
+                            );
                         }
 
                         let mut frame =
@@ -606,6 +620,13 @@ impl RenderState {
                 draw_elements(&mut frame, &step_elements)?;
                 let _ = frame.finish()?;
             }
+
+            let dnd_icon = dnd_icon_elements(renderer, state.dnd_icon.as_ref(), pointer_location);
+            if !dnd_icon.is_empty() {
+                let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                draw_elements(&mut frame, &dnd_icon)?;
+                let _ = frame.finish()?;
+            }
         }
 
         self.blur_texture_cache
@@ -621,6 +642,15 @@ impl RenderState {
                 |_, _| Some(self.output.clone()),
             );
         });
+        if let Some(icon) = state.dnd_icon.as_ref() {
+            send_frames_surface_tree(
+                icon,
+                &self.output,
+                state.start_time.elapsed(),
+                Some(std::time::Duration::ZERO),
+                |_, _| Some(self.output.clone()),
+            );
+        }
 
         state.space.refresh();
         state.prune_windows();
@@ -804,7 +834,7 @@ impl RenderState {
                     renderer,
                     overlay_loc,
                     frame_buffer,
-                    Some(frame.animation.alpha),
+                    Some(decoration_animation_for_frame(frame).alpha),
                     Some(Rectangle::from_size(frame.frame.size.to_f64())),
                     Some(overlay_size),
                     Kind::Unspecified,
@@ -1396,6 +1426,82 @@ fn draw_elements(
     }
 
     Ok(())
+}
+
+fn decoration_animation_for_frame(frame: &WindowFrame) -> WindowAnimation {
+    let mut animation = frame.animation;
+    animation.alpha *= frame.decoration_opacity;
+    animation
+}
+
+fn window_root_elements(
+    renderer: &mut GlesRenderer,
+    window: &Window,
+    location: Point<i32, Physical>,
+) -> Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
+    let Some(surface) = window.toplevel().map(|toplevel| toplevel.wl_surface()) else {
+        return Vec::new();
+    };
+
+    render_elements_from_surface_tree(
+        renderer,
+        surface,
+        location,
+        RendererScale::from(1.0),
+        1.0,
+        Kind::Unspecified,
+    )
+}
+
+fn window_popup_elements(
+    renderer: &mut GlesRenderer,
+    window: &Window,
+    location: Point<i32, Physical>,
+) -> Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
+    let Some(surface) = window.toplevel().map(|toplevel| toplevel.wl_surface()) else {
+        return Vec::new();
+    };
+
+    PopupManager::popups_for_surface(surface)
+        .flat_map(|(popup, popup_offset)| {
+            let offset = (window.geometry().loc + popup_offset - popup.geometry().loc)
+                .to_physical_precise_round(RendererScale::from(1.0));
+
+            render_elements_from_surface_tree(
+                renderer,
+                popup.wl_surface(),
+                location + offset,
+                RendererScale::from(1.0),
+                1.0,
+                Kind::Unspecified,
+            )
+        })
+        .collect()
+}
+
+pub fn dnd_icon_elements(
+    renderer: &mut GlesRenderer,
+    icon: Option<&WlSurface>,
+    pointer_location: Option<Point<f64, Logical>>,
+) -> Vec<YawcRenderElements> {
+    let (Some(icon), Some(location)) = (icon, pointer_location) else {
+        return Vec::new();
+    };
+
+    let location =
+        Point::<i32, Physical>::from((location.x.round() as i32, location.y.round() as i32));
+    let surfaces: Vec<
+        SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    > = render_elements_from_surface_tree(
+        renderer,
+        icon,
+        location,
+        RendererScale::from(1.0),
+        1.0,
+        Kind::Cursor,
+    );
+
+    surfaces.into_iter().map(YawcRenderElements::from).collect()
 }
 
 fn titlebar_shader_uniforms(

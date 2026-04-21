@@ -2,7 +2,10 @@ use smithay::{
     backend::input::TabletToolDescriptor,
     delegate_cursor_shape, delegate_data_device, delegate_output, delegate_seat,
     input::{pointer::CursorImageStatus, Seat, SeatHandler, SeatState},
-    reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
+    reexports::wayland_server::{
+        protocol::{wl_data_source::WlDataSource, wl_surface::WlSurface},
+        Resource,
+    },
     wayland::{
         output::OutputHandler,
         selection::{
@@ -47,7 +50,20 @@ impl DataDeviceHandler for Yawc {
     }
 }
 
-impl ClientDndGrabHandler for Yawc {}
+impl ClientDndGrabHandler for Yawc {
+    fn started(
+        &mut self,
+        _source: Option<WlDataSource>,
+        icon: Option<WlSurface>,
+        _seat: Seat<Self>,
+    ) {
+        self.dnd_icon = icon;
+    }
+
+    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        self.dnd_icon = None;
+    }
+}
 impl ServerDndGrabHandler for Yawc {}
 impl OutputHandler for Yawc {}
 impl TabletSeatHandler for Yawc {

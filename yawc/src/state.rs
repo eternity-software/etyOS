@@ -27,10 +27,10 @@ use smithay::{
         socket::ListeningSocketSource,
     },
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
-    config::Config,
+    config::{Config, KeyboardConfig},
     cursor::CursorShape,
     window::{SnapSide, WindowStore},
     CalloopData,
@@ -56,7 +56,9 @@ pub struct Yawc {
     pub pending_cursor: CursorShape,
     pub compositor_cursor: Option<CursorShape>,
     pub cursor_image: CursorImageStatus,
+    pub dnd_icon: Option<WlSurface>,
     pub config: Config,
+    applied_keyboard_config: Option<KeyboardConfig>,
 }
 
 impl Yawc {
@@ -83,7 +85,7 @@ impl Yawc {
         let loop_signal = event_loop.get_signal();
         let config = Config::load_or_create();
 
-        Self {
+        let mut state = Self {
             start_time,
             socket_name,
             display_handle,
@@ -103,8 +105,12 @@ impl Yawc {
             pending_cursor: CursorShape::Default,
             compositor_cursor: None,
             cursor_image: CursorImageStatus::Named(CursorIcon::Default),
+            dnd_icon: None,
             config,
-        }
+            applied_keyboard_config: None,
+        };
+        state.apply_keyboard_config();
+        state
     }
 
     fn init_wayland_listener(
@@ -130,6 +136,7 @@ impl Yawc {
                     unsafe {
                         display.get_mut().dispatch_clients(&mut data.state).unwrap();
                     }
+                    data.state.flush_wayland_clients();
                     Ok(PostAction::Continue)
                 },
             )
@@ -156,12 +163,19 @@ impl Yawc {
             })
     }
 
-    pub fn send_pending_configures(&self) {
+    pub fn send_pending_configures(&mut self) {
         self.space.elements().for_each(|window| {
             if let Some(toplevel) = window.toplevel() {
                 toplevel.send_pending_configure();
             }
         });
+        self.flush_wayland_clients();
+    }
+
+    pub fn flush_wayland_clients(&mut self) {
+        if let Err(error) = self.display_handle.flush_clients() {
+            warn!(?error, "failed to flush Wayland clients");
+        }
     }
 
     pub(crate) fn initial_window_location(&self, window: &Window) -> Point<i32, Logical> {
@@ -516,6 +530,19 @@ impl Yawc {
                 "window entered maximized state"
             );
         } else {
+            if !self.windows.is_maximized(&surface) && self.windows.restore_rect(&surface).is_none()
+            {
+                self.windows.set_maximized(&surface, false, None, None);
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                    state.bounds = None;
+                    state.size = None;
+                });
+                toplevel.send_pending_configure();
+                info!("ignored redundant unmaximize request before window had a restore size");
+                return;
+            }
+
             let restore_rect = self
                 .windows
                 .restore_rect(&surface)
@@ -597,6 +624,51 @@ impl Yawc {
         info!("window restored from minimized state");
     }
 
+    pub fn reload_config_if_changed(&mut self) -> bool {
+        let changed = self.config.reload_if_changed();
+        if changed {
+            self.apply_keyboard_config();
+        }
+        changed
+    }
+
+    pub fn apply_keyboard_config(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let keyboard_config = self.config.keyboard();
+        if self.applied_keyboard_config.as_ref() == Some(&keyboard_config) {
+            return;
+        }
+
+        let xkb_config = keyboard_config.xkb_config();
+        if let Err(error) = keyboard.set_xkb_config(self, xkb_config) {
+            warn!(
+                ?error,
+                layouts = %keyboard_config.layouts,
+                "failed to apply keyboard config"
+            );
+        } else {
+            info!(layouts = %keyboard_config.layouts, "applied keyboard config");
+            self.applied_keyboard_config = Some(keyboard_config);
+        }
+    }
+
+    pub fn cycle_keyboard_layout(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+
+        let layout_name = keyboard.with_xkb_state(self, |mut xkb_context| {
+            xkb_context.cycle_next_layout();
+            let xkb = xkb_context.xkb().lock().unwrap();
+            let layout = xkb.active_layout();
+            xkb.layout_name(layout).to_string()
+        });
+
+        info!(layout = %layout_name, "keyboard layout changed");
+    }
+
     pub fn set_window_fullscreen(
         &mut self,
         window: &Window,
@@ -637,6 +709,20 @@ impl Yawc {
                 "window entered fullscreen"
             );
         } else {
+            if !self.windows.is_fullscreen(&surface)
+                && self.windows.restore_rect(&surface).is_none()
+            {
+                self.windows.set_fullscreen(&surface, false, None);
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                    state.fullscreen_output = None;
+                    state.size = None;
+                });
+                toplevel.send_pending_configure();
+                info!("ignored redundant unfullscreen request before window had a restore size");
+                return;
+            }
+
             let restore_rect = self
                 .windows
                 .restore_rect(&surface)

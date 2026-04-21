@@ -37,7 +37,7 @@ use smithay::{
         session::{libseat::LibSeatSession, Event as SessionEvent, Session},
         udev::{UdevBackend, UdevEvent},
     },
-    desktop::{space::SpaceRenderElements, Space, Window},
+    desktop::{space::SpaceRenderElements, utils::send_frames_surface_tree, Space, Window},
     input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
     reexports::{
         calloop::{
@@ -58,7 +58,7 @@ use smithay::{
 use tracing::{error, info, warn};
 
 use crate::{
-    render::{RenderState, YawcRenderElements},
+    render::{dnd_icon_elements, RenderState, YawcRenderElements},
     window::{WindowFrame, WindowStore},
     CalloopData,
 };
@@ -221,7 +221,7 @@ impl TtyRuntime {
             .compositor_cursor
             .map(|shape| CursorImageStatus::Named(shape.to_cursor_icon()))
             .unwrap_or_else(|| data.state.cursor_image.clone());
-        data.state.config.reload_if_changed();
+        data.state.reload_config_if_changed();
         let animation_config = data.state.config.animations();
         let frames = data
             .state
@@ -238,6 +238,7 @@ impl TtyRuntime {
             &mut self.cursor_theme,
             &cursor_image,
             pointer_location,
+            data.state.dnd_icon.as_ref(),
         );
 
         if self.reset_buffers_each_frame {
@@ -277,6 +278,15 @@ impl TtyRuntime {
                 |_, _| Some(output.clone()),
             );
         });
+        if let Some(icon) = data.state.dnd_icon.as_ref() {
+            send_frames_surface_tree(
+                icon,
+                &output,
+                data.state.start_time.elapsed(),
+                Some(Duration::ZERO),
+                |_, _| Some(output.clone()),
+            );
+        }
 
         data.state.space.refresh();
         data.state.prune_windows();
@@ -481,13 +491,12 @@ pub fn init(
         let runtime = Rc::clone(&runtime);
         event_loop.handle().insert_source(
             drm_notifier,
-            move |event, metadata, data| match event {
+            move |event, metadata, _data| match event {
                 DrmEvent::VBlank(_) => {
                     runtime.borrow_mut().handle_vblank();
                     if metadata.is_none() {
                         warn!("drm vblank arrived without metadata");
                     }
-                    data.state.send_pending_configures();
                 }
                 DrmEvent::Error(error) => {
                     error!(?error, "drm device notifier reported an error");
@@ -620,6 +629,7 @@ fn render_elements<'a>(
     cursor_theme: &mut TtyCursorTheme,
     cursor_image: &CursorImageStatus,
     pointer_location: Option<Point<f64, Logical>>,
+    dnd_icon: Option<&WlSurface>,
 ) -> Vec<TtyRenderElements<'a>> {
     let mut elements = Vec::new();
 
@@ -632,6 +642,13 @@ fn render_elements<'a>(
             location,
         );
     }
+
+    elements.extend(
+        dnd_icon_elements(renderer.as_mut(), dnd_icon, pointer_location)
+            .into_iter()
+            .map(TtyYawcElement::from)
+            .map(TtyRenderElements::from),
+    );
 
     match render_state.tty_scene_elements(
         renderer.as_mut(),

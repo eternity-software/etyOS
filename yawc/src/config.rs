@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use smithay::input::keyboard::XkbConfig;
 use smithay::input::keyboard::{keysyms, ModifiersState};
 use tracing::{info, warn};
 
@@ -14,6 +15,7 @@ pub enum HotkeyAction {
     SnapRight,
     ToggleFullscreen,
     ToggleMinimize,
+    SwitchKeyboardLayout,
 }
 
 #[derive(Clone, Debug)]
@@ -23,6 +25,7 @@ pub struct Config {
     last_checked: Instant,
     hotkeys: Hotkeys,
     animations: AnimationConfig,
+    keyboard: KeyboardConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +35,7 @@ pub struct Hotkeys {
     snap_right: Option<KeyBinding>,
     fullscreen: Option<KeyBinding>,
     minimize: Option<KeyBinding>,
+    layout_switch: Option<ModifierBinding>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -43,11 +47,28 @@ struct KeyBinding {
     key: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ModifierBinding {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    logo: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnimationConfig {
     pub enabled: bool,
     pub popup_ms: u64,
     pub geometry_ms: u64,
+    pub decoration_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyboardConfig {
+    pub layouts: String,
+    pub model: String,
+    pub variant: String,
+    pub options: Option<String>,
 }
 
 impl Default for AnimationConfig {
@@ -56,6 +77,18 @@ impl Default for AnimationConfig {
             enabled: true,
             popup_ms: 180,
             geometry_ms: 220,
+            decoration_ms: 140,
+        }
+    }
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self {
+            layouts: "us".to_string(),
+            model: String::new(),
+            variant: String::new(),
+            options: None,
         }
     }
 }
@@ -68,6 +101,19 @@ impl Default for Hotkeys {
             snap_right: parse_binding("Super+Right"),
             fullscreen: parse_binding("Ctrl+Alt+F"),
             minimize: parse_binding("Ctrl+Alt+M"),
+            layout_switch: parse_modifier_binding("Alt+Shift"),
+        }
+    }
+}
+
+impl KeyboardConfig {
+    pub fn xkb_config(&self) -> XkbConfig<'_> {
+        XkbConfig {
+            rules: "",
+            model: self.model.as_str(),
+            layout: self.layouts.as_str(),
+            variant: self.variant.as_str(),
+            options: self.options.clone(),
         }
     }
 }
@@ -92,14 +138,15 @@ impl Config {
             last_checked: Instant::now() - Duration::from_secs(1),
             hotkeys: Hotkeys::default(),
             animations: AnimationConfig::default(),
+            keyboard: KeyboardConfig::default(),
         };
         config.reload();
         config
     }
 
-    pub fn reload_if_changed(&mut self) {
+    pub fn reload_if_changed(&mut self) -> bool {
         if self.last_checked.elapsed() < Duration::from_millis(100) {
-            return;
+            return false;
         }
         self.last_checked = Instant::now();
 
@@ -107,19 +154,33 @@ impl Config {
             .and_then(|metadata| metadata.modified())
             .ok();
         if modified != self.modified {
-            self.reload();
+            return self.reload();
         }
+
+        false
     }
 
     pub fn hotkey_action(&self, key: u32, modifiers: ModifiersState) -> Option<HotkeyAction> {
         self.hotkeys.action_for(key, modifiers)
     }
 
+    pub fn modifier_hotkey_action(
+        &self,
+        key: u32,
+        modifiers: ModifiersState,
+    ) -> Option<HotkeyAction> {
+        self.hotkeys.modifier_action_for(key, modifiers)
+    }
+
     pub fn animations(&self) -> AnimationConfig {
         self.animations
     }
 
-    fn reload(&mut self) {
+    pub fn keyboard(&self) -> KeyboardConfig {
+        self.keyboard.clone()
+    }
+
+    fn reload(&mut self) -> bool {
         let contents = match fs::read_to_string(&self.path) {
             Ok(contents) => contents,
             Err(error) => {
@@ -128,17 +189,19 @@ impl Config {
                     path = %self.path.display(),
                     "failed to read config; keeping current config"
                 );
-                return;
+                return false;
             }
         };
 
         let parsed = parse_config(&contents);
         self.hotkeys = parsed.hotkeys;
         self.animations = parsed.animations;
+        self.keyboard = parsed.keyboard;
         self.modified = fs::metadata(&self.path)
             .and_then(|metadata| metadata.modified())
             .ok();
         info!(path = %self.path.display(), "loaded YAWC config");
+        true
     }
 }
 
@@ -146,6 +209,7 @@ impl Config {
 struct ParsedConfig {
     hotkeys: Hotkeys,
     animations: AnimationConfig,
+    keyboard: KeyboardConfig,
 }
 
 impl Hotkeys {
@@ -164,6 +228,12 @@ impl Hotkeys {
                 .map(|_| action)
         })
     }
+
+    fn modifier_action_for(&self, key: u32, modifiers: ModifiersState) -> Option<HotkeyAction> {
+        self.layout_switch
+            .filter(|binding| binding.matches(modifiers) && is_modifier_key(key))
+            .map(|_| HotkeyAction::SwitchKeyboardLayout)
+    }
 }
 
 impl KeyBinding {
@@ -176,9 +246,19 @@ impl KeyBinding {
     }
 }
 
+impl ModifierBinding {
+    fn matches(self, modifiers: ModifiersState) -> bool {
+        self.ctrl == modifiers.ctrl
+            && self.alt == modifiers.alt
+            && self.shift == modifiers.shift
+            && self.logo == modifiers.logo
+    }
+}
+
 fn parse_config(contents: &str) -> ParsedConfig {
     let mut hotkeys = Hotkeys::default();
     let mut animations = AnimationConfig::default();
+    let mut keyboard = KeyboardConfig::default();
 
     for (line_number, raw_line) in contents.lines().enumerate() {
         let line = raw_line
@@ -203,6 +283,9 @@ fn parse_config(contents: &str) -> ParsedConfig {
             "hotkeysnapright" | "snapright" => hotkeys.snap_right = parse_binding(value),
             "hotkeyfullscreen" | "fullscreen" => hotkeys.fullscreen = parse_binding(value),
             "hotkeyminimize" | "minimize" => hotkeys.minimize = parse_binding(value),
+            "hotkeylayoutswitch" | "layoutswitch" | "keyboardlayoutswitch" => {
+                hotkeys.layout_switch = parse_modifier_binding(value)
+            }
             "animations" | "animationsenabled" | "animationenabled" => {
                 if let Some(enabled) = parse_bool(value) {
                     animations.enabled = enabled;
@@ -244,13 +327,42 @@ fn parse_config(contents: &str) -> ParsedConfig {
                     );
                 }
             }
+            "decorationanimationms" | "decorationduration" | "decorationdurationms" => {
+                if let Some(duration) = parse_duration_ms(value) {
+                    animations.decoration_ms = duration;
+                } else {
+                    warn!(
+                        line = line_number + 1,
+                        value, "ignoring invalid decoration animation duration"
+                    );
+                }
+            }
+            "keyboardlayouts" | "xkblayout" | "layouts" => {
+                keyboard.layouts = value.trim().to_string();
+            }
+            "keyboardmodel" | "xkbmodel" => {
+                keyboard.model = value.trim().to_string();
+            }
+            "keyboardvariant" | "xkbvariant" => {
+                keyboard.variant = value.trim().to_string();
+            }
+            "keyboardoptions" | "xkboptions" => {
+                let value = value.trim();
+                keyboard.options = (!value.is_empty()).then(|| value.to_string());
+            }
             _ => warn!(line = line_number + 1, key, "ignoring unknown config key"),
         }
+    }
+
+    if keyboard.layouts.trim().is_empty() {
+        warn!("keyboard_layouts is empty; falling back to us");
+        keyboard.layouts = "us".to_string();
     }
 
     ParsedConfig {
         hotkeys,
         animations,
+        keyboard,
     }
 }
 
@@ -314,6 +426,63 @@ fn parse_binding(value: &str) -> Option<KeyBinding> {
     Some(binding)
 }
 
+fn parse_modifier_binding(value: &str) -> Option<ModifierBinding> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("disabled")
+        || value.eq_ignore_ascii_case("off")
+    {
+        return None;
+    }
+
+    let mut binding = ModifierBinding {
+        ctrl: false,
+        alt: false,
+        shift: false,
+        logo: false,
+    };
+
+    for part in value.split('+') {
+        let normalized = normalize_name(part);
+        match normalized.as_str() {
+            "ctrl" | "control" => binding.ctrl = true,
+            "alt" | "meta" => binding.alt = true,
+            "shift" => binding.shift = true,
+            "super" | "logo" | "mod4" | "win" | "windows" => binding.logo = true,
+            _ => {
+                warn!(binding = value, part, "ignoring invalid modifier hotkey");
+                return None;
+            }
+        }
+    }
+
+    if !(binding.ctrl || binding.alt || binding.shift || binding.logo) {
+        warn!(
+            binding = value,
+            "ignoring modifier hotkey without modifiers"
+        );
+        return None;
+    }
+
+    Some(binding)
+}
+
+fn is_modifier_key(key: u32) -> bool {
+    matches!(
+        key,
+        keysyms::KEY_Shift_L
+            | keysyms::KEY_Shift_R
+            | keysyms::KEY_Control_L
+            | keysyms::KEY_Control_R
+            | keysyms::KEY_Alt_L
+            | keysyms::KEY_Alt_R
+            | keysyms::KEY_Super_L
+            | keysyms::KEY_Super_R
+            | keysyms::KEY_Meta_L
+            | keysyms::KEY_Meta_R
+    )
+}
+
 fn key_name_to_raw(name: &str) -> Option<u32> {
     match name {
         "up" | "arrowup" => Some(keysyms::KEY_Up),
@@ -363,12 +532,22 @@ snap_left = Super+Left
 snap_right = Super+Right
 fullscreen = Ctrl+Alt+F
 minimize = Ctrl+Alt+M
+layout_switch = Alt+Shift
+
+# Keyboard:
+#   keyboard_layouts is an XKB comma-separated layout list, for example: us,ru
+#   keyboard_model, keyboard_variant, and keyboard_options are passed to xkbcommon.
+keyboard_layouts = us
+keyboard_model =
+keyboard_variant =
+keyboard_options =
 
 # Animations:
 #   animations = true/false
 #   animation_ms changes both popup and maximize/snap timing.
-#   popup_animation_ms and geometry_animation_ms can tune them separately.
+#   popup_animation_ms, geometry_animation_ms, and decoration_animation_ms can tune them separately.
 animations = true
 popup_animation_ms = 180
 geometry_animation_ms = 220
+decoration_animation_ms = 140
 "#;

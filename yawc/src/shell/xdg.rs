@@ -23,7 +23,7 @@ use smithay::{
         },
     },
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
@@ -49,7 +49,6 @@ impl XdgShellHandler for Yawc {
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
         }
-        self.send_pending_configures();
         info!(
             windows = self.windows.len(),
             x = location.x,
@@ -61,7 +60,14 @@ impl XdgShellHandler for Yawc {
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         self.unconstrain_popup(&surface);
-        let _ = self.popups.track_popup(PopupKind::Xdg(surface));
+        let _ = self.popups.track_popup(PopupKind::Xdg(surface.clone()));
+
+        if !surface.is_initial_configure_sent() {
+            match surface.send_configure() {
+                Ok(_) => self.flush_wayland_clients(),
+                Err(error) => warn!(?error, "initial popup configure failed"),
+            }
+        }
     }
 
     fn reposition_request(

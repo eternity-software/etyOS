@@ -12,7 +12,6 @@ use smithay::{
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Rectangle, SERIAL_COUNTER},
 };
-use tracing::debug;
 
 use crate::{
     config::HotkeyAction,
@@ -56,16 +55,6 @@ fn set_cursor_override(state: &mut Yawc, cursor: Option<CursorShape>) {
     state.pending_cursor = cursor.unwrap_or(CursorShape::Default);
 }
 
-fn decoration_action_name(action: DecorationAction) -> &'static str {
-    match action {
-        DecorationAction::Move => "move",
-        DecorationAction::Resize(_) => "resize",
-        DecorationAction::Close => "close",
-        DecorationAction::Minimize => "minimize",
-        DecorationAction::ToggleMaximize => "toggle_maximize",
-    }
-}
-
 impl Yawc {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
@@ -92,7 +81,16 @@ impl Yawc {
                             return FilterResult::Forward;
                         };
 
-                        state.config.reload_if_changed();
+                        state.reload_config_if_changed();
+                        if state
+                            .config
+                            .modifier_hotkey_action(key, *modifiers)
+                            .is_some_and(|action| action == HotkeyAction::SwitchKeyboardLayout)
+                        {
+                            state.cycle_keyboard_layout();
+                            return FilterResult::Forward;
+                        }
+
                         match state.config.hotkey_action(key, *modifiers) {
                             Some(HotkeyAction::ToggleMaximize) => {
                                 state.toggle_active_window_maximized();
@@ -114,6 +112,7 @@ impl Yawc {
                                 state.toggle_active_window_minimized();
                                 FilterResult::Intercept(())
                             }
+                            Some(HotkeyAction::SwitchKeyboardLayout) => FilterResult::Forward,
                             None => FilterResult::Forward,
                         }
                     },
@@ -202,18 +201,19 @@ impl Yawc {
                 let button = event.button_code();
                 let button_state = event.state();
 
+                if ButtonState::Released == button_state {
+                    self.windows.clear_decoration_pressed();
+                }
+
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
                     if let Some(hit) = self
                         .windows
                         .decoration_hit_at(&self.space, pointer.current_location())
                     {
-                        debug!(
-                            action = decoration_action_name(hit.action),
-                            "decoration pointer press"
-                        );
                         let surface = hit.window.toplevel().unwrap().wl_surface().clone();
                         self.space.raise_element(&hit.window, true);
                         self.windows.activate(&surface);
+                        self.windows.set_decoration_pressed(&surface, true);
                         keyboard.set_focus(self, Some(surface), serial);
                         self.send_pending_configures();
 
@@ -289,6 +289,7 @@ impl Yawc {
                         .element_under(pointer.current_location())
                         .map(|(window, location)| (window.clone(), location))
                     {
+                        self.windows.clear_decoration_pressed();
                         self.space.raise_element(&window, true);
 
                         let surface = window.toplevel().unwrap().wl_surface().clone();
@@ -296,6 +297,7 @@ impl Yawc {
                         keyboard.set_focus(self, Some(surface), serial);
                         self.send_pending_configures();
                     } else {
+                        self.windows.clear_decoration_pressed();
                         self.windows.clear_focus();
                         keyboard.set_focus(self, Option::<WlSurface>::None, serial);
                         self.send_pending_configures();

@@ -21,6 +21,9 @@ const BUTTON_STEP: i32 = BUTTON_SIZE + BUTTON_PADDING;
 #[cfg_attr(not(feature = "winit-backend"), allow(dead_code))]
 pub const FRAME_RADIUS: i32 = 18;
 const MAP_ANIMATION_START_SCALE: f64 = 0.94;
+const DECORATION_ACTIVE_OPACITY: f32 = 1.0;
+const DECORATION_INACTIVE_OPACITY: f32 = 0.64;
+const DECORATION_PRESSED_OPACITY: f32 = 0.82;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -63,6 +66,10 @@ pub struct TrackedWindow {
     pub map_animation_started: bool,
     pub geometry_animation: Option<GeometryAnimation>,
     pub initial_positioned: bool,
+    pub decoration_pressed: bool,
+    pub decoration_opacity_from: f32,
+    pub decoration_opacity_to: f32,
+    pub decoration_opacity_started_at: Instant,
 }
 
 #[derive(Clone)]
@@ -80,6 +87,7 @@ pub struct WindowFrame {
     pub title: String,
     pub app_id: Option<String>,
     pub animation: WindowAnimation,
+    pub decoration_opacity: f32,
 }
 
 #[derive(Clone)]
@@ -144,6 +152,7 @@ impl WindowStore {
         let index = self.windows.len() as i32;
         let location = Point::from((48 + 48 * index, 48 + 48 * index));
 
+        let now = Instant::now();
         self.windows.push(TrackedWindow {
             window,
             active: false,
@@ -160,10 +169,14 @@ impl WindowStore {
             minimized_rect: None,
             snap_side: None,
             snap_restore_rect: None,
-            mapped_at: Instant::now(),
+            mapped_at: now,
             map_animation_started: false,
             geometry_animation: None,
             initial_positioned: false,
+            decoration_pressed: false,
+            decoration_opacity_from: DECORATION_INACTIVE_OPACITY,
+            decoration_opacity_to: DECORATION_INACTIVE_OPACITY,
+            decoration_opacity_started_at: now,
         });
 
         location
@@ -181,15 +194,29 @@ impl WindowStore {
                 .map(|toplevel| toplevel.wl_surface() == surface)
                 .unwrap_or(false);
 
-            tracked.active = is_active;
-            tracked.window.set_activated(is_active);
+            if tracked.active != is_active {
+                tracked.active = is_active;
+                tracked.decoration_pressed &= is_active;
+                set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+                tracked.window.set_activated(is_active);
+            } else if !is_active && tracked.decoration_pressed {
+                tracked.decoration_pressed = false;
+                set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+            }
         }
     }
 
     pub fn clear_focus(&mut self) {
         for tracked in &mut self.windows {
-            tracked.active = false;
-            tracked.window.set_activated(false);
+            if tracked.active {
+                tracked.active = false;
+                tracked.decoration_pressed = false;
+                set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+                tracked.window.set_activated(false);
+            } else if tracked.decoration_pressed {
+                tracked.decoration_pressed = false;
+                set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+            }
         }
     }
 
@@ -291,6 +318,8 @@ impl WindowStore {
             tracked.minimized = minimized;
             if minimized {
                 tracked.active = false;
+                tracked.decoration_pressed = false;
+                set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
                 tracked.window.set_activated(false);
             }
             if let Some(restore_rect) = restore_rect {
@@ -305,6 +334,22 @@ impl WindowStore {
     pub fn set_resizing(&mut self, surface: &WlSurface, resizing: bool) {
         if let Some(tracked) = self.find_mut(surface) {
             tracked.resizing = resizing;
+        }
+    }
+
+    pub fn set_decoration_pressed(&mut self, surface: &WlSurface, pressed: bool) {
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.decoration_pressed = pressed && tracked.active;
+            set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+        }
+    }
+
+    pub fn clear_decoration_pressed(&mut self) {
+        for tracked in &mut self.windows {
+            if tracked.decoration_pressed {
+                tracked.decoration_pressed = false;
+                set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+            }
         }
     }
 
@@ -452,6 +497,7 @@ impl WindowStore {
                 title: tracked.title.clone(),
                 app_id: tracked.app_id.clone(),
                 animation: animation_for_tracked(tracked, config),
+                decoration_opacity: decoration_opacity_for_tracked(tracked, config),
             });
         }
 
@@ -557,6 +603,7 @@ impl WindowStore {
                 title: tracked.title.clone(),
                 app_id: tracked.app_id.clone(),
                 animation: WindowAnimation::default(),
+                decoration_opacity: decoration_opacity_target(tracked),
             };
 
             if !contains(frame.frame, position) {
@@ -664,6 +711,51 @@ fn animation_for_elapsed(elapsed: Duration, config: AnimationConfig) -> WindowAn
     }
 }
 
+fn decoration_opacity_target(tracked: &TrackedWindow) -> f32 {
+    if tracked.decoration_pressed {
+        DECORATION_PRESSED_OPACITY
+    } else if tracked.active {
+        DECORATION_ACTIVE_OPACITY
+    } else {
+        DECORATION_INACTIVE_OPACITY
+    }
+}
+
+fn set_decoration_opacity_target(tracked: &mut TrackedWindow, target: f32) {
+    if (tracked.decoration_opacity_to - target).abs() < f32::EPSILON {
+        return;
+    }
+
+    tracked.decoration_opacity_from =
+        current_decoration_opacity(tracked, Duration::from_millis(140));
+    tracked.decoration_opacity_to = target;
+    tracked.decoration_opacity_started_at = Instant::now();
+}
+
+fn decoration_opacity_for_tracked(tracked: &TrackedWindow, config: AnimationConfig) -> f32 {
+    if !config.enabled || config.decoration_ms == 0 {
+        return tracked.decoration_opacity_to;
+    }
+
+    current_decoration_opacity(tracked, Duration::from_millis(config.decoration_ms))
+}
+
+fn current_decoration_opacity(tracked: &TrackedWindow, duration: Duration) -> f32 {
+    if duration.is_zero() {
+        return tracked.decoration_opacity_to;
+    }
+
+    let t = (tracked
+        .decoration_opacity_started_at
+        .elapsed()
+        .as_secs_f64()
+        / duration.as_secs_f64())
+    .clamp(0.0, 1.0);
+    let eased = ease_out_cubic(t) as f32;
+    tracked.decoration_opacity_from
+        + (tracked.decoration_opacity_to - tracked.decoration_opacity_from) * eased
+}
+
 fn ease_out_cubic(t: f64) -> f64 {
     1.0 - (1.0 - t).powi(3)
 }
@@ -769,7 +861,8 @@ fn server_content_geometry(
     window: &Window,
 ) -> Option<Rectangle<i32, Logical>> {
     let location = space.element_location(window)?;
-    Some(Rectangle::new(location, window.geometry().size))
+    let size = window.geometry().size;
+    (size.w > 0 && size.h > 0).then_some(Rectangle::new(location, size))
 }
 
 fn window_rect(space: &Space<Window>, window: &Window) -> Option<Rectangle<i32, Logical>> {

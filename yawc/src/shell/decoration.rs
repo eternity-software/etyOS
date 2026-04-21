@@ -1,7 +1,10 @@
 use smithay::{
     delegate_xdg_decoration,
     reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
-    wayland::shell::xdg::{decoration::XdgDecorationHandler, ToplevelSurface},
+    wayland::{
+        compositor::with_states,
+        shell::xdg::{decoration::XdgDecorationHandler, ToplevelSurface, XdgToplevelSurfaceData},
+    },
 };
 use tracing::info;
 
@@ -14,7 +17,12 @@ impl XdgDecorationHandler for Yawc {
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(Mode::ServerSide);
         });
-        toplevel.send_configure();
+        if initial_configure_sent(&toplevel) {
+            let configure_serial = toplevel.send_pending_configure();
+            if configure_serial.is_some() {
+                self.flush_wayland_clients();
+            }
+        }
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: Mode) {
@@ -25,7 +33,13 @@ impl XdgDecorationHandler for Yawc {
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(mode);
         });
-        toplevel.send_pending_configure();
+        if !initial_configure_sent(&toplevel) {
+            return;
+        }
+        let configure_serial = toplevel.send_pending_configure();
+        if configure_serial.is_some() {
+            self.flush_wayland_clients();
+        }
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
@@ -34,8 +48,24 @@ impl XdgDecorationHandler for Yawc {
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(Mode::ServerSide);
         });
-        toplevel.send_pending_configure();
+        if !initial_configure_sent(&toplevel) {
+            return;
+        }
+        let configure_serial = toplevel.send_pending_configure();
+        if configure_serial.is_some() {
+            self.flush_wayland_clients();
+        }
     }
 }
 
 delegate_xdg_decoration!(Yawc);
+
+fn initial_configure_sent(toplevel: &ToplevelSurface) -> bool {
+    with_states(toplevel.wl_surface(), |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .map(|data| data.lock().unwrap().initial_configure_sent)
+            .unwrap_or(false)
+    })
+}

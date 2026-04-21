@@ -16,7 +16,7 @@ use smithay::reexports::{
     calloop::EventLoop,
     wayland_server::{Display, DisplayHandle},
 };
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::state::Yawc;
@@ -51,12 +51,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         display_handle,
     };
 
+    ensure_session_environment_defaults();
+
     match cli.backend {
         #[cfg(feature = "winit-backend")]
         BackendKind::Winit => backend::winit::init(&mut event_loop, &mut data)?,
         #[cfg(feature = "tty-udev")]
         BackendKind::TtyUdev => backend::tty_udev::init(&mut event_loop, &mut data)?,
     }
+
+    update_activation_environment();
 
     let startup_command = cli.command.or_else(|| default_startup_command(cli.backend));
 
@@ -66,6 +70,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     event_loop.run(None, &mut data, |_| {})?;
     Ok(())
+}
+
+fn ensure_session_environment_defaults() {
+    set_env_default("XDG_SESSION_TYPE", "wayland");
+    set_env_default("XDG_CURRENT_DESKTOP", "etyDE:YAWC");
+    set_env_default("XDG_SESSION_DESKTOP", "yawc");
+    set_env_default("DESKTOP_SESSION", "yawc");
+    set_env_default("GDK_BACKEND", "wayland");
+    set_env_default("QT_QPA_PLATFORM", "wayland");
+    set_env_default("SDL_VIDEODRIVER", "wayland");
+    set_env_default("CLUTTER_BACKEND", "wayland");
+    set_env_default("MOZ_ENABLE_WAYLAND", "1");
+}
+
+fn set_env_default(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, value);
+    }
+}
+
+fn update_activation_environment() {
+    const ENV_NAMES: &[&str] = &[
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "DESKTOP_SESSION",
+        "GDK_BACKEND",
+        "QT_QPA_PLATFORM",
+        "SDL_VIDEODRIVER",
+        "CLUTTER_BACKEND",
+        "MOZ_ENABLE_WAYLAND",
+    ];
+
+    let active_names: Vec<&str> = ENV_NAMES
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect();
+    if active_names.is_empty() {
+        return;
+    }
+
+    let mut dbus = Command::new("dbus-update-activation-environment");
+    dbus.arg("--systemd");
+    dbus.args(&active_names);
+    run_activation_command(dbus, "dbus-update-activation-environment");
+
+    let mut systemctl = Command::new("systemctl");
+    systemctl.arg("--user").arg("import-environment");
+    systemctl.args(&active_names);
+    run_activation_command(systemctl, "systemctl --user import-environment");
+}
+
+fn run_activation_command(mut command: Command, label: &str) {
+    match command.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            warn!(
+                command = label,
+                code = status.code(),
+                "activation environment update command failed"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(
+                ?error,
+                command = label,
+                "failed to run activation environment update command"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
