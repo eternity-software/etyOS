@@ -1,4 +1,4 @@
-use std::{ffi::OsString, sync::Arc, time::Instant};
+use std::{ffi::OsString, process::Command, sync::Arc, time::Instant};
 
 use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
@@ -13,7 +13,7 @@ use smithay::{
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::{wl_output::WlOutput, wl_surface::WlSurface},
-            Display, DisplayHandle,
+            Display, DisplayHandle, Resource,
         },
     },
     utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
@@ -35,6 +35,13 @@ use crate::{
     window::{SnapSide, WindowStore},
     CalloopData,
 };
+
+#[derive(Clone)]
+pub struct TitlebarClick {
+    pub surface: WlSurface,
+    pub time_msec: u32,
+    pub location: Point<f64, Logical>,
+}
 
 pub struct Yawc {
     pub start_time: Instant,
@@ -58,6 +65,8 @@ pub struct Yawc {
     pub cursor_image: CursorImageStatus,
     pub dnd_icon: Option<WlSurface>,
     pub config: Config,
+    pub titlebar_right_press: Option<WlSurface>,
+    pub last_titlebar_click: Option<TitlebarClick>,
     applied_keyboard_config: Option<KeyboardConfig>,
 }
 
@@ -107,6 +116,8 @@ impl Yawc {
             cursor_image: CursorImageStatus::Named(CursorIcon::Default),
             dnd_icon: None,
             config,
+            titlebar_right_press: None,
+            last_titlebar_click: None,
             applied_keyboard_config: None,
         };
         state.apply_keyboard_config();
@@ -297,7 +308,75 @@ impl Yawc {
     }
 
     pub fn prune_windows(&mut self) {
-        self.windows.prune_dead();
+        self.windows.prune_dead(self.config.animations());
+    }
+
+    pub fn finish_close_animations(&mut self) {
+        let windows = self.windows.close_requests_ready(self.config.animations());
+        for window in windows {
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.send_close();
+            }
+        }
+    }
+
+    pub fn close_window(&mut self, window: &Window) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+
+        if self
+            .windows
+            .request_close(toplevel.wl_surface(), self.config.animations())
+        {
+            toplevel.send_close();
+        }
+    }
+
+    pub fn close_active_window(&mut self) {
+        if let Some(window) = self.windows.active_window() {
+            self.close_window(&window);
+        }
+    }
+
+    pub fn kill_active_window(&mut self) {
+        let Some(window) = self.windows.active_window() else {
+            return;
+        };
+        let Some(surface) = window.toplevel().map(|toplevel| toplevel.wl_surface()) else {
+            return;
+        };
+
+        let Ok(client) = self.display_handle.get_client(surface.id()) else {
+            warn!("failed to resolve active window client for kill hotkey");
+            return;
+        };
+        let Ok(credentials) = client.get_credentials(&self.display_handle) else {
+            warn!("failed to read active window client credentials for kill hotkey");
+            return;
+        };
+
+        let pid = credentials.pid;
+        if pid <= 1 {
+            warn!(pid, "refusing to kill active window with invalid pid");
+            return;
+        }
+
+        match Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status()
+        {
+            Ok(status) if status.success() => {
+                info!(pid, "killed active window process");
+            }
+            Ok(status) => {
+                warn!(pid, code = status.code(), "kill command failed");
+            }
+            Err(error) => {
+                warn!(?error, pid, "failed to execute kill command");
+            }
+        }
     }
 
     pub fn toggle_window_fullscreen(&mut self, window: &Window) {

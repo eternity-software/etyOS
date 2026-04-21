@@ -222,11 +222,13 @@ impl TtyRuntime {
             .map(|shape| CursorImageStatus::Named(shape.to_cursor_icon()))
             .unwrap_or_else(|| data.state.cursor_image.clone());
         data.state.reload_config_if_changed();
+        data.state.finish_close_animations();
         let animation_config = data.state.config.animations();
+        let controls_mode = data.state.config.window_controls();
         let frames = data
             .state
             .windows
-            .frames(&data.state.space, animation_config);
+            .frames(&data.state.space, animation_config, controls_mode);
         let elements = render_elements(
             &mut renderer,
             &mut self.render_state,

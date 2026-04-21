@@ -42,6 +42,7 @@ use tracing::{info, warn};
 #[cfg(feature = "tty-udev")]
 use crate::window::WindowStore;
 use crate::{
+    config::WindowControlsMode,
     state::Yawc,
     window::{WindowAnimation, WindowFrame, BUTTON_PADDING, FRAME_RADIUS, TITLEBAR_HEIGHT},
 };
@@ -439,14 +440,18 @@ impl RenderState {
         display_handle: &mut DisplayHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
         state.reload_config_if_changed();
+        state.finish_close_animations();
         let animation_config = state.config.animations();
+        let controls_mode = state.config.window_controls();
         let pointer_location = state
             .seat
             .get_pointer()
             .map(|pointer| pointer.current_location());
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
-        let all_frames = state.windows.frames(&state.space, animation_config);
+        let all_frames = state
+            .windows
+            .frames(&state.space, animation_config, controls_mode);
         let mut frame_by_surface = HashMap::new();
         for frame in &all_frames {
             if let Some(toplevel) = frame.window.toplevel() {
@@ -1297,6 +1302,8 @@ struct DecorationCacheKey {
     frame_w: i32,
     active: bool,
     maximized: bool,
+    controls_mode: WindowControlsMode,
+    close_tint: u8,
     title: String,
     app_id: Option<String>,
 }
@@ -1307,6 +1314,8 @@ impl DecorationCacheKey {
             frame_w: frame.frame.size.w,
             active: frame.active,
             maximized: frame.maximized,
+            controls_mode: frame.controls_mode,
+            close_tint: (frame.close_tint.clamp(0.0, 1.0) * 255.0).round() as u8,
             title: frame.title.clone(),
             app_id: frame.app_id.clone(),
         }
@@ -1553,7 +1562,7 @@ fn overlay_buffer(
     let height = frame.frame.size.h.max(1) as u32;
     let mut image = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 0]));
 
-    draw_titlebar_fill(&mut image);
+    draw_titlebar_fill(&mut image, frame.close_tint);
 
     let title = if frame.title.trim().is_empty() {
         "Untitled"
@@ -1562,9 +1571,14 @@ fn overlay_buffer(
     };
 
     if let Some(font) = title_font {
-        let minimize_left = frame.minimize_button.loc.x - frame.frame.loc.x;
         let content_left = TITLE_PADDING;
-        let content_right = (minimize_left - BUTTON_PADDING).max(content_left);
+        let content_right = match frame.controls_mode {
+            WindowControlsMode::Buttons => {
+                let minimize_left = frame.minimize_button.loc.x - frame.frame.loc.x;
+                (minimize_left - BUTTON_PADDING).max(content_left)
+            }
+            WindowControlsMode::Gestures => (frame.frame.size.w - TITLE_PADDING).max(content_left),
+        };
         let text_width = measure_text_width(font, title, TITLE_FONT_SIZE);
         let icon_width = app_icon.map(|_| ICON_SIZE as i32).unwrap_or(0);
         let group_width = text_width
@@ -1600,44 +1614,46 @@ fn overlay_buffer(
         );
     }
 
-    let minimize_button = Rectangle::new(
-        (
-            frame.minimize_button.loc.x - frame.frame.loc.x,
-            frame.minimize_button.loc.y - frame.frame.loc.y,
-        )
-            .into(),
-        frame.minimize_button.size,
-    );
-    draw_minimize_button(&mut image, minimize_button, CLOSE_COLOR);
+    if frame.controls_mode == WindowControlsMode::Buttons {
+        let minimize_button = Rectangle::new(
+            (
+                frame.minimize_button.loc.x - frame.frame.loc.x,
+                frame.minimize_button.loc.y - frame.frame.loc.y,
+            )
+                .into(),
+            frame.minimize_button.size,
+        );
+        draw_minimize_button(&mut image, minimize_button, CLOSE_COLOR);
 
-    let maximize_button = Rectangle::new(
-        (
-            frame.maximize_button.loc.x - frame.frame.loc.x,
-            frame.maximize_button.loc.y - frame.frame.loc.y,
-        )
-            .into(),
-        frame.maximize_button.size,
-    );
-    draw_maximize_button(&mut image, maximize_button, CLOSE_COLOR, frame.maximized);
+        let maximize_button = Rectangle::new(
+            (
+                frame.maximize_button.loc.x - frame.frame.loc.x,
+                frame.maximize_button.loc.y - frame.frame.loc.y,
+            )
+                .into(),
+            frame.maximize_button.size,
+        );
+        draw_maximize_button(&mut image, maximize_button, CLOSE_COLOR, frame.maximized);
 
-    let close_button = Rectangle::new(
-        (
-            frame.close_button.loc.x - frame.frame.loc.x,
-            frame.close_button.loc.y - frame.frame.loc.y,
-        )
-            .into(),
-        frame.close_button.size,
-    );
-    draw_close_button(&mut image, close_button, CLOSE_COLOR);
+        let close_button = Rectangle::new(
+            (
+                frame.close_button.loc.x - frame.frame.loc.x,
+                frame.close_button.loc.y - frame.frame.loc.y,
+            )
+                .into(),
+            frame.close_button.size,
+        );
+        draw_close_button(&mut image, close_button, CLOSE_COLOR);
+    }
 
     rgba_to_buffer(&image)
 }
 
 // Draw the rounded-top translucent fill that sits above the blur backdrop.
-fn draw_titlebar_fill(image: &mut RgbaImage) {
+fn draw_titlebar_fill(image: &mut RgbaImage, close_tint: f32) {
     let width = image.width() as i32;
     let height = image.height() as i32;
-    let fill = Rgba(FRAME_FILL_RGBA);
+    let fill = titlebar_fill_color(close_tint);
 
     for y in 0..TITLEBAR_HEIGHT.min(height) {
         for x in 0..width {
@@ -1646,6 +1662,19 @@ fn draw_titlebar_fill(image: &mut RgbaImage) {
             }
         }
     }
+}
+
+fn titlebar_fill_color(close_tint: f32) -> Rgba<u8> {
+    let red = [182, 86, 92, 158];
+    let tint = close_tint.clamp(0.0, 1.0);
+    let mut color = [0_u8; 4];
+    for (index, value) in color.iter_mut().enumerate() {
+        *value = (FRAME_FILL_RGBA[index] as f32
+            + (red[index] as f32 - FRAME_FILL_RGBA[index] as f32) * tint)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    Rgba(color)
 }
 
 fn draw_text(

@@ -8,7 +8,10 @@ use smithay::{
     wayland::{compositor, shell::xdg::SurfaceCachedState},
 };
 
-use crate::{config::AnimationConfig, shell::xdg::WindowMetadata};
+use crate::{
+    config::{AnimationConfig, WindowControlsMode},
+    shell::xdg::WindowMetadata,
+};
 
 pub const TITLEBAR_HEIGHT: i32 = 40;
 pub const RESIZE_HITBOX: i32 = 6;
@@ -24,6 +27,9 @@ const MAP_ANIMATION_START_SCALE: f64 = 0.94;
 const DECORATION_ACTIVE_OPACITY: f32 = 1.0;
 const DECORATION_INACTIVE_OPACITY: f32 = 0.64;
 const DECORATION_PRESSED_OPACITY: f32 = 0.82;
+const TITLEBAR_CLOSE_TINT_MS: u64 = 180;
+const TITLEBAR_CLOSE_TINT_TARGET: f32 = 0.24;
+const CLOSE_RESTORE_GRACE_MS: u64 = 180;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,6 +76,15 @@ pub struct TrackedWindow {
     pub decoration_opacity_from: f32,
     pub decoration_opacity_to: f32,
     pub decoration_opacity_started_at: Instant,
+    pub titlebar_close_pressed: bool,
+    pub titlebar_close_tint_from: f32,
+    pub titlebar_close_tint_to: f32,
+    pub titlebar_close_tint_started_at: Instant,
+    pub close_animating: bool,
+    pub close_sent: bool,
+    pub close_restoring: bool,
+    pub close_started_at: Instant,
+    pub close_restore_started_at: Instant,
 }
 
 #[derive(Clone)]
@@ -88,6 +103,8 @@ pub struct WindowFrame {
     pub app_id: Option<String>,
     pub animation: WindowAnimation,
     pub decoration_opacity: f32,
+    pub close_tint: f32,
+    pub controls_mode: WindowControlsMode,
 }
 
 #[derive(Clone)]
@@ -98,6 +115,7 @@ pub struct DecorationHit {
 
 #[derive(Clone, Copy)]
 pub enum DecorationAction {
+    Titlebar,
     Move,
     Resize(ResizeEdge),
     Minimize,
@@ -177,6 +195,15 @@ impl WindowStore {
             decoration_opacity_from: DECORATION_INACTIVE_OPACITY,
             decoration_opacity_to: DECORATION_INACTIVE_OPACITY,
             decoration_opacity_started_at: now,
+            titlebar_close_pressed: false,
+            titlebar_close_tint_from: 0.0,
+            titlebar_close_tint_to: 0.0,
+            titlebar_close_tint_started_at: now,
+            close_animating: false,
+            close_sent: false,
+            close_restoring: false,
+            close_started_at: now,
+            close_restore_started_at: now,
         });
 
         location
@@ -197,11 +224,16 @@ impl WindowStore {
             if tracked.active != is_active {
                 tracked.active = is_active;
                 tracked.decoration_pressed &= is_active;
+                tracked.titlebar_close_pressed &= is_active;
                 set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+                set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
                 tracked.window.set_activated(is_active);
             } else if !is_active && tracked.decoration_pressed {
                 tracked.decoration_pressed = false;
                 set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+            } else if !is_active && tracked.titlebar_close_pressed {
+                tracked.titlebar_close_pressed = false;
+                set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
             }
         }
     }
@@ -211,11 +243,16 @@ impl WindowStore {
             if tracked.active {
                 tracked.active = false;
                 tracked.decoration_pressed = false;
+                tracked.titlebar_close_pressed = false;
                 set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+                set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
                 tracked.window.set_activated(false);
             } else if tracked.decoration_pressed {
                 tracked.decoration_pressed = false;
                 set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+            } else if tracked.titlebar_close_pressed {
+                tracked.titlebar_close_pressed = false;
+                set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
             }
         }
     }
@@ -235,8 +272,25 @@ impl WindowStore {
             .map(|tracked| tracked.window.clone())
     }
 
-    pub fn prune_dead(&mut self) {
+    pub fn prune_dead(&mut self, config: AnimationConfig) {
+        let close_duration = Duration::from_millis(config.close_ms);
         self.windows.retain(|tracked| {
+            if tracked.close_animating {
+                if tracked
+                    .window
+                    .toplevel()
+                    .map(|toplevel| toplevel.wl_surface().is_alive())
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+
+                return config.enabled
+                    && config.close_ms > 0
+                    && tracked.close_started_at.elapsed() < close_duration
+                    && !tracked.close_sent;
+            }
+
             tracked
                 .window
                 .toplevel()
@@ -255,6 +309,71 @@ impl WindowStore {
     pub fn remove(&mut self, surface: &WlSurface) {
         self.windows
             .retain(|tracked| !same_surface(tracked, surface));
+    }
+
+    pub fn request_close(&mut self, surface: &WlSurface, config: AnimationConfig) -> bool {
+        if !config.enabled || config.close_ms == 0 {
+            return true;
+        }
+
+        let now = Instant::now();
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.close_animating = true;
+            tracked.close_sent = false;
+            tracked.close_restoring = false;
+            tracked.active = false;
+            tracked.decoration_pressed = false;
+            tracked.titlebar_close_pressed = false;
+            tracked.close_started_at = now;
+            set_decoration_opacity_target(tracked, DECORATION_INACTIVE_OPACITY);
+            return false;
+        }
+
+        true
+    }
+
+    pub fn close_requests_ready(&mut self, config: AnimationConfig) -> Vec<Window> {
+        if !config.enabled || config.close_ms == 0 {
+            for tracked in &mut self.windows {
+                if tracked.close_animating || tracked.close_restoring {
+                    tracked.close_animating = false;
+                    tracked.close_sent = false;
+                    tracked.close_restoring = false;
+                    set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+                    set_titlebar_close_tint_target(tracked, 0.0);
+                }
+            }
+            return Vec::new();
+        }
+
+        let close_duration = Duration::from_millis(config.close_ms);
+        let restore_duration = close_duration + Duration::from_millis(CLOSE_RESTORE_GRACE_MS);
+        let mut windows = Vec::new();
+        for tracked in &mut self.windows {
+            if tracked.close_animating
+                && !tracked.close_sent
+                && tracked.close_started_at.elapsed() >= close_duration
+            {
+                tracked.close_sent = true;
+                set_titlebar_close_tint_target(tracked, 0.0);
+                windows.push(tracked.window.clone());
+            } else if tracked.close_animating
+                && tracked.close_sent
+                && tracked.close_started_at.elapsed() >= restore_duration
+            {
+                tracked.close_animating = false;
+                tracked.close_sent = false;
+                tracked.close_restoring = true;
+                tracked.close_restore_started_at = Instant::now();
+                set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+                set_titlebar_close_tint_target(tracked, 0.0);
+            } else if tracked.close_restoring
+                && tracked.close_restore_started_at.elapsed() >= close_duration
+            {
+                tracked.close_restoring = false;
+            }
+        }
+        windows
     }
 
     pub fn set_server_decoration(&mut self, surface: &WlSurface, enabled: bool) {
@@ -349,6 +468,22 @@ impl WindowStore {
             if tracked.decoration_pressed {
                 tracked.decoration_pressed = false;
                 set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+            }
+        }
+    }
+
+    pub fn set_titlebar_close_pressed(&mut self, surface: &WlSurface, pressed: bool) {
+        if let Some(tracked) = self.find_mut(surface) {
+            tracked.titlebar_close_pressed = pressed && tracked.active;
+            set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
+        }
+    }
+
+    pub fn clear_titlebar_close_pressed(&mut self) {
+        for tracked in &mut self.windows {
+            if tracked.titlebar_close_pressed {
+                tracked.titlebar_close_pressed = false;
+                set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
             }
         }
     }
@@ -461,7 +596,12 @@ impl WindowStore {
         }
     }
 
-    pub fn frames(&self, space: &Space<Window>, config: AnimationConfig) -> Vec<WindowFrame> {
+    pub fn frames(
+        &self,
+        space: &Space<Window>,
+        config: AnimationConfig,
+        controls_mode: WindowControlsMode,
+    ) -> Vec<WindowFrame> {
         let mut frames = Vec::new();
 
         for window in space.elements() {
@@ -498,6 +638,8 @@ impl WindowStore {
                 app_id: tracked.app_id.clone(),
                 animation: animation_for_tracked(tracked, config),
                 decoration_opacity: decoration_opacity_for_tracked(tracked, config),
+                close_tint: titlebar_close_tint_for_tracked(tracked),
+                controls_mode,
             });
         }
 
@@ -508,6 +650,7 @@ impl WindowStore {
         &self,
         space: &Space<Window>,
         position: Point<f64, Logical>,
+        controls_mode: WindowControlsMode,
     ) -> Option<DecorationHit> {
         for window in space.elements().rev() {
             let Some(surface) = window
@@ -604,37 +747,41 @@ impl WindowStore {
                 app_id: tracked.app_id.clone(),
                 animation: WindowAnimation::default(),
                 decoration_opacity: decoration_opacity_target(tracked),
+                close_tint: titlebar_close_tint_target(tracked),
+                controls_mode,
             };
 
             if !contains(frame.frame, position) {
                 continue;
             }
 
-            if contains(frame.close_button, position) {
-                return Some(DecorationHit {
-                    window: tracked.window.clone(),
-                    action: DecorationAction::Close,
-                });
+            if controls_mode == WindowControlsMode::Buttons {
+                if contains(frame.close_button, position) {
+                    return Some(DecorationHit {
+                        window: tracked.window.clone(),
+                        action: DecorationAction::Close,
+                    });
+                }
+
+                if contains(frame.maximize_button, position) {
+                    return Some(DecorationHit {
+                        window: tracked.window.clone(),
+                        action: DecorationAction::ToggleMaximize,
+                    });
+                }
+
+                if contains(frame.minimize_button, position) {
+                    return Some(DecorationHit {
+                        window: tracked.window.clone(),
+                        action: DecorationAction::Minimize,
+                    });
+                }
             }
 
-            if contains(frame.maximize_button, position) {
+            if contains(frame.header, position) {
                 return Some(DecorationHit {
                     window: tracked.window.clone(),
-                    action: DecorationAction::ToggleMaximize,
-                });
-            }
-
-            if contains(frame.minimize_button, position) {
-                return Some(DecorationHit {
-                    window: tracked.window.clone(),
-                    action: DecorationAction::Minimize,
-                });
-            }
-
-            if !tracked.maximized && contains(frame.header, position) {
-                return Some(DecorationHit {
-                    window: tracked.window.clone(),
-                    action: DecorationAction::Move,
+                    action: DecorationAction::Titlebar,
                 });
             }
 
@@ -672,6 +819,16 @@ fn animation_for_tracked(tracked: &TrackedWindow, config: AnimationConfig) -> Wi
         return WindowAnimation::default();
     }
 
+    if tracked.close_animating {
+        return close_animation_for_elapsed(tracked.close_started_at.elapsed(), config);
+    }
+    if tracked.close_restoring {
+        return close_restore_animation_for_elapsed(
+            tracked.close_restore_started_at.elapsed(),
+            config,
+        );
+    }
+
     let mut animation = if tracked.map_animation_started {
         animation_for_elapsed(tracked.mapped_at.elapsed(), config)
     } else {
@@ -693,6 +850,39 @@ fn animation_for_tracked(tracked: &TrackedWindow, config: AnimationConfig) -> Wi
     });
 
     animation
+}
+
+fn close_animation_for_elapsed(elapsed: Duration, config: AnimationConfig) -> WindowAnimation {
+    if config.close_ms == 0 {
+        return WindowAnimation::default();
+    }
+
+    let duration = Duration::from_millis(config.close_ms);
+    let t = elapsed.as_secs_f64() / duration.as_secs_f64();
+    let eased = ease_out_cubic(t.clamp(0.0, 1.0));
+    WindowAnimation {
+        alpha: (1.0 - eased) as f32,
+        scale: 1.0 - 0.04 * eased,
+        geometry: None,
+    }
+}
+
+fn close_restore_animation_for_elapsed(
+    elapsed: Duration,
+    config: AnimationConfig,
+) -> WindowAnimation {
+    if config.close_ms == 0 {
+        return WindowAnimation::default();
+    }
+
+    let duration = Duration::from_millis(config.close_ms);
+    let t = elapsed.as_secs_f64() / duration.as_secs_f64();
+    let eased = ease_out_cubic(t.clamp(0.0, 1.0));
+    WindowAnimation {
+        alpha: eased as f32,
+        scale: 0.96 + 0.04 * eased,
+        geometry: None,
+    }
 }
 
 fn animation_for_elapsed(elapsed: Duration, config: AnimationConfig) -> WindowAnimation {
@@ -738,6 +928,36 @@ fn decoration_opacity_for_tracked(tracked: &TrackedWindow, config: AnimationConf
     }
 
     current_decoration_opacity(tracked, Duration::from_millis(config.decoration_ms))
+}
+
+fn titlebar_close_tint_target(tracked: &TrackedWindow) -> f32 {
+    if tracked.titlebar_close_pressed {
+        TITLEBAR_CLOSE_TINT_TARGET
+    } else {
+        0.0
+    }
+}
+
+fn set_titlebar_close_tint_target(tracked: &mut TrackedWindow, target: f32) {
+    if (tracked.titlebar_close_tint_to - target).abs() < f32::EPSILON {
+        return;
+    }
+
+    tracked.titlebar_close_tint_from = titlebar_close_tint_for_tracked(tracked);
+    tracked.titlebar_close_tint_to = target;
+    tracked.titlebar_close_tint_started_at = Instant::now();
+}
+
+fn titlebar_close_tint_for_tracked(tracked: &TrackedWindow) -> f32 {
+    let duration = Duration::from_millis(TITLEBAR_CLOSE_TINT_MS);
+    let t = tracked
+        .titlebar_close_tint_started_at
+        .elapsed()
+        .as_secs_f64()
+        / duration.as_secs_f64();
+    let progress = ease_out_cubic(t.clamp(0.0, 1.0)) as f32;
+    tracked.titlebar_close_tint_from
+        + (tracked.titlebar_close_tint_to - tracked.titlebar_close_tint_from) * progress
 }
 
 fn current_decoration_opacity(tracked: &TrackedWindow, duration: Duration) -> f32 {

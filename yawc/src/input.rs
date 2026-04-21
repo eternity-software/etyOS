@@ -14,12 +14,17 @@ use smithay::{
 };
 
 use crate::{
-    config::HotkeyAction,
+    config::{HotkeyAction, WindowControlsMode},
     cursor::CursorShape,
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
-    state::Yawc,
+    state::{TitlebarClick, Yawc},
     window::{DecorationAction, ResizeEdge, SnapSide},
 };
+
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const TITLEBAR_DOUBLE_CLICK_MS: u32 = 450;
+const TITLEBAR_DOUBLE_CLICK_DISTANCE: f64 = 8.0;
 
 fn edges_to_cursor(edges: ResizeEdge) -> CursorShape {
     let top = edges.contains(ResizeEdge::TOP);
@@ -42,7 +47,7 @@ fn edges_to_cursor(edges: ResizeEdge) -> CursorShape {
 fn cursor_for_decoration_hit(hit: Option<crate::window::DecorationHit>) -> Option<CursorShape> {
     match hit.map(|hit| hit.action) {
         Some(DecorationAction::Resize(edges)) => Some(edges_to_cursor(edges)),
-        Some(DecorationAction::Move) => Some(CursorShape::Move),
+        Some(DecorationAction::Move) | Some(DecorationAction::Titlebar) => Some(CursorShape::Move),
         Some(DecorationAction::Minimize)
         | Some(DecorationAction::ToggleMaximize)
         | Some(DecorationAction::Close) => Some(CursorShape::Default),
@@ -53,6 +58,27 @@ fn cursor_for_decoration_hit(hit: Option<crate::window::DecorationHit>) -> Optio
 fn set_cursor_override(state: &mut Yawc, cursor: Option<CursorShape>) {
     state.compositor_cursor = cursor;
     state.pending_cursor = cursor.unwrap_or(CursorShape::Default);
+}
+
+fn titlebar_double_click(
+    previous: Option<&TitlebarClick>,
+    surface: &WlSurface,
+    location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    time_msec: u32,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    if &previous.surface != surface {
+        return false;
+    }
+    let elapsed = time_msec.saturating_sub(previous.time_msec);
+    if elapsed > TITLEBAR_DOUBLE_CLICK_MS {
+        return false;
+    }
+    let dx = previous.location.x - location.x;
+    let dy = previous.location.y - location.y;
+    (dx * dx + dy * dy).sqrt() <= TITLEBAR_DOUBLE_CLICK_DISTANCE
 }
 
 impl Yawc {
@@ -112,6 +138,14 @@ impl Yawc {
                                 state.toggle_active_window_minimized();
                                 FilterResult::Intercept(())
                             }
+                            Some(HotkeyAction::CloseWindow) => {
+                                state.close_active_window();
+                                FilterResult::Intercept(())
+                            }
+                            Some(HotkeyAction::KillWindow) => {
+                                state.kill_active_window();
+                                FilterResult::Intercept(())
+                            }
                             Some(HotkeyAction::SwitchKeyboardLayout) => FilterResult::Forward,
                             None => FilterResult::Forward,
                         }
@@ -138,7 +172,10 @@ impl Yawc {
                 );
 
                 let serial = SERIAL_COUNTER.next_serial();
-                let decoration_hit = self.windows.decoration_hit_at(&self.space, location);
+                let controls_mode = self.config.window_controls();
+                let decoration_hit =
+                    self.windows
+                        .decoration_hit_at(&self.space, location, controls_mode);
                 let under = if decoration_hit.is_some() {
                     None
                 } else {
@@ -172,7 +209,10 @@ impl Yawc {
                     event.position_transformed(output_geometry.size) + output_geometry.loc.to_f64();
                 let serial = SERIAL_COUNTER.next_serial();
                 let pointer = self.seat.get_pointer().unwrap();
-                let decoration_hit = self.windows.decoration_hit_at(&self.space, location);
+                let controls_mode = self.config.window_controls();
+                let decoration_hit =
+                    self.windows
+                        .decoration_hit_at(&self.space, location, controls_mode);
                 let under = if decoration_hit.is_some() {
                     None
                 } else {
@@ -200,21 +240,73 @@ impl Yawc {
                 let serial = SERIAL_COUNTER.next_serial();
                 let button = event.button_code();
                 let button_state = event.state();
+                let controls_mode = self.config.window_controls();
+                let pointer_location = pointer.current_location();
 
                 if ButtonState::Released == button_state {
+                    if button == BTN_RIGHT {
+                        if let Some(pressed_surface) = self.titlebar_right_press.take() {
+                            let close_on_release = self
+                                .windows
+                                .decoration_hit_at(&self.space, pointer_location, controls_mode)
+                                .filter(|hit| {
+                                    matches!(hit.action, DecorationAction::Titlebar)
+                                        && hit
+                                            .window
+                                            .toplevel()
+                                            .map(|toplevel| {
+                                                toplevel.wl_surface() == &pressed_surface
+                                            })
+                                            .unwrap_or(false)
+                                })
+                                .map(|hit| hit.window)
+                                .filter(|_| controls_mode == WindowControlsMode::Gestures);
+
+                            if let Some(window) = close_on_release {
+                                self.windows.clear_decoration_pressed();
+                                pointer.button(
+                                    self,
+                                    &ButtonEvent {
+                                        button,
+                                        state: button_state,
+                                        serial,
+                                        time: event.time_msec(),
+                                    },
+                                );
+                                pointer.frame(self);
+                                self.close_window(&window);
+                                return;
+                            }
+
+                            self.windows.clear_titlebar_close_pressed();
+                            self.windows.clear_decoration_pressed();
+                        }
+                    }
+                    self.titlebar_right_press = None;
+                    self.windows.clear_titlebar_close_pressed();
                     self.windows.clear_decoration_pressed();
                 }
 
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
-                    if let Some(hit) = self
-                        .windows
-                        .decoration_hit_at(&self.space, pointer.current_location())
+                    if let Some(hit) =
+                        self.windows
+                            .decoration_hit_at(&self.space, pointer_location, controls_mode)
                     {
                         let surface = hit.window.toplevel().unwrap().wl_surface().clone();
                         self.space.raise_element(&hit.window, true);
                         self.windows.activate(&surface);
-                        self.windows.set_decoration_pressed(&surface, true);
-                        keyboard.set_focus(self, Some(surface), serial);
+                        if matches!(hit.action, DecorationAction::Titlebar)
+                            && controls_mode == WindowControlsMode::Gestures
+                            && button == BTN_RIGHT
+                        {
+                            self.windows.set_titlebar_close_pressed(&surface, true);
+                            self.titlebar_right_press = Some(surface.clone());
+                        } else {
+                            self.titlebar_right_press = None;
+                            self.windows.clear_titlebar_close_pressed();
+                            self.windows.set_decoration_pressed(&surface, true);
+                        }
+                        keyboard.set_focus(self, Some(surface.clone()), serial);
                         self.send_pending_configures();
 
                         let button_event = ButtonEvent {
@@ -226,7 +318,72 @@ impl Yawc {
                         pointer.button(self, &button_event);
 
                         match hit.action {
+                            crate::window::DecorationAction::Titlebar => {
+                                if button == BTN_RIGHT
+                                    && controls_mode == WindowControlsMode::Gestures
+                                {
+                                    pointer.frame(self);
+                                    return;
+                                }
+
+                                if button == BTN_LEFT {
+                                    if titlebar_double_click(
+                                        self.last_titlebar_click.as_ref(),
+                                        hit.window.toplevel().unwrap().wl_surface(),
+                                        pointer_location,
+                                        event.time_msec(),
+                                    ) {
+                                        self.last_titlebar_click = None;
+                                        self.windows.clear_decoration_pressed();
+                                        self.toggle_window_maximized(&hit.window);
+                                        pointer.frame(self);
+                                        return;
+                                    }
+
+                                    self.last_titlebar_click = Some(TitlebarClick {
+                                        surface: hit
+                                            .window
+                                            .toplevel()
+                                            .unwrap()
+                                            .wl_surface()
+                                            .clone(),
+                                        time_msec: event.time_msec(),
+                                        location: pointer_location,
+                                    });
+
+                                    if self.windows.is_maximized(&surface) {
+                                        pointer.frame(self);
+                                        return;
+                                    }
+
+                                    set_cursor_override(self, Some(CursorShape::Move));
+                                    if let Some(toplevel) = hit.window.toplevel() {
+                                        self.windows.clear_snap(toplevel.wl_surface());
+                                    }
+                                    let start_data = PointerGrabStartData {
+                                        focus: None,
+                                        button,
+                                        location: pointer_location,
+                                    };
+                                    let initial_window_location =
+                                        self.space.element_location(&hit.window).unwrap();
+                                    pointer.set_grab(
+                                        self,
+                                        MoveSurfaceGrab {
+                                            start_data,
+                                            window: hit.window,
+                                            initial_window_location,
+                                        },
+                                        serial,
+                                        Focus::Clear,
+                                    );
+                                }
+                            }
                             crate::window::DecorationAction::Move => {
+                                if button != BTN_LEFT {
+                                    pointer.frame(self);
+                                    return;
+                                }
                                 set_cursor_override(self, Some(CursorShape::Move));
                                 if let Some(toplevel) = hit.window.toplevel() {
                                     self.windows.clear_snap(toplevel.wl_surface());
@@ -250,6 +407,10 @@ impl Yawc {
                                 );
                             }
                             crate::window::DecorationAction::Resize(edges) => {
+                                if button != BTN_LEFT {
+                                    pointer.frame(self);
+                                    return;
+                                }
                                 set_cursor_override(self, Some(edges_to_cursor(edges)));
                                 let start_data = PointerGrabStartData {
                                     focus: None,
@@ -272,13 +433,19 @@ impl Yawc {
                                 pointer.set_grab(self, grab, serial, Focus::Clear);
                             }
                             crate::window::DecorationAction::Close => {
-                                hit.window.toplevel().unwrap().send_close();
+                                if button == BTN_LEFT {
+                                    self.close_window(&hit.window);
+                                }
                             }
                             crate::window::DecorationAction::Minimize => {
-                                self.set_window_minimized(&hit.window);
+                                if button == BTN_LEFT {
+                                    self.set_window_minimized(&hit.window);
+                                }
                             }
                             crate::window::DecorationAction::ToggleMaximize => {
-                                self.toggle_window_maximized(&hit.window);
+                                if button == BTN_LEFT {
+                                    self.toggle_window_maximized(&hit.window);
+                                }
                             }
                         }
 
@@ -290,6 +457,8 @@ impl Yawc {
                         .map(|(window, location)| (window.clone(), location))
                     {
                         self.windows.clear_decoration_pressed();
+                        self.windows.clear_titlebar_close_pressed();
+                        self.titlebar_right_press = None;
                         self.space.raise_element(&window, true);
 
                         let surface = window.toplevel().unwrap().wl_surface().clone();
@@ -298,6 +467,8 @@ impl Yawc {
                         self.send_pending_configures();
                     } else {
                         self.windows.clear_decoration_pressed();
+                        self.windows.clear_titlebar_close_pressed();
+                        self.titlebar_right_press = None;
                         self.windows.clear_focus();
                         keyboard.set_focus(self, Option::<WlSurface>::None, serial);
                         self.send_pending_configures();
@@ -318,10 +489,11 @@ impl Yawc {
                 if !pointer.is_grabbed() {
                     set_cursor_override(
                         self,
-                        cursor_for_decoration_hit(
-                            self.windows
-                                .decoration_hit_at(&self.space, pointer.current_location()),
-                        ),
+                        cursor_for_decoration_hit(self.windows.decoration_hit_at(
+                            &self.space,
+                            pointer.current_location(),
+                            controls_mode,
+                        )),
                     );
                 }
             }

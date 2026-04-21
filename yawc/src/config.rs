@@ -16,6 +16,8 @@ pub enum HotkeyAction {
     ToggleFullscreen,
     ToggleMinimize,
     SwitchKeyboardLayout,
+    CloseWindow,
+    KillWindow,
 }
 
 #[derive(Clone, Debug)]
@@ -26,6 +28,7 @@ pub struct Config {
     hotkeys: Hotkeys,
     animations: AnimationConfig,
     keyboard: KeyboardConfig,
+    window_controls: WindowControlsMode,
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +38,8 @@ pub struct Hotkeys {
     snap_right: Option<KeyBinding>,
     fullscreen: Option<KeyBinding>,
     minimize: Option<KeyBinding>,
+    close: Option<KeyBinding>,
+    kill: Option<KeyBinding>,
     layout_switch: Option<ModifierBinding>,
 }
 
@@ -61,6 +66,13 @@ pub struct AnimationConfig {
     pub popup_ms: u64,
     pub geometry_ms: u64,
     pub decoration_ms: u64,
+    pub close_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WindowControlsMode {
+    Gestures,
+    Buttons,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,7 +90,14 @@ impl Default for AnimationConfig {
             popup_ms: 180,
             geometry_ms: 220,
             decoration_ms: 140,
+            close_ms: 220,
         }
+    }
+}
+
+impl Default for WindowControlsMode {
+    fn default() -> Self {
+        Self::Gestures
     }
 }
 
@@ -101,6 +120,8 @@ impl Default for Hotkeys {
             snap_right: parse_binding("Super+Right"),
             fullscreen: parse_binding("Ctrl+Alt+F"),
             minimize: parse_binding("Ctrl+Alt+M"),
+            close: parse_binding("Super+W"),
+            kill: parse_binding("Super+Q"),
             layout_switch: parse_modifier_binding("Alt+Shift"),
         }
     }
@@ -139,6 +160,7 @@ impl Config {
             hotkeys: Hotkeys::default(),
             animations: AnimationConfig::default(),
             keyboard: KeyboardConfig::default(),
+            window_controls: WindowControlsMode::default(),
         };
         config.reload();
         config
@@ -180,6 +202,10 @@ impl Config {
         self.keyboard.clone()
     }
 
+    pub fn window_controls(&self) -> WindowControlsMode {
+        self.window_controls
+    }
+
     fn reload(&mut self) -> bool {
         let contents = match fs::read_to_string(&self.path) {
             Ok(contents) => contents,
@@ -197,6 +223,7 @@ impl Config {
         self.hotkeys = parsed.hotkeys;
         self.animations = parsed.animations;
         self.keyboard = parsed.keyboard;
+        self.window_controls = parsed.window_controls;
         self.modified = fs::metadata(&self.path)
             .and_then(|metadata| metadata.modified())
             .ok();
@@ -210,6 +237,7 @@ struct ParsedConfig {
     hotkeys: Hotkeys,
     animations: AnimationConfig,
     keyboard: KeyboardConfig,
+    window_controls: WindowControlsMode,
 }
 
 impl Hotkeys {
@@ -220,6 +248,8 @@ impl Hotkeys {
             (HotkeyAction::SnapRight, self.snap_right),
             (HotkeyAction::ToggleFullscreen, self.fullscreen),
             (HotkeyAction::ToggleMinimize, self.minimize),
+            (HotkeyAction::CloseWindow, self.close),
+            (HotkeyAction::KillWindow, self.kill),
         ]
         .into_iter()
         .find_map(|(action, binding)| {
@@ -259,6 +289,7 @@ fn parse_config(contents: &str) -> ParsedConfig {
     let mut hotkeys = Hotkeys::default();
     let mut animations = AnimationConfig::default();
     let mut keyboard = KeyboardConfig::default();
+    let mut window_controls = WindowControlsMode::default();
 
     for (line_number, raw_line) in contents.lines().enumerate() {
         let line = raw_line
@@ -283,6 +314,10 @@ fn parse_config(contents: &str) -> ParsedConfig {
             "hotkeysnapright" | "snapright" => hotkeys.snap_right = parse_binding(value),
             "hotkeyfullscreen" | "fullscreen" => hotkeys.fullscreen = parse_binding(value),
             "hotkeyminimize" | "minimize" => hotkeys.minimize = parse_binding(value),
+            "hotkeyclose" | "close" => hotkeys.close = parse_binding(value),
+            "hotkeykill" | "kill" | "killprocess" | "forcekill" => {
+                hotkeys.kill = parse_binding(value)
+            }
             "hotkeylayoutswitch" | "layoutswitch" | "keyboardlayoutswitch" => {
                 hotkeys.layout_switch = parse_modifier_binding(value)
             }
@@ -300,6 +335,7 @@ fn parse_config(contents: &str) -> ParsedConfig {
                 if let Some(duration) = parse_duration_ms(value) {
                     animations.popup_ms = duration;
                     animations.geometry_ms = duration;
+                    animations.close_ms = duration;
                 } else {
                     warn!(
                         line = line_number + 1,
@@ -337,6 +373,26 @@ fn parse_config(contents: &str) -> ParsedConfig {
                     );
                 }
             }
+            "closeanimationms" | "closeduration" | "closedurationms" => {
+                if let Some(duration) = parse_duration_ms(value) {
+                    animations.close_ms = duration;
+                } else {
+                    warn!(
+                        line = line_number + 1,
+                        value, "ignoring invalid close animation duration"
+                    );
+                }
+            }
+            "windowcontrols" | "titlebarcontrols" | "controlsmode" => {
+                if let Some(mode) = parse_window_controls(value) {
+                    window_controls = mode;
+                } else {
+                    warn!(
+                        line = line_number + 1,
+                        value, "ignoring invalid window controls mode"
+                    );
+                }
+            }
             "keyboardlayouts" | "xkblayout" | "layouts" => {
                 keyboard.layouts = value.trim().to_string();
             }
@@ -363,6 +419,7 @@ fn parse_config(contents: &str) -> ParsedConfig {
         hotkeys,
         animations,
         keyboard,
+        window_controls,
     }
 }
 
@@ -382,6 +439,18 @@ fn parse_duration_ms(value: &str) -> Option<u64> {
         .unwrap_or(trimmed)
         .trim();
     without_suffix.parse::<u64>().ok()
+}
+
+fn parse_window_controls(value: &str) -> Option<WindowControlsMode> {
+    match normalize_name(value).as_str() {
+        "gestures" | "gesture" | "modern" | "hidden" | "none" | "buttonless" => {
+            Some(WindowControlsMode::Gestures)
+        }
+        "buttons" | "button" | "classic" | "windows" | "windowsmode" | "default" => {
+            Some(WindowControlsMode::Buttons)
+        }
+        _ => None,
+    }
 }
 
 fn parse_binding(value: &str) -> Option<KeyBinding> {
@@ -491,6 +560,8 @@ fn key_name_to_raw(name: &str) -> Option<u32> {
         "down" | "arrowdown" => Some(keysyms::KEY_Down),
         "f" => Some(keysyms::KEY_f),
         "m" => Some(keysyms::KEY_m),
+        "q" => Some(keysyms::KEY_q),
+        "w" => Some(keysyms::KEY_w),
         _ => None,
     }
 }
@@ -523,7 +594,7 @@ const DEFAULT_CONFIG: &str = r#"# YAWC config
 #   Super, Ctrl, Alt, Shift
 #
 # Keys currently supported by the config parser:
-#   Up, Down, Left, Right, F, M
+#   Up, Down, Left, Right, F, M, Q, W
 #
 # Set any binding to "none" to disable it.
 
@@ -532,6 +603,8 @@ snap_left = Super+Left
 snap_right = Super+Right
 fullscreen = Ctrl+Alt+F
 minimize = Ctrl+Alt+M
+close = Super+W
+kill = Super+Q
 layout_switch = Alt+Shift
 
 # Keyboard:
@@ -545,9 +618,15 @@ keyboard_options =
 # Animations:
 #   animations = true/false
 #   animation_ms changes both popup and maximize/snap timing.
-#   popup_animation_ms, geometry_animation_ms, and decoration_animation_ms can tune them separately.
+#   popup_animation_ms, geometry_animation_ms, decoration_animation_ms, and close_animation_ms can tune them separately.
 animations = true
 popup_animation_ms = 180
 geometry_animation_ms = 220
 decoration_animation_ms = 140
+close_animation_ms = 220
+
+# Window controls:
+#   gestures: no titlebar buttons, right-click titlebar to close, double-click titlebar to maximize.
+#   buttons/windows/classic: show close/maximize/minimize buttons.
+window_controls = gestures
 "#;
