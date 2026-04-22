@@ -62,6 +62,14 @@ smithay::backend::renderer::element::render_elements! {
     AnimatedSurface=AnimatedSurfaceElement,
 }
 
+#[derive(Clone)]
+#[cfg(feature = "tty-udev")]
+pub struct CaptureCursor {
+    pub buffer: MemoryRenderBuffer,
+    pub hotspot: Point<i32, Physical>,
+    pub location: Point<f64, Logical>,
+}
+
 const FRAME_FILL_RGBA: [u8; 4] = [92, 96, 102, 150];
 const TITLE_COLOR: Rgba<u8> = Rgba([244, 246, 248, 238]);
 const CLOSE_COLOR: Rgba<u8> = Rgba([244, 246, 248, 230]);
@@ -69,6 +77,14 @@ const TITLE_PADDING: i32 = 18;
 const TITLE_FONT_SIZE: f32 = 17.5;
 const ICON_SIZE: u32 = 20;
 const ICON_GAP: i32 = 10;
+const LEGACY_BADGE_SIZE: i32 = 18;
+const LEGACY_BADGE_GAP: i32 = 10;
+const LEGACY_BADGE_COLOR: Rgba<u8> = Rgba([245, 145, 35, 235]);
+const LEGACY_BADGE_MARK_COLOR: Rgba<u8> = Rgba([52, 32, 16, 245]);
+const LEGACY_TOOLTIP_TEXT: &str = "Legacy X11 application running through XWayland";
+const TOOLTIP_FONT_SIZE: f32 = 14.0;
+const TOOLTIP_PADDING_X: i32 = 10;
+const TOOLTIP_HEIGHT: i32 = 28;
 const BLUR_PAD_X: i32 = 48;
 const BLUR_PAD_Y: i32 = 96;
 const CSD_RADIUS: i32 = 10;
@@ -569,6 +585,7 @@ impl RenderState {
         windows: &WindowStore,
         animation_config: crate::config::AnimationConfig,
         region: Rectangle<i32, Logical>,
+        cursor: Option<CaptureCursor>,
     ) -> Result<CapturedFrame, GlesError> {
         let output_size = self
             .output
@@ -578,7 +595,13 @@ impl RenderState {
         let buffer_size = Size::<i32, Buffer>::from((output_size.w, output_size.h));
         let mut target: GlesTexture = renderer.create_buffer(Fourcc::Xrgb8888, buffer_size)?;
         let mut framebuffer = renderer.bind(&mut target)?;
-        let scene = self.tty_scene_elements(renderer, space, frames, windows, animation_config)?;
+        let mut scene =
+            self.tty_scene_elements(renderer, space, frames, windows, animation_config, None)?;
+        if let Some(cursor) = cursor {
+            if let Some(cursor) = capture_cursor_element(renderer, cursor)? {
+                scene.splice(0..0, [cursor]);
+            }
+        }
 
         {
             let mut frame = renderer.render(&mut framebuffer, output_size, Transform::Normal)?;
@@ -615,6 +638,7 @@ impl RenderState {
         animation_config: crate::config::AnimationConfig,
         region: Rectangle<i32, Logical>,
         target: &mut smithay::backend::allocator::dmabuf::Dmabuf,
+        cursor: Option<CaptureCursor>,
     ) -> Result<(), GlesError> {
         use smithay::backend::allocator::Buffer as _;
 
@@ -625,7 +649,13 @@ impl RenderState {
             return Err(GlesError::FramebufferBindingError);
         }
 
-        let scene = self.tty_scene_elements(renderer, space, frames, windows, animation_config)?;
+        let mut scene =
+            self.tty_scene_elements(renderer, space, frames, windows, animation_config, None)?;
+        if let Some(cursor) = cursor {
+            if let Some(cursor) = capture_cursor_element(renderer, cursor)? {
+                scene.splice(0..0, [cursor]);
+            }
+        }
         let mut framebuffer = renderer.bind(target)?;
 
         {
@@ -653,12 +683,11 @@ impl RenderState {
         frames: &[WindowFrame],
         windows: &WindowStore,
         animation_config: crate::config::AnimationConfig,
+        pointer_location: Option<Point<f64, Logical>>,
     ) -> Result<Vec<YawcRenderElements>, GlesError> {
-        let mut frame_by_surface = HashMap::new();
+        let mut frame_by_window = HashMap::new();
         for frame in frames {
-            if let Some(toplevel) = frame.window.toplevel() {
-                frame_by_surface.insert(toplevel.wl_surface().clone(), frame.clone());
-            }
+            frame_by_window.insert(frame.window.clone(), frame.clone());
         }
 
         let output_size = self
@@ -668,7 +697,7 @@ impl RenderState {
             .unwrap_or_else(|| Size::from((1, 1)));
         let output_geometry = self.output_geometry();
         let titlebar_shader = self.ensure_titlebar_shader(renderer)?.cloned();
-        let mut deco_by_surface = self.decoration_elements(renderer, frames)?;
+        let mut deco_by_window = self.decoration_elements(renderer, frames)?;
         let mut live_csd_surfaces = HashSet::new();
         let mut elements = Vec::new();
 
@@ -677,37 +706,32 @@ impl RenderState {
             let mut blur_element = None;
             let mut shadow_element = None;
             let mut csd_snapshot = None;
-            let frame_meta = window
-                .toplevel()
-                .and_then(|toplevel| frame_by_surface.get(toplevel.wl_surface()));
-            let animation = window
-                .toplevel()
-                .map(|toplevel| {
-                    frame_meta.map(|frame| frame.animation).unwrap_or_else(|| {
-                        windows.animation(toplevel.wl_surface(), animation_config)
-                    })
+            let frame_meta = frame_by_window.get(window);
+            let animation = frame_meta
+                .map(|frame| frame.animation)
+                .or_else(|| {
+                    window
+                        .toplevel()
+                        .map(|toplevel| windows.animation(toplevel.wl_surface(), animation_config))
                 })
                 .unwrap_or_default();
 
-            if let Some(toplevel) = window.toplevel() {
-                if let Some(deco) = deco_by_surface.remove(toplevel.wl_surface()) {
+            if let Some(frame_meta) = frame_meta {
+                if let Some(deco) = deco_by_window.remove(window) {
                     window_elements.extend(deco);
-                    if let Some(frame_meta) = frame_meta {
-                        if let Some(fill) = self.titlebar_fill_element(renderer, frame_meta)? {
-                            window_elements.push(fill);
-                        }
+                    if let Some(fill) = self.titlebar_fill_element(renderer, frame_meta)? {
+                        window_elements.push(fill);
                     }
                 }
 
-                if let (Some(shader), Some(capture)) = (
+                if let (Some(shader), Some(surface), Some(capture)) = (
                     titlebar_shader.as_ref(),
-                    frame_meta.and_then(|frame| {
-                        blur_capture_for_frame(frame, output_geometry, BlurOrigin::TopLeft)
-                    }),
+                    window_wl_surface(window),
+                    blur_capture_for_frame(frame_meta, output_geometry, BlurOrigin::TopLeft),
                 ) {
                     let blur_texture = self.ensure_blur_texture(
                         renderer,
-                        toplevel.wl_surface(),
+                        &surface,
                         capture.capture_w,
                         capture.capture_h,
                     )?;
@@ -717,10 +741,8 @@ impl RenderState {
                         capture.dst_loc,
                         capture.dst_size(),
                         capture,
-                        frame_meta.map(|frame| frame.frame),
-                        frame_meta
-                            .map(decoration_animation_for_frame)
-                            .unwrap_or(animation),
+                        Some(frame_meta.frame),
+                        decoration_animation_for_frame(frame_meta),
                     )));
                 }
             }
@@ -746,7 +768,8 @@ impl RenderState {
                         .into_iter()
                         .map(YawcRenderElements::from);
                     window_elements.splice(0..0, popup_elements);
-                    let surf = window_root_elements(renderer, window, phys_loc);
+                    let surf =
+                        window.render_elements(renderer, phys_loc, RendererScale::from(1.0), 1.0);
                     window_elements
                         .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
                 } else {
@@ -815,6 +838,12 @@ impl RenderState {
         let snapshot_elements = self.csd_snapshot_elements(renderer, &destroyed);
         elements.splice(0..0, snapshot_elements);
         self.retain_csd_snapshots(&live_csd_surfaces, &destroyed);
+
+        if let Some(tooltip) =
+            self.legacy_tooltip_element(renderer, frames, pointer_location, output_geometry)?
+        {
+            elements.splice(0..0, [tooltip]);
+        }
 
         elements.extend(desktop_elements(
             renderer,
@@ -987,14 +1016,12 @@ impl RenderState {
         let all_frames = state
             .windows
             .frames(&state.space, animation_config, controls_mode);
-        let mut frame_by_surface = HashMap::new();
+        let mut frame_by_window = HashMap::new();
         for frame in &all_frames {
-            if let Some(toplevel) = frame.window.toplevel() {
-                frame_by_surface.insert(toplevel.wl_surface().clone(), frame.clone());
-            }
+            frame_by_window.insert(frame.window.clone(), frame.clone());
         }
 
-        let mut deco_by_surface = {
+        let mut deco_by_window = {
             let renderer = backend.renderer();
             self.decoration_elements(renderer, &all_frames)?
         };
@@ -1021,8 +1048,8 @@ impl RenderState {
                 let mut step_elements: Vec<YawcRenderElements> = Vec::new();
                 let mut csd_snapshot = None;
 
-                if let Some(toplevel) = window.toplevel() {
-                    if let Some(frame_meta) = frame_by_surface.get(toplevel.wl_surface()) {
+                if let Some(frame_meta) = frame_by_window.get(window) {
+                    if let Some(surface) = window_wl_surface(window) {
                         let Some(capture) = blur_capture_for_frame(
                             frame_meta,
                             Rectangle::from_size(size.to_logical(1)),
@@ -1030,10 +1057,10 @@ impl RenderState {
                         ) else {
                             continue;
                         };
-                        used_blur_surfaces.insert(toplevel.wl_surface().clone());
+                        used_blur_surfaces.insert(surface.clone());
                         let blur_texture = self.ensure_blur_texture(
                             renderer,
-                            toplevel.wl_surface(),
+                            &surface,
                             capture.capture_w,
                             capture.capture_h,
                         )?;
@@ -1085,7 +1112,7 @@ impl RenderState {
                             )
                         });
 
-                        if let Some(deco) = deco_by_surface.remove(toplevel.wl_surface()) {
+                        if let Some(deco) = deco_by_window.remove(window) {
                             if !frame_meta.maximized
                                 && !frame_meta.fullscreen
                                 && !frame_meta.resizing
@@ -1113,7 +1140,12 @@ impl RenderState {
                             ));
                             let phys_loc =
                                 Point::<i32, Physical>::from((render_loc.x, render_loc.y));
-                            let surf = window_root_elements(renderer, window, phys_loc);
+                            let surf = window.render_elements(
+                                renderer,
+                                phys_loc,
+                                RendererScale::from(1.0),
+                                1.0,
+                            );
                             step_elements
                                 .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
                             step_elements.extend(
@@ -1147,13 +1179,11 @@ impl RenderState {
                         loc.x - window.geometry().loc.x,
                         loc.y - window.geometry().loc.y,
                     ));
-                    let frame_meta = window
-                        .toplevel()
-                        .and_then(|toplevel| frame_by_surface.get(toplevel.wl_surface()));
-                    let animation = window
-                        .toplevel()
-                        .map(|toplevel| {
-                            frame_meta.map(|frame| frame.animation).unwrap_or_else(|| {
+                    let frame_meta = frame_by_window.get(window);
+                    let animation = frame_meta
+                        .map(|frame| frame.animation)
+                        .or_else(|| {
+                            window.toplevel().map(|toplevel| {
                                 state
                                     .windows
                                     .animation(toplevel.wl_surface(), animation_config)
@@ -1234,6 +1264,17 @@ impl RenderState {
                 let _ = frame.finish()?;
             }
             self.retain_csd_snapshots(&live_csd_surfaces, &destroyed);
+
+            if let Some(tooltip) = self.legacy_tooltip_element(
+                renderer,
+                &all_frames,
+                pointer_location,
+                Rectangle::from_size(size.to_logical(1)),
+            )? {
+                let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                draw_elements(&mut frame, &[tooltip])?;
+                let _ = frame.finish()?;
+            }
 
             let dnd_icon = dnd_icon_elements(renderer, state.dnd_icon.as_ref(), pointer_location);
             if !dnd_icon.is_empty() {
@@ -1427,8 +1468,8 @@ impl RenderState {
         &mut self,
         renderer: &mut GlesRenderer,
         frames: &[WindowFrame],
-    ) -> Result<HashMap<WlSurface, Vec<YawcRenderElements>>, GlesError> {
-        let mut result: HashMap<WlSurface, Vec<YawcRenderElements>> = HashMap::new();
+    ) -> Result<HashMap<Window, Vec<YawcRenderElements>>, GlesError> {
+        let mut result: HashMap<Window, Vec<YawcRenderElements>> = HashMap::new();
         let mut used_overlay_keys = HashSet::new();
 
         for frame in frames {
@@ -1468,15 +1509,7 @@ impl RenderState {
                 )?,
             ));
 
-            let Some(surface) = frame
-                .window
-                .toplevel()
-                .map(|toplevel| toplevel.wl_surface().clone())
-            else {
-                continue;
-            };
-
-            result.insert(surface, frame_elements);
+            result.insert(frame.window.clone(), frame_elements);
         }
 
         self.overlay_cache
@@ -1659,6 +1692,62 @@ impl RenderState {
             1.0,
             decoration_animation_for_frame(frame).alpha,
         ))))
+    }
+
+    fn legacy_tooltip_element(
+        &self,
+        renderer: &mut GlesRenderer,
+        frames: &[WindowFrame],
+        pointer_location: Option<Point<f64, Logical>>,
+        bounds: Rectangle<i32, Logical>,
+    ) -> Result<Option<YawcRenderElements>, GlesError> {
+        let Some(pointer_location) = pointer_location else {
+            return Ok(None);
+        };
+        let Some(font) = self.title_font.as_ref() else {
+            return Ok(None);
+        };
+        let Some(frame) = frames.iter().rev().find(|frame| {
+            legacy_badge_rect(frame).is_some_and(|rect| contains_point(rect, pointer_location))
+        }) else {
+            return Ok(None);
+        };
+
+        let text_width = measure_text_width(font, LEGACY_TOOLTIP_TEXT, TOOLTIP_FONT_SIZE);
+        let width = (text_width + TOOLTIP_PADDING_X * 2).max(1);
+        let height = TOOLTIP_HEIGHT.max(1);
+        let mut image = RgbaImage::from_pixel(width as u32, height as u32, Rgba([24, 27, 31, 224]));
+        draw_text(
+            &mut image,
+            font,
+            LEGACY_TOOLTIP_TEXT,
+            Rgba([245, 247, 250, 242]),
+            TOOLTIP_PADDING_X,
+            TOOLTIP_FONT_SIZE,
+            0,
+            height,
+            text_width,
+        );
+
+        let badge = legacy_badge_rect(frame).expect("hovered legacy frame has a badge rect");
+        let mut loc = Point::<i32, Logical>::from((badge.loc.x, badge.loc.y + badge.size.h + 8));
+        let max_x = bounds.loc.x + bounds.size.w - width;
+        let max_y = bounds.loc.y + bounds.size.h - height;
+        loc.x = loc.x.clamp(bounds.loc.x, max_x.max(bounds.loc.x));
+        loc.y = loc.y.clamp(bounds.loc.y, max_y.max(bounds.loc.y));
+
+        let buffer = rgba_to_buffer(&image);
+        Ok(Some(YawcRenderElements::from(
+            MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                Point::<f64, Physical>::from((loc.x as f64, loc.y as f64)),
+                &buffer,
+                Some(1.0),
+                None,
+                None,
+                Kind::Unspecified,
+            )?,
+        )))
     }
 
     fn shadow_element(
@@ -2403,6 +2492,7 @@ struct DecorationCacheKey {
     maximized: bool,
     controls_mode: WindowControlsMode,
     close_tint: u8,
+    legacy_x11: bool,
     title: String,
     app_id: Option<String>,
 }
@@ -2415,6 +2505,7 @@ impl DecorationCacheKey {
             maximized: frame.maximized,
             controls_mode: frame.controls_mode,
             close_tint: (frame.close_tint.clamp(0.0, 1.0) * 255.0).round() as u8,
+            legacy_x11: frame.legacy_x11,
             title: frame.title.clone(),
             app_id: frame.app_id.clone(),
         }
@@ -2609,25 +2700,6 @@ fn decoration_animation_for_frame(frame: &WindowFrame) -> WindowAnimation {
     animation
 }
 
-fn window_root_elements(
-    renderer: &mut GlesRenderer,
-    window: &Window,
-    location: Point<i32, Physical>,
-) -> Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
-    let Some(surface) = window.toplevel().map(|toplevel| toplevel.wl_surface()) else {
-        return Vec::new();
-    };
-
-    render_elements_from_surface_tree(
-        renderer,
-        surface,
-        location,
-        RendererScale::from(1.0),
-        1.0,
-        Kind::Unspecified,
-    )
-}
-
 fn window_popup_elements(
     renderer: &mut GlesRenderer,
     window: &Window,
@@ -2652,6 +2724,44 @@ fn window_popup_elements(
             )
         })
         .collect()
+}
+
+fn window_wl_surface(window: &Window) -> Option<WlSurface> {
+    if let Some(toplevel) = window.toplevel() {
+        return Some(toplevel.wl_surface().clone());
+    }
+
+    #[cfg(feature = "xwayland")]
+    if let Some(surface) = window.x11_surface() {
+        return surface.wl_surface();
+    }
+
+    None
+}
+
+#[cfg(feature = "tty-udev")]
+fn capture_cursor_element(
+    renderer: &mut GlesRenderer,
+    cursor: CaptureCursor,
+) -> Result<Option<YawcRenderElements>, GlesError> {
+    if cursor.location.x.is_nan() || cursor.location.y.is_nan() {
+        return Ok(None);
+    }
+
+    Ok(Some(YawcRenderElements::from(
+        MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            Point::<f64, Physical>::from((
+                cursor.location.x - cursor.hotspot.x as f64,
+                cursor.location.y - cursor.hotspot.y as f64,
+            )),
+            &cursor.buffer,
+            None,
+            None,
+            None,
+            Kind::Cursor,
+        )?,
+    )))
 }
 
 fn csd_visual_rect(window: &Window, render_loc: Point<i32, Logical>) -> Rectangle<i32, Logical> {
@@ -2751,8 +2861,17 @@ fn overlay_buffer(
         frame.title.as_str()
     };
 
+    if frame.legacy_x11 {
+        let badge = legacy_badge_local_rect();
+        draw_warning_badge(&mut image, badge.loc.x, badge.loc.y, badge.size.w);
+    }
+
     if let Some(font) = title_font {
-        let content_left = TITLE_PADDING;
+        let content_left = if frame.legacy_x11 {
+            TITLE_PADDING + LEGACY_BADGE_SIZE + LEGACY_BADGE_GAP
+        } else {
+            TITLE_PADDING
+        };
         let content_right = match frame.controls_mode {
             WindowControlsMode::Buttons => {
                 let minimize_left = frame.minimize_button.loc.x - frame.frame.loc.x;
@@ -2846,6 +2965,92 @@ fn titlebar_fill_color(close_tint: f32) -> (f32, f32, f32, f32) {
         color[2] as f32 / 255.0,
         color[3] as f32 / 255.0,
     )
+}
+
+fn legacy_badge_local_rect() -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (
+            TITLE_PADDING,
+            ((TITLEBAR_HEIGHT - LEGACY_BADGE_SIZE) / 2).max(0),
+        )
+            .into(),
+        (LEGACY_BADGE_SIZE, LEGACY_BADGE_SIZE).into(),
+    )
+}
+
+fn legacy_badge_rect(frame: &WindowFrame) -> Option<Rectangle<i32, Logical>> {
+    if !frame.legacy_x11 {
+        return None;
+    }
+
+    let local = legacy_badge_local_rect();
+    Some(Rectangle::new(
+        (
+            frame.frame.loc.x + local.loc.x,
+            frame.frame.loc.y + local.loc.y,
+        )
+            .into(),
+        local.size,
+    ))
+}
+
+fn contains_point(rect: Rectangle<i32, Logical>, point: Point<f64, Logical>) -> bool {
+    point.x >= rect.loc.x as f64
+        && point.y >= rect.loc.y as f64
+        && point.x < (rect.loc.x + rect.size.w) as f64
+        && point.y < (rect.loc.y + rect.size.h) as f64
+}
+
+fn draw_warning_badge(image: &mut RgbaImage, x: i32, y: i32, size: i32) {
+    let ax = x as f32 + size as f32 / 2.0;
+    let ay = y as f32 + 1.0;
+    let bx = x as f32 + 1.0;
+    let by = y as f32 + size as f32 - 1.0;
+    let cx = x as f32 + size as f32 - 1.0;
+    let cy = by;
+
+    for py in y..(y + size) {
+        for px in x..(x + size) {
+            if px < 0 || py < 0 || px >= image.width() as i32 || py >= image.height() as i32 {
+                continue;
+            }
+
+            let sample_x = px as f32 + 0.5;
+            let sample_y = py as f32 + 0.5;
+            if point_in_triangle(sample_x, sample_y, (ax, ay), (bx, by), (cx, cy)) {
+                blend_pixel(image, px as u32, py as u32, LEGACY_BADGE_COLOR, 1.0);
+            }
+        }
+    }
+
+    let mark_x = x + size / 2;
+    for py in (y + 5)..(y + size - 5) {
+        for px in (mark_x - 1)..=(mark_x + 1) {
+            if px >= 0 && py >= 0 && px < image.width() as i32 && py < image.height() as i32 {
+                blend_pixel(image, px as u32, py as u32, LEGACY_BADGE_MARK_COLOR, 1.0);
+            }
+        }
+    }
+    for py in (y + size - 4)..(y + size - 2) {
+        for px in (mark_x - 1)..=(mark_x + 1) {
+            if px >= 0 && py >= 0 && px < image.width() as i32 && py < image.height() as i32 {
+                blend_pixel(image, px as u32, py as u32, LEGACY_BADGE_MARK_COLOR, 1.0);
+            }
+        }
+    }
+}
+
+fn point_in_triangle(px: f32, py: f32, a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
+    let d1 = triangle_edge(px, py, a, b);
+    let d2 = triangle_edge(px, py, b, c);
+    let d3 = triangle_edge(px, py, c, a);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
+}
+
+fn triangle_edge(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+    (px - b.0) * (a.1 - b.1) - (a.0 - b.0) * (py - b.1)
 }
 
 fn draw_text(

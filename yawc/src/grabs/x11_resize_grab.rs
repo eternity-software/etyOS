@@ -6,18 +6,40 @@ use smithay::{
         GestureSwipeEndEvent, GestureSwipeUpdateEvent, GrabStartData as PointerGrabStartData,
         MotionEvent, PointerGrab, PointerInnerHandle, RelativeMotionEvent,
     },
-    utils::{Logical, Point},
+    utils::{Logical, Point, Rectangle},
+    xwayland::X11Surface,
 };
+use tracing::warn;
 
-use crate::{focus::FocusTarget, state::Yawc};
+use crate::{focus::FocusTarget, state::Yawc, window::ResizeEdge};
 
-pub struct MoveSurfaceGrab {
-    pub start_data: PointerGrabStartData<Yawc>,
-    pub window: Window,
-    pub initial_window_location: Point<i32, Logical>,
+pub struct X11ResizeSurfaceGrab {
+    start_data: PointerGrabStartData<Yawc>,
+    window: Window,
+    surface: X11Surface,
+    edges: ResizeEdge,
+    initial_rect: Rectangle<i32, Logical>,
 }
 
-impl PointerGrab<Yawc> for MoveSurfaceGrab {
+impl X11ResizeSurfaceGrab {
+    pub fn start(
+        start_data: PointerGrabStartData<Yawc>,
+        window: Window,
+        surface: X11Surface,
+        edges: ResizeEdge,
+        initial_rect: Rectangle<i32, Logical>,
+    ) -> Self {
+        Self {
+            start_data,
+            window,
+            surface,
+            edges,
+            initial_rect,
+        }
+    }
+}
+
+impl PointerGrab<Yawc> for X11ResizeSurfaceGrab {
     fn motion(
         &mut self,
         data: &mut Yawc,
@@ -28,9 +50,33 @@ impl PointerGrab<Yawc> for MoveSurfaceGrab {
         handle.motion(data, None, event);
 
         let delta = event.location - self.start_data.location;
-        let new_location = self.initial_window_location.to_f64() + delta;
-        data.space
-            .map_element(self.window.clone(), new_location.to_i32_round(), true);
+        let mut rect = self.initial_rect;
+        if self.edges.intersects(ResizeEdge::LEFT) {
+            let new_x = (self.initial_rect.loc.x as f64 + delta.x) as i32;
+            let right = self.initial_rect.loc.x + self.initial_rect.size.w;
+            rect.loc.x = new_x.min(right - 1);
+            rect.size.w = (right - rect.loc.x).max(1);
+        }
+        if self.edges.intersects(ResizeEdge::RIGHT) {
+            rect.size.w = (self.initial_rect.size.w as f64 + delta.x) as i32;
+        }
+        if self.edges.intersects(ResizeEdge::TOP) {
+            let new_y = (self.initial_rect.loc.y as f64 + delta.y) as i32;
+            let bottom = self.initial_rect.loc.y + self.initial_rect.size.h;
+            rect.loc.y = new_y.min(bottom - 1);
+            rect.size.h = (bottom - rect.loc.y).max(1);
+        }
+        if self.edges.intersects(ResizeEdge::BOTTOM) {
+            rect.size.h = (self.initial_rect.size.h as f64 + delta.y) as i32;
+        }
+        rect.size.w = rect.size.w.max(1);
+        rect.size.h = rect.size.h.max(1);
+
+        if let Err(error) = self.surface.configure(rect) {
+            warn!(?error, "failed to resize X11 window");
+            return;
+        }
+        data.space.map_element(self.window.clone(), rect.loc, true);
     }
 
     fn relative_motion(
@@ -50,9 +96,7 @@ impl PointerGrab<Yawc> for MoveSurfaceGrab {
         event: &ButtonEvent,
     ) {
         handle.button(data, event);
-
-        const BTN_LEFT: u32 = 0x110;
-        if !handle.current_pressed().contains(&BTN_LEFT) {
+        if !handle.current_pressed().contains(&self.start_data.button) {
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }

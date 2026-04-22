@@ -1,6 +1,7 @@
 mod backend;
 mod config;
 mod cursor;
+mod focus;
 mod grabs;
 mod input;
 mod render;
@@ -43,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid command line")
     })?;
 
-    let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
+    let mut event_loop: EventLoop<'static, CalloopData> = EventLoop::try_new()?;
     let display: Display<Yawc> = Display::new()?;
     let display_handle = display.handle();
     let state = Yawc::new(&mut event_loop, display);
@@ -54,6 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     ensure_session_environment_defaults();
+    #[cfg(feature = "xwayland")]
+    shell::xwayland::init(&mut event_loop, &mut data);
 
     match cli.backend {
         #[cfg(feature = "winit-backend")]
@@ -61,6 +64,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "tty-udev")]
         BackendKind::Standalone => backend::tty_udev::init(&mut event_loop, &mut data)?,
     }
+
+    #[cfg(feature = "xwayland")]
+    shell::xwayland::wait_until_ready(&mut event_loop, &mut data);
 
     update_activation_environment();
     #[cfg(feature = "tty-udev")]
@@ -100,6 +106,7 @@ fn set_env_default(key: &str, value: &str) {
 fn update_activation_environment() {
     const ENV_NAMES: &[&str] = &[
         "WAYLAND_DISPLAY",
+        "DISPLAY",
         "XDG_SESSION_TYPE",
         "XDG_CURRENT_DESKTOP",
         "XDG_SESSION_DESKTOP",

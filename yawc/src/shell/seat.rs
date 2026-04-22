@@ -19,11 +19,12 @@ use smithay::{
     },
 };
 
+use crate::focus::FocusTarget;
 use crate::state::Yawc;
 
 impl SeatHandler for Yawc {
-    type KeyboardFocus = WlSurface;
-    type PointerFocus = WlSurface;
+    type KeyboardFocus = FocusTarget;
+    type PointerFocus = FocusTarget;
     type TouchFocus = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<Self> {
@@ -34,8 +35,11 @@ impl SeatHandler for Yawc {
         self.cursor_image = image;
     }
 
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        let client = focused.and_then(|surface| self.display_handle.get_client(surface.id()).ok());
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&FocusTarget>) {
+        let surface = focused.and_then(FocusTarget::wl_surface);
+        let client = surface
+            .as_ref()
+            .and_then(|surface| self.display_handle.get_client(surface.id()).ok());
         set_data_device_focus(&self.display_handle, seat, client);
     }
 }

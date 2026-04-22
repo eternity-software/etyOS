@@ -1,3 +1,5 @@
+#[cfg(feature = "xwayland")]
+use smithay::xwayland::XWaylandClientData;
 use smithay::{
     backend::allocator::{dmabuf::Dmabuf, Buffer},
     backend::renderer::utils::on_commit_buffer_handler,
@@ -30,7 +32,16 @@ impl CompositorHandler for Yawc {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
+        if let Some(state) = client.get_data::<ClientState>() {
+            return &state.compositor_state;
+        }
+
+        #[cfg(feature = "xwayland")]
+        if let Some(state) = client.get_data::<XWaylandClientData>() {
+            return &state.compositor_state;
+        }
+
+        panic!("client without compositor state bound wl_compositor");
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -46,7 +57,12 @@ impl CompositorHandler for Yawc {
             let committed_window = self
                 .space
                 .elements()
-                .find(|window| window.toplevel().unwrap().wl_surface() == &root)
+                .find(|window| {
+                    window
+                        .toplevel()
+                        .map(|toplevel| toplevel.wl_surface() == &root)
+                        .unwrap_or(false)
+                })
                 .cloned();
 
             if let Some(window) = committed_window {

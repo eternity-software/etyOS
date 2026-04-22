@@ -59,7 +59,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::{OutputConfig, OutputModeConfig},
-    render::{dnd_icon_elements, RenderState, YawcRenderElements},
+    render::{dnd_icon_elements, CaptureCursor, RenderState, YawcRenderElements},
     window::{WindowFrame, WindowStore},
     CalloopData,
 };
@@ -230,7 +230,9 @@ impl TtyRuntime {
         let render_requested = data.state.take_render_requested();
         let screencopy_pending = data.state.screencopy_state.has_pending();
         let animation_pending = data.state.windows.needs_animation_frame(animation_config);
-        let should_render = render_requested || screencopy_pending || animation_pending;
+        let shutdown_pending = data.state.graceful_shutdown_pending();
+        let should_render =
+            render_requested || screencopy_pending || animation_pending || shutdown_pending;
         if !should_render {
             return;
         }
@@ -294,6 +296,8 @@ impl TtyRuntime {
 
         if let Some(request) = data.state.screencopy_state.pop_pending() {
             let region = request.region();
+            let capture_cursor =
+                capture_cursor(&mut self.cursor_theme, &cursor_image, pointer_location);
             if let Some(output_index) = output_index_for_region(&self.outputs, region) {
                 let output = &mut self.outputs[output_index];
                 let screencopy_interval = output.refresh_interval.max(Duration::from_millis(1));
@@ -310,6 +314,7 @@ impl TtyRuntime {
                         data,
                         &frames,
                         animation_config,
+                        capture_cursor,
                     );
                 } else {
                     data.state.screencopy_state.push_pending_front(request);
@@ -449,10 +454,10 @@ impl TtyRuntime {
             return true;
         }
 
-        // Ctrl+Alt+Backspace or Ctrl+Alt+Esc: emergency compositor stop.
+        // Ctrl+Alt+Backspace or Ctrl+Alt+Esc: ask clients to close, then stop shortly after.
         if matches!(key_code, 22 | 9) {
-            warn!("stopping compositor from emergency keyboard shortcut");
-            data.state.loop_signal.stop();
+            warn!("requesting graceful compositor shutdown from emergency keyboard shortcut");
+            data.state.request_graceful_shutdown();
             return true;
         }
 
@@ -1026,6 +1031,7 @@ fn capture_screencopy(
     data: &mut CalloopData,
     frames: &[WindowFrame],
     animation_config: crate::config::AnimationConfig,
+    cursor: Option<CaptureCursor>,
 ) {
     let region = request.region();
     if let Some(mut dmabuf) = request
@@ -1041,6 +1047,7 @@ fn capture_screencopy(
                 animation_config,
                 region,
                 &mut dmabuf,
+                cursor,
             )
             .map_err(|error| format!("{error:?}"));
         request.finish_dmabuf(captured);
@@ -1053,9 +1060,35 @@ fn capture_screencopy(
                 &data.state.windows,
                 animation_config,
                 region,
+                cursor,
             )
             .map_err(|error| format!("{error:?}"));
         request.finish(captured);
+    }
+}
+
+fn capture_cursor(
+    cursor_theme: &mut TtyCursorTheme,
+    cursor_image: &CursorImageStatus,
+    pointer_location: Option<Point<f64, Logical>>,
+) -> Option<CaptureCursor> {
+    let location = pointer_location?;
+    match cursor_image {
+        CursorImageStatus::Hidden => None,
+        CursorImageStatus::Named(icon) => {
+            let cursor = cursor_theme.cursor(*icon);
+            Some(CaptureCursor {
+                buffer: cursor.buffer,
+                hotspot: cursor.hotspot,
+                location,
+            })
+        }
+        CursorImageStatus::Surface(_) => {
+            // The common desktop capture path uses compositor-named cursors.
+            // Client-provided cursor surfaces can be added later through a
+            // surface-tree cursor render element without changing screencopy.
+            None
+        }
     }
 }
 
@@ -1097,6 +1130,7 @@ fn render_elements<'a>(
         frames,
         windows,
         animation_config,
+        pointer_location,
     ) {
         Ok(scene) => elements.extend(
             scene

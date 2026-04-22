@@ -14,6 +14,9 @@ xdg-desktop-portal-wlr
 pipewire
 wireplumber
 
+# X11 compatibility for legacy desktop applications.
+xwayland
+
 # Standalone backend seat/device access.
 libseat1
 seatd

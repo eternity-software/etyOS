@@ -26,6 +26,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
+    focus::FocusTarget,
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
     state::Yawc,
     window::ResizeEdge,
@@ -47,7 +48,11 @@ impl XdgShellHandler for Yawc {
 
         self.space.map_element(window, location, true);
         if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+            keyboard.set_focus(
+                self,
+                Some(FocusTarget::Wayland(wl_surface)),
+                SERIAL_COUNTER.next_serial(),
+            );
         }
         info!(
             windows = self.windows.len(),
@@ -98,7 +103,7 @@ impl XdgShellHandler for Yawc {
             let window = self
                 .space
                 .elements()
-                .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+                .find(|window| window_matches_surface(window, wl_surface))
                 .unwrap()
                 .clone();
             let initial_window_location = self.space.element_location(&window).unwrap();
@@ -135,7 +140,7 @@ impl XdgShellHandler for Yawc {
             let window = self
                 .space
                 .elements()
-                .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+                .find(|window| window_matches_surface(window, wl_surface))
                 .unwrap()
                 .clone();
             let initial_window_location = self.space.element_location(&window).unwrap();
@@ -162,7 +167,7 @@ impl XdgShellHandler for Yawc {
         let Some(window) = self
             .space
             .elements()
-            .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+            .find(|window| window_matches_surface(window, wl_surface))
             .cloned()
         else {
             surface.send_configure();
@@ -177,7 +182,7 @@ impl XdgShellHandler for Yawc {
         let Some(window) = self
             .space
             .elements()
-            .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+            .find(|window| window_matches_surface(window, wl_surface))
             .cloned()
         else {
             surface.send_configure();
@@ -196,7 +201,7 @@ impl XdgShellHandler for Yawc {
         let Some(window) = self
             .space
             .elements()
-            .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+            .find(|window| window_matches_surface(window, wl_surface))
             .cloned()
         else {
             surface.send_configure();
@@ -211,7 +216,7 @@ impl XdgShellHandler for Yawc {
         let Some(window) = self
             .space
             .elements()
-            .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+            .find(|window| window_matches_surface(window, wl_surface))
             .cloned()
         else {
             surface.send_configure();
@@ -226,7 +231,7 @@ impl XdgShellHandler for Yawc {
         let Some(window) = self
             .space
             .elements()
-            .find(|window| window.toplevel().unwrap().wl_surface() == wl_surface)
+            .find(|window| window_matches_surface(window, wl_surface))
             .cloned()
         else {
             surface.send_configure();
@@ -270,7 +275,7 @@ delegate_xdg_shell!(Yawc);
 pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: &WlSurface) {
     if let Some(window) = space
         .elements()
-        .find(|window| window.toplevel().unwrap().wl_surface() == surface)
+        .find(|window| window_matches_surface(window, surface))
         .cloned()
     {
         let initial_configure_sent = with_states(surface, |states| {
@@ -284,7 +289,9 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
         });
 
         if !initial_configure_sent {
-            window.toplevel().unwrap().send_configure();
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.send_configure();
+            }
         }
     }
 
@@ -312,7 +319,7 @@ impl Yawc {
         let Some(window) = self
             .space
             .elements()
-            .find(|window| window.toplevel().unwrap().wl_surface() == &root)
+            .find(|window| window_matches_surface(window, &root))
         else {
             return;
         };
@@ -337,6 +344,13 @@ impl Yawc {
     }
 }
 
+fn window_matches_surface(window: &Window, surface: &WlSurface) -> bool {
+    window
+        .toplevel()
+        .map(|toplevel| toplevel.wl_surface() == surface)
+        .unwrap_or(false)
+}
+
 fn check_grab(
     seat: &Seat<Yawc>,
     surface: &WlSurface,
@@ -351,7 +365,11 @@ fn check_grab(
     let start_data = pointer.grab_start_data()?;
     let (focus, _) = start_data.focus.as_ref()?;
 
-    if !focus.id().same_client_as(&surface.id()) {
+    let Some(focus_surface) = focus.wl_surface() else {
+        return None;
+    };
+
+    if !focus_surface.id().same_client_as(&surface.id()) {
         return None;
     }
 

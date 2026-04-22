@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["winit-backend"]
+default = ["winit-backend", "xwayland"]
 winit-backend = ["smithay/backend_winit"]
+xwayland = ["smithay/xwayland"]
 standalone = ["tty-udev"]
 tty-udev = [
   "smithay/backend_egl",
@@ -17,6 +18,7 @@ tty-udev = [
   "smithay/renderer_gl",
   "smithay/renderer_multi",
   "smithay/use_system_lib",
+  "xwayland",
 ]
 
 [dependencies]

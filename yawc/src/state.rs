@@ -1,4 +1,10 @@
-use std::{collections::HashMap, ffi::OsString, process::Command, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    process::Command,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use smithay::{
     backend::allocator::Format,
@@ -30,19 +36,29 @@ use smithay::{
         viewporter::ViewporterState,
     },
 };
+#[cfg(feature = "xwayland")]
+use smithay::{
+    wayland::{
+        xwayland_keyboard_grab::XWaylandKeyboardGrabState, xwayland_shell::XWaylandShellState,
+    },
+    xwayland::X11Wm,
+};
 use tracing::{info, warn};
 
 use crate::{
     config::{Config, KeyboardConfig},
     cursor::CursorShape,
+    focus::FocusTarget,
     screencopy::ScreencopyState,
     window::{SnapSide, WindowStore},
     CalloopData,
 };
 
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(2500);
+
 #[derive(Clone)]
 pub struct TitlebarClick {
-    pub surface: WlSurface,
+    pub window: Window,
     pub time_msec: u32,
     pub location: Point<f64, Logical>,
 }
@@ -56,6 +72,16 @@ pub struct Yawc {
     pub windows: WindowStore,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_shell_state: XWaylandShellState,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_keyboard_grab_state: XWaylandKeyboardGrabState,
+    #[cfg(feature = "xwayland")]
+    pub xwm: Option<X11Wm>,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_display: Option<u32>,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_failed: bool,
     pub xdg_decoration_state: XdgDecorationState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
@@ -74,11 +100,13 @@ pub struct Yawc {
     pub cursor_image: CursorImageStatus,
     pub dnd_icon: Option<WlSurface>,
     pub config: Config,
-    pub titlebar_right_press: Option<WlSurface>,
+    pub titlebar_right_press: Option<Window>,
     pub last_titlebar_click: Option<TitlebarClick>,
     pub snap_memory: HashMap<String, SnapSide>,
     pub render_requested: bool,
     applied_keyboard_config: Option<KeyboardConfig>,
+    shutdown_requested: bool,
+    shutdown_started_at: Option<Instant>,
 }
 
 impl Yawc {
@@ -87,6 +115,10 @@ impl Yawc {
         let display_handle = display.handle();
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        #[cfg(feature = "xwayland")]
+        let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
+        #[cfg(feature = "xwayland")]
+        let xwayland_keyboard_grab_state = XWaylandKeyboardGrabState::new::<Self>(&display_handle);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
@@ -117,6 +149,16 @@ impl Yawc {
             windows,
             compositor_state,
             xdg_shell_state,
+            #[cfg(feature = "xwayland")]
+            xwayland_shell_state,
+            #[cfg(feature = "xwayland")]
+            xwayland_keyboard_grab_state,
+            #[cfg(feature = "xwayland")]
+            xwm: None,
+            #[cfg(feature = "xwayland")]
+            xwayland_display: None,
+            #[cfg(feature = "xwayland")]
+            xwayland_failed: false,
             xdg_decoration_state,
             shm_state,
             output_manager_state,
@@ -140,6 +182,8 @@ impl Yawc {
             snap_memory: HashMap::new(),
             render_requested: true,
             applied_keyboard_config: None,
+            shutdown_requested: false,
+            shutdown_started_at: None,
         };
         state.apply_keyboard_config();
         state
@@ -229,13 +273,27 @@ impl Yawc {
     pub fn surface_under(
         &self,
         position: Point<f64, Logical>,
-    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+    ) -> Option<(FocusTarget, Point<f64, Logical>)> {
         self.space
             .element_under(position)
             .and_then(|(window, location)| {
+                #[cfg(feature = "xwayland")]
+                if let Some(surface) = window.x11_surface() {
+                    return window
+                        .surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
+                        .map(|(_, point)| {
+                            (
+                                FocusTarget::X11(surface.clone()),
+                                (point + location).to_f64(),
+                            )
+                        });
+                }
+
                 window
                     .surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(surface, point)| (surface, (point + location).to_f64()))
+                    .map(|(surface, point)| {
+                        (FocusTarget::Wayland(surface), (point + location).to_f64())
+                    })
             })
     }
 
@@ -277,6 +335,19 @@ impl Yawc {
     pub fn output_for_window(&self, window: &Window) -> Option<Output> {
         let rect = self.window_visual_rect(window)?;
         self.output_for_rect(rect).cloned()
+    }
+
+    pub fn focus_target_for_window(&self, window: &Window) -> Option<FocusTarget> {
+        if let Some(toplevel) = window.toplevel() {
+            return Some(FocusTarget::Wayland(toplevel.wl_surface().clone()));
+        }
+
+        #[cfg(feature = "xwayland")]
+        if let Some(surface) = window.x11_surface() {
+            return Some(FocusTarget::X11(surface.clone()));
+        }
+
+        None
     }
 
     fn output_for_rect(&self, rect: Rectangle<i32, Logical>) -> Option<&Output> {
@@ -431,9 +502,16 @@ impl Yawc {
 
     fn window_visual_rect(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
         let location = self.space.element_location(window)?;
-        let surface = window
+        let Some(surface) = window
             .toplevel()
-            .map(|toplevel| toplevel.wl_surface().clone())?;
+            .map(|toplevel| toplevel.wl_surface().clone())
+        else {
+            let bbox = window.bbox();
+            return Some(Rectangle::new(
+                location + bbox.loc,
+                non_empty_size(bbox.size, window.geometry().size),
+            ));
+        };
 
         if self.windows.uses_server_decoration(&surface) && !self.windows.is_fullscreen(&surface) {
             let content_size = non_empty_size(window.geometry().size, window.bbox().size);
@@ -526,12 +604,14 @@ impl Yawc {
 
     pub fn prune_windows(&mut self) {
         self.windows.prune_dead(self.config.animations());
+        self.finish_graceful_shutdown_if_ready();
     }
 
     pub fn refresh_space_and_prune_windows(&mut self) {
         let animations = self.config.animations();
         self.space.refresh();
         self.windows.prune_dead(animations);
+        self.finish_graceful_shutdown_if_ready();
     }
 
     pub fn finish_close_animations(&mut self) {
@@ -539,20 +619,76 @@ impl Yawc {
         for window in windows {
             if let Some(toplevel) = window.toplevel() {
                 toplevel.send_close();
+            } else {
+                #[cfg(feature = "xwayland")]
+                if let Some(surface) = window.x11_surface() {
+                    if let Err(error) = surface.close() {
+                        warn!(?error, "failed to close X11 window after animation");
+                    }
+                }
             }
+        }
+        self.finish_graceful_shutdown_if_ready();
+    }
+
+    pub fn request_graceful_shutdown(&mut self) {
+        if self.shutdown_requested {
+            return;
+        }
+
+        let windows = self.windows.managed_windows();
+        if windows.is_empty() {
+            self.loop_signal.stop();
+            return;
+        }
+
+        self.shutdown_requested = true;
+        self.shutdown_started_at = Some(Instant::now());
+        for window in windows {
+            self.close_window(&window);
+        }
+        self.request_render();
+    }
+
+    pub fn graceful_shutdown_pending(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    fn finish_graceful_shutdown_if_ready(&mut self) {
+        if !self.shutdown_requested {
+            return;
+        }
+
+        let timed_out = self
+            .shutdown_started_at
+            .map(|started_at| started_at.elapsed() >= GRACEFUL_SHUTDOWN_TIMEOUT)
+            .unwrap_or(true);
+        if self.windows.is_empty() || timed_out {
+            self.loop_signal.stop();
         }
     }
 
     pub fn close_window(&mut self, window: &Window) {
-        let Some(toplevel) = window.toplevel() else {
+        if let Some(toplevel) = window.toplevel() {
+            if self
+                .windows
+                .request_close(toplevel.wl_surface(), self.config.animations())
+            {
+                toplevel.send_close();
+            }
             return;
-        };
+        }
 
-        if self
-            .windows
-            .request_close(toplevel.wl_surface(), self.config.animations())
-        {
-            toplevel.send_close();
+        #[cfg(feature = "xwayland")]
+        if let Some(surface) = window.x11_surface() {
+            if self
+                .windows
+                .request_close_window(window, self.config.animations())
+            {
+                if let Err(error) = surface.close() {
+                    warn!(?error, "failed to close X11 window");
+                }
+            }
         }
     }
 
@@ -566,6 +702,16 @@ impl Yawc {
         let Some(window) = self.windows.active_window() else {
             return;
         };
+        #[cfg(feature = "xwayland")]
+        if let Some(surface) = window.x11_surface() {
+            let Some(pid) = surface.pid().or_else(|| surface.get_client_pid().ok()) else {
+                warn!("failed to read active X11 window pid for kill hotkey");
+                return;
+            };
+            kill_pid(pid);
+            return;
+        }
+
         let Some(surface) = window.toplevel().map(|toplevel| toplevel.wl_surface()) else {
             return;
         };
@@ -579,30 +725,16 @@ impl Yawc {
             return;
         };
 
-        let pid = credentials.pid;
-        if pid <= 1 {
-            warn!(pid, "refusing to kill active window with invalid pid");
-            return;
-        }
-
-        match Command::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .status()
-        {
-            Ok(status) if status.success() => {
-                info!(pid, "killed active window process");
-            }
-            Ok(status) => {
-                warn!(pid, code = status.code(), "kill command failed");
-            }
-            Err(error) => {
-                warn!(?error, pid, "failed to execute kill command");
-            }
-        }
+        kill_pid(credentials.pid as u32);
     }
 
     pub fn toggle_window_fullscreen(&mut self, window: &Window) {
+        #[cfg(feature = "xwayland")]
+        if window.x11_surface().is_some() {
+            self.set_x11_window_fullscreen(window, !self.windows.is_window_fullscreen(window));
+            return;
+        }
+
         let Some(surface) = window
             .toplevel()
             .map(|toplevel| toplevel.wl_surface().clone())
@@ -624,6 +756,12 @@ impl Yawc {
     }
 
     pub fn toggle_window_maximized(&mut self, window: &Window) {
+        #[cfg(feature = "xwayland")]
+        if window.x11_surface().is_some() {
+            self.set_x11_window_maximized(window, !self.windows.is_window_maximized(window));
+            return;
+        }
+
         let Some(surface) = window
             .toplevel()
             .map(|toplevel| toplevel.wl_surface().clone())
@@ -752,6 +890,12 @@ impl Yawc {
     }
 
     pub fn set_window_maximized(&mut self, window: &Window, maximized: bool) {
+        #[cfg(feature = "xwayland")]
+        if window.x11_surface().is_some() {
+            self.set_x11_window_maximized(window, maximized);
+            return;
+        }
+
         let Some(toplevel) = window.toplevel() else {
             return;
         };
@@ -873,7 +1017,84 @@ impl Yawc {
         }
     }
 
+    #[cfg(feature = "xwayland")]
+    fn set_x11_window_maximized(&mut self, window: &Window, maximized: bool) {
+        let Some(surface) = window.x11_surface() else {
+            return;
+        };
+
+        if maximized {
+            let Some(output_geometry) = self.output_geometry_for_window(window) else {
+                return;
+            };
+            let restore_rect = if self.windows.is_window_maximized(window) {
+                self.windows.window_restore_rect(window)
+            } else {
+                self.space
+                    .element_location(window)
+                    .map(|location| window_content_rect(window, location))
+            };
+
+            if let Err(error) = surface.configure(output_geometry) {
+                warn!(?error, "failed to configure X11 maximized window");
+                return;
+            }
+            self.windows
+                .set_window_maximized(window, true, restore_rect);
+            self.space
+                .map_element(window.clone(), output_geometry.loc, true);
+            info!(
+                width = output_geometry.size.w,
+                height = output_geometry.size.h,
+                "X11 window entered maximized state"
+            );
+        } else {
+            let restore_rect = self
+                .windows
+                .window_restore_rect(window)
+                .or_else(|| {
+                    self.space
+                        .element_location(window)
+                        .map(|location| window_content_rect(window, location))
+                })
+                .unwrap_or_else(|| {
+                    Rectangle::from_size(non_empty_size(window.geometry().size, window.bbox().size))
+                });
+
+            if let Err(error) = surface.configure(restore_rect) {
+                warn!(?error, "failed to configure X11 restored window");
+                return;
+            }
+            self.windows.set_window_maximized(window, false, None);
+            self.space
+                .map_element(window.clone(), restore_rect.loc, true);
+            info!(
+                width = restore_rect.size.w,
+                height = restore_rect.size.h,
+                "X11 window left maximized state"
+            );
+        }
+    }
+
     pub fn set_window_minimized(&mut self, window: &Window) {
+        #[cfg(feature = "xwayland")]
+        if window.x11_surface().is_some() {
+            let restore_rect = self
+                .space
+                .element_location(window)
+                .map(|location| window_content_rect(window, location));
+            self.windows
+                .set_window_minimized(window, true, restore_rect);
+            self.space.unmap_elem(window);
+            self.seat.get_keyboard().unwrap().set_focus(
+                self,
+                Option::<FocusTarget>::None,
+                SERIAL_COUNTER.next_serial(),
+            );
+            info!("X11 window minimized");
+            return;
+        }
+
         let Some(toplevel) = window.toplevel() else {
             return;
         };
@@ -887,7 +1108,7 @@ impl Yawc {
         self.space.unmap_elem(window);
         self.seat.get_keyboard().unwrap().set_focus(
             self,
-            Option::<WlSurface>::None,
+            Option::<FocusTarget>::None,
             SERIAL_COUNTER.next_serial(),
         );
         info!("window minimized");
@@ -897,6 +1118,36 @@ impl Yawc {
         let Some(window) = self.windows.last_minimized_window() else {
             return;
         };
+        #[cfg(feature = "xwayland")]
+        if let Some(surface) = window.x11_surface().cloned() {
+            let restore_rect = self
+                .windows
+                .window_minimized_rect(&window)
+                .or_else(|| self.windows.window_restore_rect(&window))
+                .or_else(|| {
+                    self.space
+                        .element_location(&window)
+                        .map(|location| window_content_rect(&window, location))
+                })
+                .unwrap_or_else(|| {
+                    Rectangle::from_size(non_empty_size(window.geometry().size, window.bbox().size))
+                });
+            if let Err(error) = surface.configure(restore_rect) {
+                warn!(?error, "failed to configure restored X11 window");
+            }
+            self.windows.set_window_minimized(&window, false, None);
+            self.windows.activate_x11(&surface);
+            self.space
+                .map_element(window.clone(), restore_rect.loc, true);
+            self.seat.get_keyboard().unwrap().set_focus(
+                self,
+                Some(FocusTarget::X11(surface)),
+                SERIAL_COUNTER.next_serial(),
+            );
+            info!("X11 window restored from minimized state");
+            return;
+        }
+
         let Some(toplevel) = window.toplevel() else {
             return;
         };
@@ -915,7 +1166,7 @@ impl Yawc {
             .map_element(window.clone(), restore_rect.loc, true);
         self.seat.get_keyboard().unwrap().set_focus(
             self,
-            Some(surface),
+            Some(FocusTarget::Wayland(surface)),
             SERIAL_COUNTER.next_serial(),
         );
         info!("window restored from minimized state");
@@ -972,6 +1223,12 @@ impl Yawc {
         fullscreen: bool,
         requested_output: Option<WlOutput>,
     ) {
+        #[cfg(feature = "xwayland")]
+        if window.x11_surface().is_some() {
+            self.set_x11_window_fullscreen(window, fullscreen);
+            return;
+        }
+
         let Some(toplevel) = window.toplevel() else {
             return;
         };
@@ -1051,6 +1308,57 @@ impl Yawc {
                 height = restore_rect.size.h,
                 "window left fullscreen"
             );
+        }
+    }
+
+    #[cfg(feature = "xwayland")]
+    fn set_x11_window_fullscreen(&mut self, window: &Window, fullscreen: bool) {
+        let Some(surface) = window.x11_surface() else {
+            return;
+        };
+
+        if fullscreen {
+            let Some(output_geometry) = self.output_geometry_for_window(window) else {
+                return;
+            };
+            let restore_rect = if self.windows.is_window_fullscreen(window) {
+                self.windows.window_restore_rect(window)
+            } else {
+                self.space
+                    .element_location(window)
+                    .map(|location| window_content_rect(window, location))
+            };
+
+            if let Err(error) = surface.configure(output_geometry) {
+                warn!(?error, "failed to configure X11 fullscreen window");
+                return;
+            }
+            self.windows
+                .set_window_fullscreen(window, true, restore_rect);
+            self.space
+                .map_element(window.clone(), output_geometry.loc, true);
+            info!("X11 window entered fullscreen");
+        } else {
+            let restore_rect = self
+                .windows
+                .window_restore_rect(window)
+                .or_else(|| {
+                    self.space
+                        .element_location(window)
+                        .map(|location| window_content_rect(window, location))
+                })
+                .unwrap_or_else(|| {
+                    Rectangle::from_size(non_empty_size(window.geometry().size, window.bbox().size))
+                });
+
+            if let Err(error) = surface.configure(restore_rect) {
+                warn!(?error, "failed to configure X11 unfullscreen window");
+                return;
+            }
+            self.windows.set_window_fullscreen(window, false, None);
+            self.space
+                .map_element(window.clone(), restore_rect.loc, true);
+            info!("X11 window left fullscreen");
         }
     }
 
@@ -1165,6 +1473,29 @@ fn non_empty_size(
         fallback
     } else {
         default_initial_window_size()
+    }
+}
+
+fn kill_pid(pid: u32) {
+    if pid <= 1 {
+        warn!(pid, "refusing to kill active window with invalid pid");
+        return;
+    }
+
+    match Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status()
+    {
+        Ok(status) if status.success() => {
+            info!(pid, "killed active window process");
+        }
+        Ok(status) => {
+            warn!(pid, code = status.code(), "kill command failed");
+        }
+        Err(error) => {
+            warn!(?error, pid, "failed to execute kill command");
+        }
     }
 }
 

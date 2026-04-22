@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "xwayland")]
+use smithay::xwayland::X11Surface;
 use smithay::{
     desktop::{Space, Window},
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -54,7 +56,9 @@ impl From<xdg_toplevel::ResizeEdge> for ResizeEdge {
 #[derive(Clone)]
 pub struct TrackedWindow {
     pub window: Window,
-    pub surface: WlSurface,
+    pub surface: Option<WlSurface>,
+    #[cfg(feature = "xwayland")]
+    pub x11_window_id: Option<u32>,
     pub active: bool,
     pub title: String,
     pub app_id: Option<String>,
@@ -103,6 +107,7 @@ pub struct WindowFrame {
     pub resizing: bool,
     pub title: String,
     pub app_id: Option<String>,
+    pub legacy_x11: bool,
     pub animation: WindowAnimation,
     pub decoration_opacity: f32,
     pub close_tint: f32,
@@ -180,7 +185,9 @@ impl WindowStore {
         let now = Instant::now();
         self.windows.push(TrackedWindow {
             window,
-            surface,
+            surface: Some(surface),
+            #[cfg(feature = "xwayland")]
+            x11_window_id: None,
             active: false,
             title: "Untitled".to_string(),
             app_id: None,
@@ -218,17 +225,74 @@ impl WindowStore {
         location
     }
 
+    #[cfg(feature = "xwayland")]
+    pub fn insert_x11(&mut self, window: Window) -> Point<i32, Logical> {
+        let index = self.windows.len() as i32;
+        let location = Point::from((48 + 48 * index, 48 + 48 * index));
+        let surface = window
+            .x11_surface()
+            .expect("tracked X11 windows need an X11 surface")
+            .clone();
+        let now = Instant::now();
+        self.windows.push(TrackedWindow {
+            window,
+            surface: surface.wl_surface(),
+            x11_window_id: Some(surface.window_id()),
+            active: false,
+            title: title_for_x11(&surface),
+            app_id: app_id_for_x11(&surface),
+            server_decoration: true,
+            decoration_negotiated: true,
+            maximized: false,
+            maximized_server_decoration: None,
+            minimized: false,
+            fullscreen: false,
+            resizing: false,
+            restore_rect: None,
+            minimized_rect: None,
+            snap_side: None,
+            snap_restore_rect: None,
+            mapped_at: now,
+            map_animation_started: false,
+            geometry_animation: None,
+            initial_positioned: false,
+            decoration_pressed: false,
+            decoration_opacity_from: DECORATION_INACTIVE_OPACITY,
+            decoration_opacity_to: DECORATION_INACTIVE_OPACITY,
+            decoration_opacity_started_at: now,
+            titlebar_close_pressed: false,
+            titlebar_close_tint_from: 0.0,
+            titlebar_close_tint_to: 0.0,
+            titlebar_close_tint_started_at: now,
+            close_animating: false,
+            close_sent: false,
+            close_destroyed: false,
+            close_restoring: false,
+            close_started_at: now,
+            close_restore_started_at: now,
+        });
+
+        location
+    }
+
     pub fn len(&self) -> usize {
         self.windows.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty()
+    }
+
+    pub fn managed_windows(&self) -> Vec<Window> {
+        self.windows
+            .iter()
+            .map(|tracked| tracked.window.clone())
+            .collect()
+    }
+
     pub fn activate(&mut self, surface: &WlSurface) {
         for tracked in &mut self.windows {
-            let is_active = tracked
-                .window
-                .toplevel()
-                .map(|toplevel| toplevel.wl_surface() == surface)
-                .unwrap_or(false);
+            let is_active = same_surface(tracked, surface);
 
             if tracked.active != is_active {
                 tracked.active = is_active;
@@ -243,6 +307,38 @@ impl WindowStore {
             } else if !is_active && tracked.titlebar_close_pressed {
                 tracked.titlebar_close_pressed = false;
                 set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
+            }
+        }
+    }
+
+    pub fn activate_window(&mut self, window: &Window) {
+        for tracked in &mut self.windows {
+            let is_active = tracked.window == *window;
+            if tracked.active != is_active {
+                tracked.active = is_active;
+                tracked.decoration_pressed &= is_active;
+                tracked.titlebar_close_pressed &= is_active;
+                set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+                set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
+                tracked.window.set_activated(is_active);
+            }
+        }
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub fn activate_x11(&mut self, surface: &X11Surface) {
+        if let Some(tracked) = self.find_x11_mut(surface) {
+            tracked.surface = surface.wl_surface();
+        }
+        for tracked in &mut self.windows {
+            let is_active = tracked.x11_window_id == Some(surface.window_id());
+            if tracked.active != is_active {
+                tracked.active = is_active;
+                tracked.decoration_pressed &= is_active;
+                tracked.titlebar_close_pressed &= is_active;
+                set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+                set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
+                tracked.window.set_activated(is_active);
             }
         }
     }
@@ -273,6 +369,14 @@ impl WindowStore {
             .map(|tracked| tracked.window.clone())
     }
 
+    #[cfg(feature = "xwayland")]
+    pub fn x11_window(&self, surface: &X11Surface) -> Option<Window> {
+        self.windows
+            .iter()
+            .find(|tracked| tracked.x11_window_id == Some(surface.window_id()))
+            .map(|tracked| tracked.window.clone())
+    }
+
     pub fn last_minimized_window(&self) -> Option<Window> {
         self.windows
             .iter()
@@ -285,13 +389,7 @@ impl WindowStore {
         let close_duration = Duration::from_millis(config.close_ms);
         self.windows.retain(|tracked| {
             if tracked.close_animating {
-                if !tracked.close_destroyed
-                    && tracked
-                        .window
-                        .toplevel()
-                        .map(|toplevel| toplevel.wl_surface().is_alive())
-                        .unwrap_or(false)
-                {
+                if !tracked.close_destroyed && tracked_window_alive(tracked) {
                     return true;
                 }
 
@@ -301,11 +399,7 @@ impl WindowStore {
                     && (tracked.close_destroyed || !tracked.close_sent);
             }
 
-            tracked
-                .window
-                .toplevel()
-                .map(|toplevel| toplevel.wl_surface().is_alive())
-                .unwrap_or(false)
+            tracked_window_alive(tracked)
         });
     }
 
@@ -316,9 +410,24 @@ impl WindowStore {
         }
     }
 
+    #[cfg(feature = "xwayland")]
+    pub fn set_x11_metadata(&mut self, surface: &X11Surface) {
+        if let Some(tracked) = self.find_x11_mut(surface) {
+            tracked.surface = surface.wl_surface();
+            tracked.title = title_for_x11(surface);
+            tracked.app_id = app_id_for_x11(surface);
+        }
+    }
+
     pub fn remove(&mut self, surface: &WlSurface) {
         self.windows
             .retain(|tracked| !same_surface(tracked, surface));
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub fn remove_x11(&mut self, surface: &X11Surface) {
+        self.windows
+            .retain(|tracked| tracked.x11_window_id != Some(surface.window_id()));
     }
 
     pub fn request_destroy_close(&mut self, surface: &WlSurface, config: AnimationConfig) -> bool {
@@ -446,11 +555,33 @@ impl WindowStore {
             })
             .filter_map(|tracked| {
                 Some((
-                    tracked.surface.clone(),
+                    tracked.surface.clone()?,
                     close_animation_for_elapsed(tracked.close_started_at.elapsed(), config),
                 ))
             })
             .collect()
+    }
+
+    pub fn request_close_window(&mut self, window: &Window, config: AnimationConfig) -> bool {
+        if !config.enabled || config.close_ms == 0 {
+            return true;
+        }
+
+        let now = Instant::now();
+        if let Some(tracked) = self.find_window_mut(window) {
+            tracked.close_animating = true;
+            tracked.close_sent = false;
+            tracked.close_destroyed = false;
+            tracked.close_restoring = false;
+            tracked.active = false;
+            tracked.decoration_pressed = false;
+            tracked.titlebar_close_pressed = false;
+            tracked.close_started_at = now;
+            set_decoration_opacity_target(tracked, DECORATION_INACTIVE_OPACITY);
+            return false;
+        }
+
+        true
     }
 
     pub fn set_server_decoration(&mut self, surface: &WlSurface, enabled: bool) {
@@ -504,6 +635,12 @@ impl WindowStore {
             .unwrap_or(false)
     }
 
+    pub fn is_window_maximized(&self, window: &Window) -> bool {
+        self.find_window(window)
+            .map(|tracked| tracked.maximized)
+            .unwrap_or(false)
+    }
+
     pub fn set_minimized(
         &mut self,
         surface: &WlSurface,
@@ -515,6 +652,30 @@ impl WindowStore {
             if minimized {
                 tracked.active = false;
                 tracked.decoration_pressed = false;
+                set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+                tracked.window.set_activated(false);
+            }
+            if let Some(restore_rect) = restore_rect {
+                tracked.minimized_rect = Some(restore_rect);
+            }
+            if !minimized {
+                tracked.minimized_rect = None;
+            }
+        }
+    }
+
+    pub fn set_window_minimized(
+        &mut self,
+        window: &Window,
+        minimized: bool,
+        restore_rect: Option<Rectangle<i32, Logical>>,
+    ) {
+        if let Some(tracked) = self.find_window_mut(window) {
+            tracked.minimized = minimized;
+            if minimized {
+                tracked.active = false;
+                tracked.decoration_pressed = false;
+                tracked.titlebar_close_pressed = false;
                 set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
                 tracked.window.set_activated(false);
             }
@@ -546,6 +707,13 @@ impl WindowStore {
         }
     }
 
+    pub fn set_decoration_pressed_window(&mut self, window: &Window, pressed: bool) {
+        if let Some(tracked) = self.find_window_mut(window) {
+            tracked.decoration_pressed = pressed && tracked.active;
+            set_decoration_opacity_target(tracked, decoration_opacity_target(tracked));
+        }
+    }
+
     pub fn clear_decoration_pressed(&mut self) {
         for tracked in &mut self.windows {
             if tracked.decoration_pressed {
@@ -557,6 +725,13 @@ impl WindowStore {
 
     pub fn set_titlebar_close_pressed(&mut self, surface: &WlSurface, pressed: bool) {
         if let Some(tracked) = self.find_mut(surface) {
+            tracked.titlebar_close_pressed = pressed && tracked.active;
+            set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
+        }
+    }
+
+    pub fn set_titlebar_close_pressed_window(&mut self, window: &Window, pressed: bool) {
+        if let Some(tracked) = self.find_window_mut(window) {
             tracked.titlebar_close_pressed = pressed && tracked.active;
             set_titlebar_close_tint_target(tracked, titlebar_close_tint_target(tracked));
         }
@@ -577,8 +752,55 @@ impl WindowStore {
             .unwrap_or(false)
     }
 
+    pub fn is_window_fullscreen(&self, window: &Window) -> bool {
+        self.find_window(window)
+            .map(|tracked| tracked.fullscreen)
+            .unwrap_or(false)
+    }
+
     pub fn restore_rect(&self, surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
         self.find(surface).and_then(|tracked| tracked.restore_rect)
+    }
+
+    pub fn window_restore_rect(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        self.find_window(window)
+            .and_then(|tracked| tracked.restore_rect)
+    }
+
+    pub fn set_window_maximized(
+        &mut self,
+        window: &Window,
+        maximized: bool,
+        restore_rect: Option<Rectangle<i32, Logical>>,
+    ) {
+        if let Some(tracked) = self.find_window_mut(window) {
+            tracked.maximized = maximized;
+            if maximized {
+                tracked.fullscreen = false;
+                tracked.snap_side = None;
+                tracked.snap_restore_rect = None;
+                tracked.initial_positioned = true;
+            }
+            tracked.restore_rect = maximized.then_some(restore_rect).flatten();
+        }
+    }
+
+    pub fn set_window_fullscreen(
+        &mut self,
+        window: &Window,
+        fullscreen: bool,
+        restore_rect: Option<Rectangle<i32, Logical>>,
+    ) {
+        if let Some(tracked) = self.find_window_mut(window) {
+            tracked.fullscreen = fullscreen;
+            if fullscreen {
+                tracked.maximized = false;
+                tracked.snap_side = None;
+                tracked.snap_restore_rect = None;
+                tracked.initial_positioned = true;
+            }
+            tracked.restore_rect = fullscreen.then_some(restore_rect).flatten();
+        }
     }
 
     pub fn snap_side(&self, surface: &WlSurface) -> Option<SnapSide> {
@@ -623,6 +845,11 @@ impl WindowStore {
 
     pub fn minimized_rect(&self, surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
         self.find(surface)
+            .and_then(|tracked| tracked.minimized_rect)
+    }
+
+    pub fn window_minimized_rect(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        self.find_window(window)
             .and_then(|tracked| tracked.minimized_rect)
     }
 
@@ -704,13 +931,7 @@ impl WindowStore {
         let mut frames = Vec::new();
 
         for window in space.elements() {
-            let Some(surface) = window
-                .toplevel()
-                .map(|toplevel| toplevel.wl_surface().clone())
-            else {
-                continue;
-            };
-            let Some(tracked) = self.find(&surface) else {
+            let Some(tracked) = self.find_window(window) else {
                 continue;
             };
             if tracked.fullscreen || tracked.minimized {
@@ -735,6 +956,7 @@ impl WindowStore {
                 resizing: tracked.resizing,
                 title: tracked.title.clone(),
                 app_id: tracked.app_id.clone(),
+                legacy_x11: is_x11_tracked(tracked),
                 animation: animation_for_tracked(tracked, config),
                 decoration_opacity: decoration_opacity_for_tracked(tracked, config),
                 close_tint: titlebar_close_tint_for_tracked(tracked),
@@ -752,13 +974,7 @@ impl WindowStore {
         controls_mode: WindowControlsMode,
     ) -> Option<DecorationHit> {
         for window in space.elements().rev() {
-            let Some(surface) = window
-                .toplevel()
-                .map(|toplevel| toplevel.wl_surface().clone())
-            else {
-                continue;
-            };
-            let Some(tracked) = self.find(&surface) else {
+            let Some(tracked) = self.find_window(window) else {
                 continue;
             };
             if tracked.minimized {
@@ -844,6 +1060,7 @@ impl WindowStore {
                 resizing: tracked.resizing,
                 title: tracked.title.clone(),
                 app_id: tracked.app_id.clone(),
+                legacy_x11: is_x11_tracked(tracked),
                 animation: WindowAnimation::default(),
                 decoration_opacity: decoration_opacity_target(tracked),
                 close_tint: titlebar_close_tint_target(tracked),
@@ -898,6 +1115,25 @@ impl WindowStore {
             .find(|tracked| same_surface(tracked, surface))
     }
 
+    fn find_window_mut(&mut self, window: &Window) -> Option<&mut TrackedWindow> {
+        self.windows
+            .iter_mut()
+            .find(|tracked| tracked.window == *window)
+    }
+
+    fn find_window(&self, window: &Window) -> Option<&TrackedWindow> {
+        self.windows
+            .iter()
+            .find(|tracked| tracked.window == *window)
+    }
+
+    #[cfg(feature = "xwayland")]
+    fn find_x11_mut(&mut self, surface: &X11Surface) -> Option<&mut TrackedWindow> {
+        self.windows
+            .iter_mut()
+            .find(|tracked| tracked.x11_window_id == Some(surface.window_id()))
+    }
+
     fn find(&self, surface: &WlSurface) -> Option<&TrackedWindow> {
         self.windows
             .iter()
@@ -910,7 +1146,41 @@ fn valid_animation_rect(rect: Rectangle<i32, Logical>) -> bool {
 }
 
 fn same_surface(tracked: &TrackedWindow, surface: &WlSurface) -> bool {
-    tracked.surface == *surface
+    tracked.surface.as_ref() == Some(surface)
+}
+
+fn tracked_window_alive(tracked: &TrackedWindow) -> bool {
+    if let Some(toplevel) = tracked.window.toplevel() {
+        return toplevel.wl_surface().is_alive();
+    }
+
+    #[cfg(feature = "xwayland")]
+    if let Some(surface) = tracked.window.x11_surface() {
+        return surface.alive();
+    }
+
+    false
+}
+
+#[cfg(feature = "xwayland")]
+fn title_for_x11(surface: &X11Surface) -> String {
+    let title = surface.title();
+    if title.is_empty() {
+        "Untitled".to_string()
+    } else {
+        title
+    }
+}
+
+#[cfg(feature = "xwayland")]
+fn app_id_for_x11(surface: &X11Surface) -> Option<String> {
+    let class = surface.class();
+    if !class.is_empty() {
+        return Some(class);
+    }
+
+    let instance = surface.instance();
+    (!instance.is_empty()).then_some(instance)
 }
 
 fn animation_for_tracked(tracked: &TrackedWindow, config: AnimationConfig) -> WindowAnimation {
@@ -1131,6 +1401,18 @@ fn uses_server_decoration(tracked: &TrackedWindow) -> bool {
     !client_draws_own_decorations(&tracked.window)
 }
 
+fn is_x11_tracked(tracked: &TrackedWindow) -> bool {
+    #[cfg(feature = "xwayland")]
+    {
+        tracked.x11_window_id.is_some()
+    }
+    #[cfg(not(feature = "xwayland"))]
+    {
+        let _ = tracked;
+        false
+    }
+}
+
 fn client_draws_own_decorations(window: &Window) -> bool {
     let geometry = window.geometry();
     let bbox = window.bbox();
@@ -1143,7 +1425,7 @@ fn allowed_resize_edges(window: &Window, edges: ResizeEdge) -> Option<ResizeEdge
         .toplevel()
         .map(|toplevel| toplevel.wl_surface().clone())
     else {
-        return None;
+        return Some(edges);
     };
 
     let (min_size, max_size) = compositor::with_states(&surface, |states| {

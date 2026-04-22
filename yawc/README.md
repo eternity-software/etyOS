@@ -28,6 +28,8 @@ The design favors direct Wayland/Smithay integration over borrowing behavior fro
 - `xdg-shell` toplevel window support
 - `xdg-shell` popup tracking and unconstraining
 - `xdg-decoration` handling with server-side decorations
+- XWayland server and X11 window-manager integration for legacy X11 clients
+- XWayland window decoration badge and hover note for legacy X11 applications
 - `wp_viewporter` support for client-side scaled subsurfaces
 - `linux-dmabuf` feedback for native Wayland GPU buffers
 - YAWC-owned `wlr-screencopy` support for portal screen capture
@@ -81,6 +83,8 @@ The repository is intentionally modular so the compositor can grow into a full s
   `xdg-decoration` policy.
 - `src/shell/seat.rs`
   Seat, output, cursor-shape, data-device, and drag-and-drop plumbing.
+- `src/shell/xwayland.rs`
+  XWayland startup, X11 window mapping, X11 configure/focus/close handling, and `DISPLAY` export.
 
 ### Interaction and Rendering
 
@@ -162,12 +166,14 @@ Most importantly, OBS and other portal-aware screen capture clients need:
 
 ```bash
 sudo apt install -y \
+  xwayland \
   xdg-desktop-portal xdg-desktop-portal-wlr \
   pipewire wireplumber
 ```
 
 `xdg-desktop-portal-wlr` bridges the standard desktop portal ScreenCast API to YAWC's screencopy protocol support.
 YAWC session scripts generate YAWC-specific portal preferences that route ScreenCast and Screenshot through that bridge while leaving unsupported portal interfaces disabled instead of silently depending on KDE or GNOME backends.
+`xwayland` provides compatibility for X11-only applications while YAWC remains the Wayland compositor and X11 window manager.
 
 ## Scripts
 
@@ -388,7 +394,7 @@ Do not use it for the normal single-GPU Plasma-to-VT test path.
 Emergency shortcuts in standalone mode:
 
 - `Ctrl+Alt+F1` ... `Ctrl+Alt+F12` asks logind/libseat to switch VT.
-- `Ctrl+Alt+Backspace` or `Ctrl+Alt+Esc` stops YAWC.
+- `Ctrl+Alt+Backspace` or `Ctrl+Alt+Esc` asks open apps to close, then stops YAWC shortly after.
 
 The `openvt` handoff path is available for experiments:
 
@@ -432,7 +438,7 @@ obs --verbose 2>&1 | grep -Ei 'OpenGL|adapter|renderer|EGL|llvmpipe|nvidia|mesa'
 ```
 
 `yawc-debug-gpu-env` is installed with the login session. `./scripts/debug-gpu-env.sh` is the repository-local equivalent.
-`glxinfo` requires X11/GLX and is not useful in a pure YAWC Wayland session without `DISPLAY`.
+`glxinfo` uses X11/GLX through XWayland; use the OBS log first when checking native Wayland/EGL renderer selection.
 
 If explicitly installed with `YAWC_INSTALL_DMABUF_PROBE=1`, the `YAWC dmabuf probe` login session writes:
 

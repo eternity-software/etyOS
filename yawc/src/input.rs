@@ -9,13 +9,13 @@ use smithay::{
             AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent,
         },
     },
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Rectangle, SERIAL_COUNTER},
 };
 
 use crate::{
     config::{HotkeyAction, WindowControlsMode},
     cursor::CursorShape,
+    focus::FocusTarget,
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
     state::{TitlebarClick, Yawc},
     window::{DecorationAction, ResizeEdge, SnapSide},
@@ -62,14 +62,14 @@ fn set_cursor_override(state: &mut Yawc, cursor: Option<CursorShape>) {
 
 fn titlebar_double_click(
     previous: Option<&TitlebarClick>,
-    surface: &WlSurface,
+    window: &smithay::desktop::Window,
     location: smithay::utils::Point<f64, smithay::utils::Logical>,
     time_msec: u32,
 ) -> bool {
     let Some(previous) = previous else {
         return false;
     };
-    if &previous.surface != surface {
+    if &previous.window != window {
         return false;
     }
     let elapsed = time_msec.saturating_sub(previous.time_msec);
@@ -238,19 +238,13 @@ impl Yawc {
 
                 if ButtonState::Released == button_state {
                     if button == BTN_RIGHT {
-                        if let Some(pressed_surface) = self.titlebar_right_press.take() {
+                        if let Some(pressed_window) = self.titlebar_right_press.take() {
                             let close_on_release = self
                                 .windows
                                 .decoration_hit_at(&self.space, pointer_location, controls_mode)
                                 .filter(|hit| {
                                     matches!(hit.action, DecorationAction::Titlebar)
-                                        && hit
-                                            .window
-                                            .toplevel()
-                                            .map(|toplevel| {
-                                                toplevel.wl_surface() == &pressed_surface
-                                            })
-                                            .unwrap_or(false)
+                                        && hit.window == pressed_window
                                 })
                                 .map(|hit| hit.window)
                                 .filter(|_| controls_mode == WindowControlsMode::Gestures);
@@ -285,21 +279,24 @@ impl Yawc {
                         self.windows
                             .decoration_hit_at(&self.space, pointer_location, controls_mode)
                     {
-                        let surface = hit.window.toplevel().unwrap().wl_surface().clone();
                         self.space.raise_element(&hit.window, true);
-                        self.windows.activate(&surface);
+                        self.windows.activate_window(&hit.window);
                         if matches!(hit.action, DecorationAction::Titlebar)
                             && controls_mode == WindowControlsMode::Gestures
                             && button == BTN_RIGHT
                         {
-                            self.windows.set_titlebar_close_pressed(&surface, true);
-                            self.titlebar_right_press = Some(surface.clone());
+                            self.windows
+                                .set_titlebar_close_pressed_window(&hit.window, true);
+                            self.titlebar_right_press = Some(hit.window.clone());
                         } else {
                             self.titlebar_right_press = None;
                             self.windows.clear_titlebar_close_pressed();
-                            self.windows.set_decoration_pressed(&surface, true);
+                            self.windows
+                                .set_decoration_pressed_window(&hit.window, true);
                         }
-                        keyboard.set_focus(self, Some(surface.clone()), serial);
+                        if let Some(target) = self.focus_target_for_window(&hit.window) {
+                            keyboard.set_focus(self, Some(target), serial);
+                        }
                         self.send_pending_configures();
 
                         let button_event = ButtonEvent {
@@ -322,7 +319,7 @@ impl Yawc {
                                 if button == BTN_LEFT {
                                     if titlebar_double_click(
                                         self.last_titlebar_click.as_ref(),
-                                        hit.window.toplevel().unwrap().wl_surface(),
+                                        &hit.window,
                                         pointer_location,
                                         event.time_msec(),
                                     ) {
@@ -334,17 +331,12 @@ impl Yawc {
                                     }
 
                                     self.last_titlebar_click = Some(TitlebarClick {
-                                        surface: hit
-                                            .window
-                                            .toplevel()
-                                            .unwrap()
-                                            .wl_surface()
-                                            .clone(),
+                                        window: hit.window.clone(),
                                         time_msec: event.time_msec(),
                                         location: pointer_location,
                                     });
 
-                                    if self.windows.is_maximized(&surface) {
+                                    if self.windows.is_window_maximized(&hit.window) {
                                         pointer.frame(self);
                                         return;
                                     }
@@ -417,6 +409,23 @@ impl Yawc {
                                 let initial_window_location =
                                     self.space.element_location(&hit.window).unwrap();
                                 let initial_window_size = hit.window.geometry().size;
+                                #[cfg(feature = "xwayland")]
+                                if let Some(surface) = hit.window.x11_surface().cloned() {
+                                    let grab = crate::grabs::X11ResizeSurfaceGrab::start(
+                                        start_data,
+                                        hit.window.clone(),
+                                        surface,
+                                        edges,
+                                        Rectangle::new(
+                                            initial_window_location,
+                                            initial_window_size,
+                                        ),
+                                    );
+                                    pointer.set_grab(self, grab, serial, Focus::Clear);
+                                    pointer.frame(self);
+                                    return;
+                                }
+
                                 let grab = ResizeSurfaceGrab::start(
                                     start_data,
                                     hit.window.clone(),
@@ -454,16 +463,17 @@ impl Yawc {
                         self.titlebar_right_press = None;
                         self.space.raise_element(&window, true);
 
-                        let surface = window.toplevel().unwrap().wl_surface().clone();
-                        self.windows.activate(&surface);
-                        keyboard.set_focus(self, Some(surface), serial);
+                        self.windows.activate_window(&window);
+                        if let Some(target) = self.focus_target_for_window(&window) {
+                            keyboard.set_focus(self, Some(target), serial);
+                        }
                         self.send_pending_configures();
                     } else {
                         self.windows.clear_decoration_pressed();
                         self.windows.clear_titlebar_close_pressed();
                         self.titlebar_right_press = None;
                         self.windows.clear_focus();
-                        keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+                        keyboard.set_focus(self, Option::<FocusTarget>::None, serial);
                         self.send_pending_configures();
                     }
                 }

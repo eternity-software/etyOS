@@ -16,7 +16,7 @@ use smithay::{
     wayland::{compositor, shell::xdg::SurfaceCachedState},
 };
 
-use crate::{state::Yawc, window::ResizeEdge};
+use crate::{focus::FocusTarget, state::Yawc, window::ResizeEdge};
 
 pub struct ResizeSurfaceGrab {
     start_data: PointerGrabStartData<Yawc>,
@@ -55,7 +55,7 @@ impl PointerGrab<Yawc> for ResizeSurfaceGrab {
         &mut self,
         data: &mut Yawc,
         handle: &mut PointerInnerHandle<'_, Yawc>,
-        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        _focus: Option<(FocusTarget, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
         handle.motion(data, None, event);
@@ -115,7 +115,7 @@ impl PointerGrab<Yawc> for ResizeSurfaceGrab {
         &mut self,
         data: &mut Yawc,
         handle: &mut PointerInnerHandle<'_, Yawc>,
-        focus: Option<(WlSurface, Point<f64, Logical>)>,
+        focus: Option<(FocusTarget, Point<f64, Logical>)>,
         event: &RelativeMotionEvent,
     ) {
         handle.relative_motion(data, focus, event);
@@ -293,7 +293,12 @@ impl ResizeSurfaceState {
 pub fn handle_commit(space: &mut Space<Window>, surface: &WlSurface) -> Option<()> {
     let window = space
         .elements()
-        .find(|window| window.toplevel().unwrap().wl_surface() == surface)
+        .find(|window| {
+            window
+                .toplevel()
+                .map(|toplevel| toplevel.wl_surface() == surface)
+                .unwrap_or(false)
+        })
         .cloned()?;
 
     let mut window_loc = space.element_location(&window)?;
