@@ -1,0 +1,14 @@
+{
+  "name": "nirvana",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Nirvana UI engine for etyOS system applets",
+  "main": "src/main/main.js",
+  "scripts": {
+    "dev": "./scripts/run-electron.sh",
+    "start": "./scripts/run-electron.sh"
+  },
+  "devDependencies": {
+    "electron": "^37.2.0"
+  }
+}

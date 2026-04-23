@@ -1,0 +1,10 @@
+{
+  "applets": [
+    {
+      "id": "uikit-showcase",
+      "manifestPath": "applets/uikit-showcase/Cargo.toml",
+      "packageName": "uikit-showcase",
+      "rendererAppletId": "component-showcase"
+    }
+  ]
+}
