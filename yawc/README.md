@@ -39,6 +39,7 @@ The design favors direct Wayland/Smithay integration over borrowing behavior fro
 - move, resize, maximize, snap, restore, minimize, fullscreen, close, and force-kill handling
 - close, minimize, and maximize SSD button handling in classic button mode
 - buttonless gesture mode: right-click titlebar to close and double-click titlebar to maximize/restore
+- overview mode on `Super` for scaled window selection
 - live-reloaded configurable compositor hotkeys
 - default window hotkeys: `Super+Up`, `Super+Left`, `Super+Right`, `Super+W`, `Super+Q`, `Ctrl+Alt+F`, `Ctrl+Alt+M`
 - keyboard layout switching with `Alt+Shift`
@@ -316,7 +317,7 @@ screencopy_dmabuf = false
 ```
 
 Pressing the same snap binding again restores the window to the position and size it had before snapping.
-`Super+Up` toggles maximize/restore. `Super+W` asks the focused client to close. `Super+Q` force-kills the process associated with the focused window.
+`Super` toggles overview mode for scaled window selection. In overview mode, click a window or use arrow keys and `Enter` to switch focus. `Super+Up` toggles maximize/restore. `Super+W` asks the focused client to close. `Super+Q` force-kills the process associated with the focused window.
 
 Supported modifiers are `Super`, `Ctrl`, `Alt`, and `Shift`. Supported keys are `Up`, `Down`, `Left`, `Right`, `F`, `M`, `Q`, and `W`. Set a binding to `none` to disable it.
 
@@ -334,6 +335,7 @@ Useful session overrides:
 ```bash
 YAWC_STARTUP_COMMAND=foot yawc-session
 YAWC_DRM_LEGACY=1 yawc-session
+YAWC_DRM_RESET_BUFFERS_EACH_FRAME=0 yawc-session
 YAWC_GPU_VENDOR=nvidia yawc-session
 YAWC_DISABLE_CLIENT_DMABUF=1 yawc-session
 YAWC_SKIP_PORTAL_CONFIG=1 yawc-session
@@ -342,7 +344,7 @@ YAWC_SESSION_LOG=/tmp/yawc-session.log yawc-session
 RUST_LOG=yawc=trace,smithay=debug yawc-session
 ```
 
-YAWC advertises `linux-dmabuf` with default feedback in standalone sessions so native Wayland EGL clients can use GPU buffers. `YAWC_DISABLE_CLIENT_DMABUF=1` is a diagnostic fallback if a driver-specific dmabuf path needs to be bypassed temporarily.
+YAWC advertises `linux-dmabuf` with default feedback in standalone sessions so native Wayland EGL clients can use GPU buffers. `YAWC_DISABLE_CLIENT_DMABUF=1` is a diagnostic fallback if a driver-specific dmabuf path needs to be bypassed temporarily. The standalone backend also resets DRM buffers before each frame by default to avoid intermittent damage-corruption artifacts with custom compositor rendering; set `YAWC_DRM_RESET_BUFFERS_EACH_FRAME=0` only if you deliberately want to test buffer reuse behavior.
 
 To remove the login session entry:
 
@@ -385,6 +387,7 @@ Useful variations:
 ./scripts/start-standalone.sh --command foot
 YAWC_STANDALONE_LOG=/tmp/yawc-standalone.log ./scripts/start-standalone.sh
 YAWC_DRM_LEGACY=0 ./scripts/start-standalone.sh
+YAWC_DRM_RESET_BUFFERS_EACH_FRAME=0 ./scripts/start-standalone.sh
 YAWC_ALLOW_ACTIVE_DESKTOP=1 ./scripts/start-standalone.sh
 ```
 

@@ -44,8 +44,11 @@ use crate::screencopy::CapturedFrame;
 use crate::window::WindowStore;
 use crate::{
     config::WindowControlsMode,
-    state::Yawc,
-    window::{WindowAnimation, WindowFrame, BUTTON_PADDING, FRAME_RADIUS, TITLEBAR_HEIGHT},
+    state::{OverviewWindow, Yawc},
+    window::{
+        GeometryAnimationFrame, WindowAnimation, WindowFrame, BUTTON_PADDING, FRAME_RADIUS,
+        TITLEBAR_HEIGHT,
+    },
 };
 use smithay::backend::renderer::{Bind, Offscreen};
 
@@ -88,12 +91,16 @@ const TOOLTIP_HEIGHT: i32 = 28;
 const BLUR_PAD_X: i32 = 48;
 const BLUR_PAD_Y: i32 = 96;
 const CSD_RADIUS: i32 = 10;
+const OVERVIEW_BACKDROP: (f32, f32, f32, f32) = (0.03, 0.04, 0.05, 0.58);
+const OVERVIEW_OUTLINE_COLOR: (f32, f32, f32, f32) = (0.74, 0.78, 0.82, 1.0);
 const SHADOW_PAD: i32 = 28;
 const SHADOW_OFFSET_Y: i32 = 8;
 const SHADOW_OPACITY: f32 = 0.16;
 const SHADOW_SPREAD: f32 = 18.0;
 const TITLEBAR_SHAPE_MODE: f32 = 0.0;
-const SHADOW_SHAPE_MODE: f32 = 1.0;
+const ROUNDED_SHAPE_MODE: f32 = 1.0;
+const OUTLINE_SHAPE_MODE: f32 = 2.0;
+const SHADOW_SHAPE_MODE: f32 = 3.0;
 const TITLEBAR_BLUR_SHADER: &str = r#"
 //_DEFINES_
 
@@ -339,6 +346,15 @@ void main() {
     float coverage = 1.0;
     if (mode < 0.5) {
         coverage = top_round_alpha(p, area_size, radius);
+    } else if (mode < 1.5) {
+        float dist = rounded_distance(p, vec2(0.0), area_size, radius);
+        coverage = 1.0 - smoothstep(-1.25, 1.25, dist);
+    } else if (mode < 2.5) {
+        float thickness = max(spread, 1.0);
+        vec2 origin = vec2(thickness * 0.5);
+        vec2 size = max(area_size - vec2(thickness), vec2(1.0));
+        float dist = rounded_distance(p, origin, size, max(radius - thickness * 0.5, 0.0));
+        coverage = 1.0 - smoothstep(thickness * 0.5 - 1.0, thickness * 0.5 + 1.0, abs(dist));
     } else {
         vec2 origin = inner_rect.xy;
         vec2 size = inner_rect.zw;
@@ -584,6 +600,7 @@ impl RenderState {
         frames: &[WindowFrame],
         windows: &WindowStore,
         animation_config: crate::config::AnimationConfig,
+        overview_windows: &[OverviewWindow],
         region: Rectangle<i32, Logical>,
         cursor: Option<CaptureCursor>,
     ) -> Result<CapturedFrame, GlesError> {
@@ -595,8 +612,15 @@ impl RenderState {
         let buffer_size = Size::<i32, Buffer>::from((output_size.w, output_size.h));
         let mut target: GlesTexture = renderer.create_buffer(Fourcc::Xrgb8888, buffer_size)?;
         let mut framebuffer = renderer.bind(&mut target)?;
-        let mut scene =
-            self.tty_scene_elements(renderer, space, frames, windows, animation_config, None)?;
+        let mut scene = self.tty_scene_elements(
+            renderer,
+            space,
+            frames,
+            windows,
+            animation_config,
+            overview_windows,
+            None,
+        )?;
         if let Some(cursor) = cursor {
             if let Some(cursor) = capture_cursor_element(renderer, cursor)? {
                 scene.splice(0..0, [cursor]);
@@ -636,6 +660,7 @@ impl RenderState {
         frames: &[WindowFrame],
         windows: &WindowStore,
         animation_config: crate::config::AnimationConfig,
+        overview_windows: &[OverviewWindow],
         region: Rectangle<i32, Logical>,
         target: &mut smithay::backend::allocator::dmabuf::Dmabuf,
         cursor: Option<CaptureCursor>,
@@ -649,8 +674,15 @@ impl RenderState {
             return Err(GlesError::FramebufferBindingError);
         }
 
-        let mut scene =
-            self.tty_scene_elements(renderer, space, frames, windows, animation_config, None)?;
+        let mut scene = self.tty_scene_elements(
+            renderer,
+            space,
+            frames,
+            windows,
+            animation_config,
+            overview_windows,
+            None,
+        )?;
         if let Some(cursor) = cursor {
             if let Some(cursor) = capture_cursor_element(renderer, cursor)? {
                 scene.splice(0..0, [cursor]);
@@ -683,6 +715,7 @@ impl RenderState {
         frames: &[WindowFrame],
         windows: &WindowStore,
         animation_config: crate::config::AnimationConfig,
+        overview_windows: &[OverviewWindow],
         pointer_location: Option<Point<f64, Logical>>,
     ) -> Result<Vec<YawcRenderElements>, GlesError> {
         let mut frame_by_window = HashMap::new();
@@ -696,6 +729,19 @@ impl RenderState {
             .map(|mode| mode.size)
             .unwrap_or_else(|| Size::from((1, 1)));
         let output_geometry = self.output_geometry();
+
+        if !overview_windows.is_empty() {
+            let mut elements =
+                self.overview_elements(renderer, space, frames, overview_windows, output_geometry)?;
+            elements.reverse();
+            elements.extend(desktop_elements(
+                renderer,
+                self.wallpaper_buffer.as_ref(),
+                self.output_location.to_f64(),
+            )?);
+            return Ok(elements);
+        }
+
         let titlebar_shader = self.ensure_titlebar_shader(renderer)?.cloned();
         let mut deco_by_window = self.decoration_elements(renderer, frames)?;
         let mut live_csd_surfaces = HashSet::new();
@@ -1005,6 +1051,7 @@ impl RenderState {
     ) -> Result<(), Box<dyn std::error::Error>> {
         state.reload_config_if_changed();
         state.finish_close_animations();
+        state.finish_overview_animation();
         let animation_config = state.config.animations();
         let controls_mode = state.config.window_controls();
         let pointer_location = state
@@ -1016,6 +1063,7 @@ impl RenderState {
         let all_frames = state
             .windows
             .frames(&state.space, animation_config, controls_mode);
+        let overview_windows = state.overview_windows();
         let mut frame_by_window = HashMap::new();
         for frame in &all_frames {
             frame_by_window.insert(frame.window.clone(), frame.clone());
@@ -1044,236 +1092,267 @@ impl RenderState {
                 let _ = frame.finish()?;
             }
 
-            for window in &windows {
-                let mut step_elements: Vec<YawcRenderElements> = Vec::new();
-                let mut csd_snapshot = None;
+            if !overview_windows.is_empty() {
+                let overview_elements = self.overview_elements(
+                    renderer,
+                    &state.space,
+                    &all_frames,
+                    &overview_windows,
+                    Rectangle::from_size(size.to_logical(1)),
+                )?;
+                if !overview_elements.is_empty() {
+                    let mut frame =
+                        renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                    draw_elements(&mut frame, &overview_elements)?;
+                    let _ = frame.finish()?;
+                }
+            } else {
+                for window in &windows {
+                    let mut step_elements: Vec<YawcRenderElements> = Vec::new();
+                    let mut csd_snapshot = None;
 
-                if let Some(frame_meta) = frame_by_window.get(window) {
-                    if let Some(surface) = window_wl_surface(window) {
-                        let Some(capture) = blur_capture_for_frame(
-                            frame_meta,
-                            Rectangle::from_size(size.to_logical(1)),
-                            BlurOrigin::BottomLeft,
-                        ) else {
+                    if let Some(frame_meta) = frame_by_window.get(window) {
+                        if let Some(surface) = window_wl_surface(window) {
+                            let Some(capture) = blur_capture_for_frame(
+                                frame_meta,
+                                Rectangle::from_size(size.to_logical(1)),
+                                BlurOrigin::BottomLeft,
+                            ) else {
+                                continue;
+                            };
+                            used_blur_surfaces.insert(surface.clone());
+                            let blur_texture = self.ensure_blur_texture(
+                                renderer,
+                                &surface,
+                                capture.capture_w,
+                                capture.capture_h,
+                            )?;
+                            let blur_texture_size = blur_texture.size();
+                            let blur_buffer = TextureBuffer::from_texture(
+                                renderer,
+                                blur_texture.clone(),
+                                1,
+                                Transform::Normal,
+                                None,
+                            );
+                            let blur_payload = titlebar_shader.as_ref().map(|shader| {
+                                let capture_rect = Rectangle::new(
+                                    capture.dst_loc,
+                                    (capture.dst_w, capture.dst_h).into(),
+                                );
+                                let (blur_loc, blur_size) = animated_rect(
+                                    capture_rect,
+                                    Some(frame_meta.frame),
+                                    decoration_animation_for_frame(frame_meta),
+                                );
+                                (
+                                    blur_texture,
+                                    YawcRenderElements::from(TextureShaderElement::new(
+                                        TextureRenderElement::from_texture_buffer(
+                                            blur_loc,
+                                            &blur_buffer,
+                                            Some(decoration_animation_for_frame(frame_meta).alpha),
+                                            Some(Rectangle::new(
+                                                (capture.src_x as f64, capture.src_y as f64).into(),
+                                                (capture.dst_w as f64, capture.dst_h as f64).into(),
+                                            )),
+                                            Some(blur_size),
+                                            Kind::Unspecified,
+                                        ),
+                                        shader.clone(),
+                                        titlebar_shader_uniforms(
+                                            blur_size.w,
+                                            blur_size.h,
+                                            blur_texture_size.w,
+                                            blur_texture_size.h,
+                                            capture.src_x,
+                                            capture.src_y,
+                                            capture.flip_y,
+                                        ),
+                                    )),
+                                    frame_meta.clone(),
+                                    capture,
+                                )
+                            });
+
+                            if let Some(deco) = deco_by_window.remove(window) {
+                                if !frame_meta.maximized
+                                    && !frame_meta.fullscreen
+                                    && !frame_meta.resizing
+                                {
+                                    if let Some(shadow) = self.shadow_element(
+                                        renderer,
+                                        frame_meta.frame,
+                                        FRAME_RADIUS,
+                                        Some(frame_meta.frame),
+                                        frame_meta.animation,
+                                    )? {
+                                        step_elements.push(shadow);
+                                    }
+                                }
+                                if let Some(fill) =
+                                    self.titlebar_fill_element(renderer, frame_meta)?
+                                {
+                                    step_elements.push(fill);
+                                }
+                                step_elements.extend(deco);
+                            }
+
+                            if let Some(loc) = state.space.element_location(window) {
+                                let render_loc = Point::<i32, Logical>::from((
+                                    loc.x - window.geometry().loc.x,
+                                    loc.y - window.geometry().loc.y,
+                                ));
+                                let phys_loc =
+                                    Point::<i32, Physical>::from((render_loc.x, render_loc.y));
+                                let surf = window.render_elements(
+                                    renderer,
+                                    phys_loc,
+                                    RendererScale::from(1.0),
+                                    1.0,
+                                );
+                                step_elements.extend(
+                                    self.client_surface_elements(renderer, frame_meta, surf)?,
+                                );
+                                step_elements.extend(
+                                    window_popup_elements(renderer, window, phys_loc)
+                                        .into_iter()
+                                        .map(YawcRenderElements::from),
+                                );
+                            }
+
+                            let mut frame =
+                                renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                            if let Some((blur_texture, blur_element, blur_frame_meta, capture)) =
+                                blur_payload.as_ref()
+                            {
+                                self.capture_blur_texture(
+                                    &mut frame,
+                                    blur_texture,
+                                    blur_frame_meta,
+                                    *capture,
+                                )?;
+                                draw_elements(&mut frame, std::slice::from_ref(blur_element))?;
+                            }
+                            draw_elements(&mut frame, &step_elements)?;
+                            let _ = frame.finish()?;
                             continue;
-                        };
-                        used_blur_surfaces.insert(surface.clone());
-                        let blur_texture = self.ensure_blur_texture(
+                        }
+                    }
+
+                    if let Some(loc) = state.space.element_location(window) {
+                        let render_loc = Point::<i32, Logical>::from((
+                            loc.x - window.geometry().loc.x,
+                            loc.y - window.geometry().loc.y,
+                        ));
+                        let frame_meta = frame_by_window.get(window);
+                        let animation = frame_meta
+                            .map(|frame| frame.animation)
+                            .or_else(|| {
+                                window.toplevel().map(|toplevel| {
+                                    state
+                                        .windows
+                                        .animation(toplevel.wl_surface(), animation_config)
+                                })
+                            })
+                            .unwrap_or_default();
+                        let anchor = animation_anchor(&state.space, window, frame_meta);
+                        let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
+                        let surf: Vec<
+                            SpaceRenderElements<
+                                GlesRenderer,
+                                WaylandSurfaceRenderElement<GlesRenderer>,
+                            >,
+                        > = window.render_elements(
+                            renderer,
+                            phys_loc,
+                            RendererScale::from(1.0),
+                            1.0,
+                        );
+                        if window.toplevel().is_some() {
+                            if let Some(frame_meta) = frame_meta {
+                                step_elements.extend(
+                                    self.client_surface_elements(renderer, frame_meta, surf)?,
+                                );
+                            } else {
+                                let has_csd_surface = !surf.is_empty();
+                                let csd_rect = csd_visual_rect(window, render_loc);
+                                let tiled = window
+                                    .toplevel()
+                                    .map(|toplevel| {
+                                        state.windows.is_fullscreen(toplevel.wl_surface())
+                                            || state.windows.is_maximized(toplevel.wl_surface())
+                                    })
+                                    .unwrap_or(false);
+                                let resizing = window
+                                    .toplevel()
+                                    .map(|toplevel| {
+                                        state.windows.is_resizing(toplevel.wl_surface())
+                                    })
+                                    .unwrap_or(false);
+                                if !tiled && !resizing {
+                                    if let Some(shadow) = self.shadow_element(
+                                        renderer, csd_rect, CSD_RADIUS, anchor, animation,
+                                    )? {
+                                        step_elements.push(shadow);
+                                    }
+                                }
+                                step_elements.extend(self.csd_surface_elements(
+                                    renderer, csd_rect, surf, anchor, animation,
+                                )?);
+                                if has_csd_surface {
+                                    if let Some(toplevel) = window.toplevel() {
+                                        csd_snapshot =
+                                            Some((toplevel.wl_surface().clone(), csd_rect));
+                                    }
+                                } else if let Some(toplevel) = window.toplevel() {
+                                    live_csd_surfaces.insert(toplevel.wl_surface().clone());
+                                }
+                            }
+                        } else {
+                            step_elements.extend(surf.into_iter().map(YawcRenderElements::from));
+                        }
+                    }
+
+                    if let Some((surface, rect)) = csd_snapshot {
+                        live_csd_surfaces.insert(surface.clone());
+                        self.update_csd_snapshot(
                             renderer,
                             &surface,
-                            capture.capture_w,
-                            capture.capture_h,
+                            size,
+                            (0, 0).into(),
+                            rect,
+                            &step_elements,
                         )?;
-                        let blur_texture_size = blur_texture.size();
-                        let blur_buffer = TextureBuffer::from_texture(
-                            renderer,
-                            blur_texture.clone(),
-                            1,
-                            Transform::Normal,
-                            None,
-                        );
-                        let blur_payload = titlebar_shader.as_ref().map(|shader| {
-                            let capture_rect = Rectangle::new(
-                                capture.dst_loc,
-                                (capture.dst_w, capture.dst_h).into(),
-                            );
-                            let (blur_loc, blur_size) = animated_rect(
-                                capture_rect,
-                                Some(frame_meta.frame),
-                                decoration_animation_for_frame(frame_meta),
-                            );
-                            (
-                                blur_texture,
-                                YawcRenderElements::from(TextureShaderElement::new(
-                                    TextureRenderElement::from_texture_buffer(
-                                        blur_loc,
-                                        &blur_buffer,
-                                        Some(decoration_animation_for_frame(frame_meta).alpha),
-                                        Some(Rectangle::new(
-                                            (capture.src_x as f64, capture.src_y as f64).into(),
-                                            (capture.dst_w as f64, capture.dst_h as f64).into(),
-                                        )),
-                                        Some(blur_size),
-                                        Kind::Unspecified,
-                                    ),
-                                    shader.clone(),
-                                    titlebar_shader_uniforms(
-                                        blur_size.w,
-                                        blur_size.h,
-                                        blur_texture_size.w,
-                                        blur_texture_size.h,
-                                        capture.src_x,
-                                        capture.src_y,
-                                        capture.flip_y,
-                                    ),
-                                )),
-                                frame_meta.clone(),
-                                capture,
-                            )
-                        });
-
-                        if let Some(deco) = deco_by_window.remove(window) {
-                            if !frame_meta.maximized
-                                && !frame_meta.fullscreen
-                                && !frame_meta.resizing
-                            {
-                                if let Some(shadow) = self.shadow_element(
-                                    renderer,
-                                    frame_meta.frame,
-                                    FRAME_RADIUS,
-                                    Some(frame_meta.frame),
-                                    frame_meta.animation,
-                                )? {
-                                    step_elements.push(shadow);
-                                }
-                            }
-                            if let Some(fill) = self.titlebar_fill_element(renderer, frame_meta)? {
-                                step_elements.push(fill);
-                            }
-                            step_elements.extend(deco);
-                        }
-
-                        if let Some(loc) = state.space.element_location(window) {
-                            let render_loc = Point::<i32, Logical>::from((
-                                loc.x - window.geometry().loc.x,
-                                loc.y - window.geometry().loc.y,
-                            ));
-                            let phys_loc =
-                                Point::<i32, Physical>::from((render_loc.x, render_loc.y));
-                            let surf = window.render_elements(
-                                renderer,
-                                phys_loc,
-                                RendererScale::from(1.0),
-                                1.0,
-                            );
-                            step_elements
-                                .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
-                            step_elements.extend(
-                                window_popup_elements(renderer, window, phys_loc)
-                                    .into_iter()
-                                    .map(YawcRenderElements::from),
-                            );
-                        }
-
-                        let mut frame =
-                            renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
-                        if let Some((blur_texture, blur_element, blur_frame_meta, capture)) =
-                            blur_payload.as_ref()
-                        {
-                            self.capture_blur_texture(
-                                &mut frame,
-                                blur_texture,
-                                blur_frame_meta,
-                                *capture,
-                            )?;
-                            draw_elements(&mut frame, std::slice::from_ref(blur_element))?;
-                        }
-                        draw_elements(&mut frame, &step_elements)?;
-                        let _ = frame.finish()?;
-                        continue;
                     }
+
+                    let mut frame =
+                        renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                    draw_elements(&mut frame, &step_elements)?;
+                    let _ = frame.finish()?;
                 }
 
-                if let Some(loc) = state.space.element_location(window) {
-                    let render_loc = Point::<i32, Logical>::from((
-                        loc.x - window.geometry().loc.x,
-                        loc.y - window.geometry().loc.y,
-                    ));
-                    let frame_meta = frame_by_window.get(window);
-                    let animation = frame_meta
-                        .map(|frame| frame.animation)
-                        .or_else(|| {
-                            window.toplevel().map(|toplevel| {
-                                state
-                                    .windows
-                                    .animation(toplevel.wl_surface(), animation_config)
-                            })
-                        })
-                        .unwrap_or_default();
-                    let anchor = animation_anchor(&state.space, window, frame_meta);
-                    let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
-                    let surf: Vec<
-                        SpaceRenderElements<
-                            GlesRenderer,
-                            WaylandSurfaceRenderElement<GlesRenderer>,
-                        >,
-                    > = window.render_elements(renderer, phys_loc, RendererScale::from(1.0), 1.0);
-                    if window.toplevel().is_some() {
-                        if let Some(frame_meta) = frame_meta {
-                            step_elements
-                                .extend(self.client_surface_elements(renderer, frame_meta, surf)?);
-                        } else {
-                            let has_csd_surface = !surf.is_empty();
-                            let csd_rect = csd_visual_rect(window, render_loc);
-                            let tiled = window
-                                .toplevel()
-                                .map(|toplevel| {
-                                    state.windows.is_fullscreen(toplevel.wl_surface())
-                                        || state.windows.is_maximized(toplevel.wl_surface())
-                                })
-                                .unwrap_or(false);
-                            let resizing = window
-                                .toplevel()
-                                .map(|toplevel| state.windows.is_resizing(toplevel.wl_surface()))
-                                .unwrap_or(false);
-                            if !tiled && !resizing {
-                                if let Some(shadow) = self.shadow_element(
-                                    renderer, csd_rect, CSD_RADIUS, anchor, animation,
-                                )? {
-                                    step_elements.push(shadow);
-                                }
-                            }
-                            step_elements.extend(self.csd_surface_elements(
-                                renderer, csd_rect, surf, anchor, animation,
-                            )?);
-                            if has_csd_surface {
-                                if let Some(toplevel) = window.toplevel() {
-                                    csd_snapshot = Some((toplevel.wl_surface().clone(), csd_rect));
-                                }
-                            } else if let Some(toplevel) = window.toplevel() {
-                                live_csd_surfaces.insert(toplevel.wl_surface().clone());
-                            }
-                        }
-                    } else {
-                        step_elements.extend(surf.into_iter().map(YawcRenderElements::from));
-                    }
+                let destroyed = state.windows.destroyed_close_animations(animation_config);
+                let ghost_elements = self.csd_snapshot_elements(renderer, &destroyed);
+                if !ghost_elements.is_empty() {
+                    let mut frame =
+                        renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                    draw_elements(&mut frame, &ghost_elements)?;
+                    let _ = frame.finish()?;
                 }
+                self.retain_csd_snapshots(&live_csd_surfaces, &destroyed);
 
-                if let Some((surface, rect)) = csd_snapshot {
-                    live_csd_surfaces.insert(surface.clone());
-                    self.update_csd_snapshot(
-                        renderer,
-                        &surface,
-                        size,
-                        (0, 0).into(),
-                        rect,
-                        &step_elements,
-                    )?;
+                if let Some(tooltip) = self.legacy_tooltip_element(
+                    renderer,
+                    &all_frames,
+                    pointer_location,
+                    Rectangle::from_size(size.to_logical(1)),
+                )? {
+                    let mut frame =
+                        renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                    draw_elements(&mut frame, &[tooltip])?;
+                    let _ = frame.finish()?;
                 }
-
-                let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
-                draw_elements(&mut frame, &step_elements)?;
-                let _ = frame.finish()?;
-            }
-
-            let destroyed = state.windows.destroyed_close_animations(animation_config);
-            let ghost_elements = self.csd_snapshot_elements(renderer, &destroyed);
-            if !ghost_elements.is_empty() {
-                let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
-                draw_elements(&mut frame, &ghost_elements)?;
-                let _ = frame.finish()?;
-            }
-            self.retain_csd_snapshots(&live_csd_surfaces, &destroyed);
-
-            if let Some(tooltip) = self.legacy_tooltip_element(
-                renderer,
-                &all_frames,
-                pointer_location,
-                Rectangle::from_size(size.to_logical(1)),
-            )? {
-                let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
-                draw_elements(&mut frame, &[tooltip])?;
-                let _ = frame.finish()?;
             }
 
             let dnd_icon = dnd_icon_elements(renderer, state.dnd_icon.as_ref(), pointer_location);
@@ -1748,6 +1827,194 @@ impl RenderState {
                 Kind::Unspecified,
             )?,
         )))
+    }
+
+    fn overview_elements(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        space: &Space<Window>,
+        frames: &[WindowFrame],
+        overview_windows: &[OverviewWindow],
+        output_geometry: Rectangle<i32, Logical>,
+    ) -> Result<Vec<YawcRenderElements>, GlesError> {
+        let mut elements = Vec::new();
+        let progress = overview_windows
+            .first()
+            .map(|item| item.progress as f32)
+            .unwrap_or(1.0);
+        if let Some(backdrop) =
+            self.solid_shape_element(renderer, output_geometry, OVERVIEW_BACKDROP, 0, progress)?
+        {
+            elements.push(backdrop);
+        }
+
+        let mut overview_frames = Vec::new();
+        for item in overview_windows {
+            if let Some(frame) = frames.iter().find(|frame| frame.window == item.window) {
+                let mut frame = frame.clone();
+                frame.animation = overview_animation(item.source, item.target, item.progress);
+                overview_frames.push(frame);
+            }
+        }
+
+        let mut frame_by_window = HashMap::new();
+        for frame in &overview_frames {
+            frame_by_window.insert(frame.window.clone(), frame.clone());
+        }
+        let mut deco_by_window = self.decoration_elements(renderer, &overview_frames)?;
+        let order = space
+            .elements()
+            .enumerate()
+            .map(|(index, window)| (window.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let mut ordered_items = overview_windows.iter().collect::<Vec<_>>();
+        ordered_items.sort_by_key(|item| order.get(&item.window).copied().unwrap_or(usize::MAX));
+
+        for item in ordered_items {
+            let current_rect = interpolated_rect(item.source, item.target, item.progress);
+            let animation = overview_animation(item.source, item.target, item.progress);
+
+            if let Some(shadow) = self.shadow_element(
+                renderer,
+                current_rect,
+                CSD_RADIUS,
+                Some(current_rect),
+                WindowAnimation::default(),
+            )? {
+                elements.push(shadow);
+            }
+
+            if item.selection_alpha > 0.01 {
+                let has_server_frame = frame_by_window.contains_key(&item.window);
+                let card_pad = 3;
+                let card_rect = Rectangle::new(
+                    (current_rect.loc.x - card_pad, current_rect.loc.y - card_pad).into(),
+                    (
+                        current_rect.size.w + card_pad * 2,
+                        current_rect.size.h + card_pad * 2,
+                    )
+                        .into(),
+                );
+                if let Some(card) = self.outline_shape_element(
+                    renderer,
+                    card_rect,
+                    OVERVIEW_OUTLINE_COLOR,
+                    overview_outline_radius(has_server_frame, card_pad),
+                    2.0,
+                    item.selection_alpha * item.progress as f32,
+                )? {
+                    elements.push(card);
+                }
+            }
+
+            let Some(loc) = space.element_location(&item.window) else {
+                continue;
+            };
+            let render_loc = Point::<i32, Logical>::from((
+                loc.x - item.window.geometry().loc.x,
+                loc.y - item.window.geometry().loc.y,
+            ));
+            let phys_loc = Point::<i32, Physical>::from((render_loc.x, render_loc.y));
+
+            if let Some(frame_meta) = frame_by_window.get(&item.window) {
+                if let Some(fill) = self.titlebar_fill_element(renderer, frame_meta)? {
+                    elements.push(fill);
+                }
+                let surf =
+                    item.window
+                        .render_elements(renderer, phys_loc, RendererScale::from(1.0), 1.0);
+                elements.extend(self.client_surface_elements(renderer, frame_meta, surf)?);
+                if let Some(deco) = deco_by_window.remove(&item.window) {
+                    elements.extend(deco);
+                }
+            } else {
+                let surf: Vec<
+                    SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+                > = item
+                    .window
+                    .render_elements(renderer, phys_loc, RendererScale::from(1.0), 1.0);
+                elements.extend(self.csd_surface_elements(
+                    renderer,
+                    item.source,
+                    surf,
+                    Some(item.source),
+                    animation,
+                )?);
+            }
+        }
+
+        Ok(elements)
+    }
+
+    fn solid_shape_element(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        rect: Rectangle<i32, Logical>,
+        color: (f32, f32, f32, f32),
+        radius: i32,
+        alpha: f32,
+    ) -> Result<Option<YawcRenderElements>, GlesError> {
+        if rect.size.w <= 0 || rect.size.h <= 0 {
+            return Ok(None);
+        }
+
+        let Some(program) = self.ensure_shape_shader(renderer)?.cloned() else {
+            return Ok(None);
+        };
+        let texture = self.ensure_shape_texture(renderer)?;
+        Ok(Some(YawcRenderElements::from(ShapeElement::new(
+            texture,
+            program,
+            Point::<i32, Physical>::from((rect.loc.x, rect.loc.y)),
+            Size::<i32, Physical>::from((rect.size.w.max(1), rect.size.h.max(1))),
+            color,
+            (
+                0.0,
+                0.0,
+                rect.size.w.max(1) as f32,
+                rect.size.h.max(1) as f32,
+            ),
+            radius.max(0) as f32,
+            ROUNDED_SHAPE_MODE,
+            1.0,
+            alpha,
+        ))))
+    }
+
+    fn outline_shape_element(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        rect: Rectangle<i32, Logical>,
+        color: (f32, f32, f32, f32),
+        radius: i32,
+        thickness: f32,
+        alpha: f32,
+    ) -> Result<Option<YawcRenderElements>, GlesError> {
+        if rect.size.w <= 0 || rect.size.h <= 0 || alpha <= 0.0 {
+            return Ok(None);
+        }
+
+        let Some(program) = self.ensure_shape_shader(renderer)?.cloned() else {
+            return Ok(None);
+        };
+        let texture = self.ensure_shape_texture(renderer)?;
+        Ok(Some(YawcRenderElements::from(ShapeElement::new(
+            texture,
+            program,
+            Point::<i32, Physical>::from((rect.loc.x, rect.loc.y)),
+            Size::<i32, Physical>::from((rect.size.w.max(1), rect.size.h.max(1))),
+            color,
+            (
+                0.0,
+                0.0,
+                rect.size.w.max(1) as f32,
+                rect.size.h.max(1) as f32,
+            ),
+            radius.max(0) as f32,
+            OUTLINE_SHAPE_MODE,
+            thickness.max(1.0),
+            alpha,
+        ))))
     }
 
     fn shadow_element(
@@ -2767,18 +3034,30 @@ fn capture_cursor_element(
 fn csd_visual_rect(window: &Window, render_loc: Point<i32, Logical>) -> Rectangle<i32, Logical> {
     let bbox = window.bbox();
     let geometry = window.geometry();
-    let size = if bbox.size.w > 0 && bbox.size.h > 0 {
-        bbox.size
-    } else if geometry.size.w > 0 && geometry.size.h > 0 {
-        geometry.size
-    } else {
-        (1, 1).into()
-    };
+    if window.toplevel().is_some() {
+        return Rectangle::new(
+            render_loc + geometry.loc,
+            non_empty_render_size(geometry.size, bbox.size),
+        );
+    }
 
     Rectangle::new(
-        (render_loc.x + bbox.loc.x, render_loc.y + bbox.loc.y).into(),
-        size,
+        render_loc + geometry.loc + bbox.loc,
+        non_empty_render_size(bbox.size, geometry.size),
     )
+}
+
+fn non_empty_render_size(
+    preferred: Size<i32, Logical>,
+    fallback: Size<i32, Logical>,
+) -> Size<i32, Logical> {
+    if preferred.w > 0 && preferred.h > 0 {
+        preferred
+    } else if fallback.w > 0 && fallback.h > 0 {
+        fallback
+    } else {
+        (1, 1).into()
+    }
 }
 
 pub fn dnd_icon_elements(
@@ -3369,14 +3648,18 @@ fn animation_anchor(
     }
 
     let loc = space.element_location(window)?;
-    let render_loc = Point::<i32, Logical>::from((
-        loc.x - window.geometry().loc.x,
-        loc.y - window.geometry().loc.y,
-    ));
+    let geometry = window.geometry();
     let bbox = window.bbox();
+    if window.toplevel().is_some() {
+        return Some(Rectangle::new(
+            loc,
+            non_empty_render_size(geometry.size, bbox.size),
+        ));
+    }
+
     Some(Rectangle::new(
-        (render_loc.x + bbox.loc.x, render_loc.y + bbox.loc.y).into(),
-        bbox.size,
+        loc + bbox.loc,
+        non_empty_render_size(bbox.size, geometry.size),
     ))
 }
 
@@ -3394,6 +3677,30 @@ fn animated_surface_elements(
             surface => YawcRenderElements::from(surface),
         })
         .collect()
+}
+
+fn overview_animation(
+    source: Rectangle<i32, Logical>,
+    target: Rectangle<i32, Logical>,
+    progress: f64,
+) -> WindowAnimation {
+    WindowAnimation {
+        alpha: 1.0,
+        scale: 1.0,
+        geometry: Some(GeometryAnimationFrame {
+            from: source,
+            to: target,
+            progress,
+        }),
+    }
+}
+
+fn overview_outline_radius(has_server_frame: bool, pad: i32) -> i32 {
+    if has_server_frame {
+        FRAME_RADIUS + pad
+    } else {
+        CSD_RADIUS
+    }
 }
 
 fn animated_point(

@@ -4,7 +4,7 @@ use smithay::{
         KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     input::{
-        keyboard::FilterResult,
+        keyboard::{keysyms, FilterResult},
         pointer::{
             AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent,
         },
@@ -60,6 +60,10 @@ fn set_cursor_override(state: &mut Yawc, cursor: Option<CursorShape>) {
     state.pending_cursor = cursor.unwrap_or(CursorShape::Default);
 }
 
+fn is_super_key(key: u32) -> bool {
+    matches!(key, keysyms::KEY_Super_L | keysyms::KEY_Super_R)
+}
+
 fn titlebar_double_click(
     previous: Option<&TitlebarClick>,
     window: &smithay::desktop::Window,
@@ -96,10 +100,6 @@ impl Yawc {
                     serial,
                     time,
                     |state, modifiers, keysym| {
-                        if !pressed {
-                            return FilterResult::Forward;
-                        }
-
                         let Some(key) = keysym
                             .raw_latin_sym_or_raw_current_sym()
                             .map(|sym| sym.raw())
@@ -108,6 +108,57 @@ impl Yawc {
                         };
 
                         state.reload_config_if_changed();
+
+                        if is_super_key(key) {
+                            if pressed {
+                                state.super_overview_armed = true;
+                                return FilterResult::Intercept(());
+                            }
+                            if state.super_overview_armed {
+                                if state.overview_active {
+                                    state.activate_overview_selection(serial);
+                                } else {
+                                    state.toggle_overview();
+                                }
+                            }
+                            state.super_overview_armed = false;
+                            return FilterResult::Intercept(());
+                        }
+
+                        if !pressed {
+                            return FilterResult::Forward;
+                        }
+                        state.super_overview_armed = false;
+
+                        if state.overview_active {
+                            if key == keysyms::KEY_Escape {
+                                state.set_overview_active(false);
+                                return FilterResult::Intercept(());
+                            }
+                            if key == keysyms::KEY_Return || key == keysyms::KEY_KP_Enter {
+                                state.activate_overview_selection(serial);
+                                return FilterResult::Intercept(());
+                            }
+                            if key == keysyms::KEY_Left {
+                                state.move_overview_selection(-1, 0);
+                                return FilterResult::Intercept(());
+                            }
+                            if key == keysyms::KEY_Right {
+                                state.move_overview_selection(1, 0);
+                                return FilterResult::Intercept(());
+                            }
+                            if key == keysyms::KEY_Up {
+                                state.move_overview_selection(0, -1);
+                                return FilterResult::Intercept(());
+                            }
+                            if key == keysyms::KEY_Down {
+                                state.move_overview_selection(0, 1);
+                                return FilterResult::Intercept(());
+                            }
+
+                            state.set_overview_active(false);
+                        }
+
                         if state
                             .config
                             .modifier_hotkey_action(key, *modifiers)
@@ -170,6 +221,22 @@ impl Yawc {
 
                 let serial = SERIAL_COUNTER.next_serial();
                 let controls_mode = self.config.window_controls();
+                if self.overview_active {
+                    self.set_overview_selection_at(location);
+                    pointer.motion(
+                        self,
+                        None,
+                        &MotionEvent {
+                            location,
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(self);
+                    set_cursor_override(self, Some(CursorShape::Default));
+                    return;
+                }
+
                 let decoration_hit =
                     self.windows
                         .decoration_hit_at(&self.space, location, controls_mode);
@@ -203,6 +270,22 @@ impl Yawc {
                 let serial = SERIAL_COUNTER.next_serial();
                 let pointer = self.seat.get_pointer().unwrap();
                 let controls_mode = self.config.window_controls();
+                if self.overview_active {
+                    self.set_overview_selection_at(location);
+                    pointer.motion(
+                        self,
+                        None,
+                        &MotionEvent {
+                            location,
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(self);
+                    set_cursor_override(self, Some(CursorShape::Default));
+                    return;
+                }
+
                 let decoration_hit =
                     self.windows
                         .decoration_hit_at(&self.space, location, controls_mode);
@@ -235,6 +318,23 @@ impl Yawc {
                 let button_state = event.state();
                 let controls_mode = self.config.window_controls();
                 let pointer_location = pointer.current_location();
+
+                if self.overview_active {
+                    if ButtonState::Released == button_state {
+                        if button == BTN_LEFT {
+                            if let Some(window) = self.overview_window_at(pointer_location) {
+                                self.select_overview_window(window);
+                                self.activate_overview_selection(serial);
+                            } else {
+                                self.set_overview_active(false);
+                            }
+                        } else if button == BTN_RIGHT {
+                            self.set_overview_active(false);
+                        }
+                    }
+                    pointer.frame(self);
+                    return;
+                }
 
                 if ButtonState::Released == button_state {
                     if button == BTN_RIGHT {
@@ -501,6 +601,10 @@ impl Yawc {
                 }
             }
             InputEvent::PointerAxis { event, .. } => {
+                if self.overview_active {
+                    return;
+                }
+
                 let source = event.source();
                 let horizontal_amount = event.amount(Axis::Horizontal).unwrap_or_else(|| {
                     event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0

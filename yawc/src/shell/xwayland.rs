@@ -268,6 +268,7 @@ impl XwmHandler for CalloopData {
         geometry: Rectangle<i32, Logical>,
         _above: Option<smithay::xwayland::xwm::X11Window>,
     ) {
+        self.state.windows.set_x11_metadata(&surface);
         if let Some(window) = self.state.windows.x11_window(&surface) {
             self.state.space.map_element(window, geometry.loc, false);
             self.state.request_render();

@@ -55,12 +55,31 @@ use crate::{
 };
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(2500);
+const OVERVIEW_ANIMATION_DURATION: Duration = Duration::from_millis(240);
+const OVERVIEW_SELECTION_ANIMATION_DURATION: Duration = Duration::from_millis(120);
 
 #[derive(Clone)]
 pub struct TitlebarClick {
     pub window: Window,
     pub time_msec: u32,
     pub location: Point<f64, Logical>,
+}
+
+#[derive(Clone)]
+pub struct OverviewWindow {
+    pub window: Window,
+    pub source: Rectangle<i32, Logical>,
+    pub target: Rectangle<i32, Logical>,
+    pub active: bool,
+    pub selected: bool,
+    pub selection_alpha: f32,
+    pub progress: f64,
+}
+
+#[derive(Clone)]
+struct OverviewLayoutItem {
+    window: Window,
+    target: Rectangle<i32, Logical>,
 }
 
 pub struct Yawc {
@@ -103,6 +122,17 @@ pub struct Yawc {
     pub titlebar_right_press: Option<Window>,
     pub last_titlebar_click: Option<TitlebarClick>,
     pub snap_memory: HashMap<String, SnapSide>,
+    pub overview_active: bool,
+    pub overview_visible: bool,
+    pub overview_closing: bool,
+    pub overview_started_at: Instant,
+    pub super_overview_armed: bool,
+    overview_layout: Vec<OverviewLayoutItem>,
+    overview_selection: Option<Window>,
+    overview_previous_selection: Option<Window>,
+    overview_hovered: Option<Window>,
+    overview_previous_hovered: Option<Window>,
+    overview_selection_started_at: Instant,
     pub render_requested: bool,
     applied_keyboard_config: Option<KeyboardConfig>,
     shutdown_requested: bool,
@@ -180,6 +210,17 @@ impl Yawc {
             titlebar_right_press: None,
             last_titlebar_click: None,
             snap_memory: HashMap::new(),
+            overview_active: false,
+            overview_visible: false,
+            overview_closing: false,
+            overview_started_at: Instant::now(),
+            super_overview_armed: false,
+            overview_layout: Vec::new(),
+            overview_selection: None,
+            overview_previous_selection: None,
+            overview_hovered: None,
+            overview_previous_hovered: None,
+            overview_selection_started_at: Instant::now(),
             render_requested: true,
             applied_keyboard_config: None,
             shutdown_requested: false,
@@ -318,6 +359,350 @@ impl Yawc {
 
     pub fn take_render_requested(&mut self) -> bool {
         std::mem::take(&mut self.render_requested)
+    }
+
+    pub fn set_overview_active(&mut self, active: bool) {
+        if self.overview_active == active
+            && self.overview_visible == active
+            && !self.overview_closing
+        {
+            return;
+        }
+
+        if active {
+            let layout = self.build_overview_layout(0.0);
+            if layout.is_empty() {
+                return;
+            }
+            self.overview_layout = layout
+                .into_iter()
+                .map(|item| OverviewLayoutItem {
+                    window: item.window,
+                    target: item.target,
+                })
+                .collect();
+            self.overview_selection = self
+                .windows
+                .active_window()
+                .filter(|window| {
+                    self.overview_layout
+                        .iter()
+                        .any(|item| item.window == *window)
+                })
+                .or_else(|| self.overview_layout.first().map(|item| item.window.clone()));
+            self.overview_previous_selection = None;
+            self.overview_hovered = None;
+            self.overview_previous_hovered = None;
+            self.overview_selection_started_at = Instant::now();
+        }
+
+        self.overview_active = active;
+        self.overview_visible = true;
+        self.overview_closing = !active;
+        self.overview_started_at = Instant::now();
+        self.super_overview_armed = false;
+        self.windows.clear_decoration_pressed();
+        self.windows.clear_titlebar_close_pressed();
+        self.titlebar_right_press = None;
+        self.request_render();
+        info!(active, "overview state changed");
+    }
+
+    pub fn toggle_overview(&mut self) {
+        self.set_overview_active(!self.overview_active);
+    }
+
+    pub fn overview_needs_animation_frame(&self) -> bool {
+        self.overview_visible
+            && (self.overview_started_at.elapsed() < OVERVIEW_ANIMATION_DURATION
+                || (self.overview_active
+                    && self.overview_selection_started_at.elapsed()
+                        < OVERVIEW_SELECTION_ANIMATION_DURATION))
+    }
+
+    pub fn finish_overview_animation(&mut self) {
+        if self.overview_closing
+            && self.overview_started_at.elapsed() >= OVERVIEW_ANIMATION_DURATION
+        {
+            self.overview_visible = false;
+            self.overview_closing = false;
+            self.overview_layout.clear();
+            self.overview_selection = None;
+            self.overview_previous_selection = None;
+            self.overview_hovered = None;
+            self.overview_previous_hovered = None;
+            self.request_render();
+        }
+    }
+
+    fn overview_progress(&self) -> f64 {
+        let raw = if OVERVIEW_ANIMATION_DURATION.is_zero() {
+            1.0
+        } else {
+            (self.overview_started_at.elapsed().as_secs_f64()
+                / OVERVIEW_ANIMATION_DURATION.as_secs_f64())
+            .clamp(0.0, 1.0)
+        };
+        let eased = ease_out_cubic(raw);
+        if self.overview_closing {
+            1.0 - eased
+        } else {
+            eased
+        }
+    }
+
+    pub fn overview_windows(&self) -> Vec<OverviewWindow> {
+        if !self.overview_visible {
+            return Vec::new();
+        }
+
+        let progress = self.overview_progress();
+        if !self.overview_layout.is_empty() {
+            let active_window = self.windows.active_window();
+            let mut items = self
+                .overview_layout
+                .iter()
+                .filter(|item| {
+                    !self.windows.is_window_minimized(&item.window)
+                        && !self.windows.is_window_fullscreen(&item.window)
+                        && is_overview_window(&item.window)
+                })
+                .filter_map(|item| {
+                    let source = self.window_visual_rect(&item.window)?;
+                    let active = active_window
+                        .as_ref()
+                        .map(|active| active == &item.window)
+                        .unwrap_or(false);
+                    let selected = self
+                        .overview_selection
+                        .as_ref()
+                        .map(|selected| selected == &item.window)
+                        .unwrap_or(false);
+                    let selection_alpha = self.overview_selection_alpha(&item.window, active);
+                    Some(OverviewWindow {
+                        window: item.window.clone(),
+                        source,
+                        target: item.target,
+                        active,
+                        selected,
+                        selection_alpha,
+                        progress,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if self.overview_closing {
+                self.sort_overview_items_by_space_order(&mut items);
+            }
+            return items;
+        }
+
+        self.build_overview_layout(progress)
+    }
+
+    fn build_overview_layout(&self, progress: f64) -> Vec<OverviewWindow> {
+        let Some(output_geometry) = self.placement_output_geometry(None) else {
+            return Vec::new();
+        };
+
+        let windows = self
+            .space
+            .elements()
+            .filter(|window| {
+                !self.windows.is_window_minimized(window)
+                    && !self.windows.is_window_fullscreen(window)
+                    && is_overview_window(window)
+            })
+            .filter_map(|window| Some((window.clone(), self.window_visual_rect(window)?)))
+            .collect::<Vec<_>>();
+
+        overview_layout(
+            windows,
+            output_geometry,
+            self.windows.active_window(),
+            self.overview_selection.as_ref(),
+            progress,
+        )
+    }
+
+    pub fn overview_window_at(&self, location: Point<f64, Logical>) -> Option<Window> {
+        self.overview_windows()
+            .into_iter()
+            .rev()
+            .find(|item| item.target.to_f64().contains(location))
+            .map(|item| item.window)
+    }
+
+    pub fn set_overview_selection_at(&mut self, location: Point<f64, Logical>) {
+        let hovered = self.overview_window_at(location);
+        self.set_overview_hovered(hovered);
+    }
+
+    pub fn select_overview_window(&mut self, window: Window) {
+        self.set_overview_hovered(None);
+        self.set_overview_selection(Some(window));
+    }
+
+    fn set_overview_selection(&mut self, selection: Option<Window>) {
+        if self.overview_selection == selection {
+            return;
+        }
+        self.overview_previous_selection = self.overview_selection.clone();
+        self.overview_selection = selection;
+        self.overview_selection_started_at = Instant::now();
+        self.request_render();
+    }
+
+    fn set_overview_hovered(&mut self, hovered: Option<Window>) {
+        if self.overview_hovered == hovered {
+            return;
+        }
+        self.overview_previous_hovered = self.overview_hovered.clone();
+        self.overview_hovered = hovered;
+        self.overview_selection_started_at = Instant::now();
+        self.request_render();
+    }
+
+    fn overview_selection_alpha(&self, window: &Window, active: bool) -> f32 {
+        let target = self.overview_window_alpha(
+            window,
+            active,
+            self.overview_selection.as_ref(),
+            self.overview_hovered.as_ref(),
+        );
+        let from = self.overview_window_alpha(
+            window,
+            active,
+            self.overview_previous_selection.as_ref(),
+            self.overview_previous_hovered.as_ref(),
+        );
+        let progress = (self.overview_selection_started_at.elapsed().as_secs_f32()
+            / OVERVIEW_SELECTION_ANIMATION_DURATION.as_secs_f32())
+        .clamp(0.0, 1.0);
+        let eased = ease_out_cubic(progress as f64) as f32;
+        from + (target - from) * eased
+    }
+
+    fn overview_window_alpha(
+        &self,
+        window: &Window,
+        active: bool,
+        selected: Option<&Window>,
+        hovered: Option<&Window>,
+    ) -> f32 {
+        if selected.map(|selected| selected == window).unwrap_or(false)
+            || hovered.map(|hovered| hovered == window).unwrap_or(false)
+        {
+            0.50
+        } else if active {
+            0.30
+        } else {
+            0.0
+        }
+    }
+
+    pub fn activate_overview_selection(&mut self, serial: smithay::utils::Serial) -> bool {
+        let selected = self
+            .overview_selection
+            .clone()
+            .or_else(|| self.windows.active_window())
+            .or_else(|| {
+                self.overview_windows()
+                    .first()
+                    .map(|item| item.window.clone())
+            });
+        let Some(window) = selected else {
+            return false;
+        };
+        self.focus_window(&window, serial);
+        self.set_overview_hovered(None);
+        self.set_overview_selection(Some(window));
+        self.set_overview_active(false);
+        true
+    }
+
+    pub fn move_overview_selection(&mut self, dx: i32, dy: i32) {
+        let items = self.overview_windows();
+        if items.is_empty() {
+            return;
+        }
+
+        let active_window = self.windows.active_window();
+        let selected = self.overview_selection.as_ref().or(active_window.as_ref());
+        let current_index = selected
+            .and_then(|selected| items.iter().position(|item| item.window == *selected))
+            .unwrap_or(0);
+        let current = &items[current_index];
+        let current_center = rect_center(current.target);
+
+        let mut best: Option<(usize, f64)> = None;
+        for (index, item) in items.iter().enumerate() {
+            if index == current_index {
+                continue;
+            }
+
+            let center = rect_center(item.target);
+            let delta_x = center.x - current_center.x;
+            let delta_y = center.y - current_center.y;
+            if dx < 0 && delta_x >= -1.0 {
+                continue;
+            }
+            if dx > 0 && delta_x <= 1.0 {
+                continue;
+            }
+            if dy < 0 && delta_y >= -1.0 {
+                continue;
+            }
+            if dy > 0 && delta_y <= 1.0 {
+                continue;
+            }
+
+            let primary = if dx != 0 {
+                delta_x.abs()
+            } else {
+                delta_y.abs()
+            };
+            let secondary = if dx != 0 {
+                delta_y.abs()
+            } else {
+                delta_x.abs()
+            };
+            let score = primary * 4.0 + secondary;
+            if best
+                .map(|(_, best_score)| score < best_score)
+                .unwrap_or(true)
+            {
+                best = Some((index, score));
+            }
+        }
+
+        let next_index = best
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| wrap_overview_index(current_index, items.len(), dx, dy));
+        self.set_overview_hovered(None);
+        self.set_overview_selection(Some(items[next_index].window.clone()));
+    }
+
+    fn sort_overview_items_by_space_order(&self, items: &mut [OverviewWindow]) {
+        let order = self
+            .space
+            .elements()
+            .enumerate()
+            .map(|(index, window)| (window.clone(), index))
+            .collect::<HashMap<_, _>>();
+        items.sort_by_key(|item| order.get(&item.window).copied().unwrap_or(usize::MAX));
+    }
+
+    pub fn focus_window(&mut self, window: &Window, serial: smithay::utils::Serial) {
+        self.space.raise_element(window, true);
+        self.windows.activate_window(window);
+        if let (Some(keyboard), Some(target)) = (
+            self.seat.get_keyboard(),
+            self.focus_target_for_window(window),
+        ) {
+            keyboard.set_focus(self, Some(target), serial);
+        }
+        self.send_pending_configures();
+        self.request_render();
     }
 
     pub fn output_at(&self, location: Point<f64, Logical>) -> Option<Output> {
@@ -526,9 +911,10 @@ impl Yawc {
         }
 
         let bbox = window.bbox();
+        let geometry = window.geometry();
         Some(Rectangle::new(
-            location + bbox.loc,
-            non_empty_size(bbox.size, window.geometry().size),
+            location,
+            non_empty_size(geometry.size, bbox.size),
         ))
     }
 
@@ -569,6 +955,83 @@ impl Yawc {
         } else {
             visual_rect.loc
         }
+    }
+
+    fn restore_rect_candidate_for_window(
+        &self,
+        window: &Window,
+        uses_server_decoration: bool,
+        output_geometry: Rectangle<i32, Logical>,
+    ) -> Option<Rectangle<i32, Logical>> {
+        let visual_rect = self.window_visual_rect(window)?;
+        if rect_covers_output(visual_rect, output_geometry) {
+            return None;
+        }
+
+        let content_location =
+            Self::content_location_from_visual(visual_rect, uses_server_decoration);
+        let content_size = if uses_server_decoration {
+            (
+                visual_rect.size.w.max(1),
+                (visual_rect.size.h - crate::window::TITLEBAR_HEIGHT).max(1),
+            )
+                .into()
+        } else {
+            non_empty_size(visual_rect.size, window.geometry().size)
+        };
+
+        Some(Rectangle::new(content_location, content_size))
+    }
+
+    fn fallback_restore_rect_for_output(
+        &self,
+        window: &Window,
+        uses_server_decoration: bool,
+        output_geometry: Rectangle<i32, Logical>,
+    ) -> Rectangle<i32, Logical> {
+        let current_size = non_empty_size(window.geometry().size, window.bbox().size);
+        let titlebar_height = if uses_server_decoration {
+            crate::window::TITLEBAR_HEIGHT
+        } else {
+            0
+        };
+        let max_content_width = ((output_geometry.size.w * 3) / 4).max(1);
+        let max_content_height =
+            (((output_geometry.size.h - titlebar_height).max(1) * 3) / 4).max(1);
+        let preferred_size = if current_size.w < output_geometry.size.w - 64
+            && current_size.h < output_geometry.size.h - titlebar_height - 64
+        {
+            current_size
+        } else {
+            default_initial_window_size()
+        };
+        let content_size: Size<i32, Logical> = (
+            preferred_size.w.min(max_content_width).max(1),
+            preferred_size.h.min(max_content_height).max(1),
+        )
+            .into();
+        let visual_width = content_size.w;
+        let visual_height = content_size.h + titlebar_height;
+        let visual_x = output_geometry.loc.x + ((output_geometry.size.w - visual_width).max(0) / 2);
+        let visual_y =
+            output_geometry.loc.y + ((output_geometry.size.h - visual_height).max(0) / 2);
+
+        Rectangle::new((visual_x, visual_y + titlebar_height).into(), content_size)
+    }
+
+    fn usable_restore_rect(
+        restore_rect: Rectangle<i32, Logical>,
+        uses_server_decoration: bool,
+        output_geometry: Option<Rectangle<i32, Logical>>,
+    ) -> Option<Rectangle<i32, Logical>> {
+        if let Some(output_geometry) = output_geometry {
+            let visual_rect = Self::visual_rect_from_content(restore_rect, uses_server_decoration);
+            if rect_covers_output(visual_rect, output_geometry) {
+                return None;
+            }
+        }
+
+        Some(restore_rect)
     }
 
     fn snap_layout(
@@ -702,6 +1165,10 @@ impl Yawc {
         let Some(window) = self.windows.active_window() else {
             return;
         };
+        if self.active_window_is_nirvana(&window) {
+            info!("ignoring kill hotkey for focused Nirvana window");
+            return;
+        }
         #[cfg(feature = "xwayland")]
         if let Some(surface) = window.x11_surface() {
             let Some(pid) = surface.pid().or_else(|| surface.get_client_pid().ok()) else {
@@ -726,6 +1193,47 @@ impl Yawc {
         };
 
         kill_pid(credentials.pid as u32);
+    }
+
+    fn active_window_is_nirvana(&self, window: &Window) -> bool {
+        #[cfg(feature = "xwayland")]
+        if let Some(surface) = window.x11_surface() {
+            if surface
+                .class()
+                .as_str()
+                .trim()
+                .eq_ignore_ascii_case("nirvana")
+            {
+                return true;
+            }
+
+            if let Some(pid) = surface.pid().or_else(|| surface.get_client_pid().ok()) {
+                if pid_command_looks_like_nirvana(pid) {
+                    return true;
+                }
+            }
+        }
+
+        let Some(surface) = window.toplevel().map(|toplevel| toplevel.wl_surface()) else {
+            return false;
+        };
+
+        if self
+            .windows
+            .app_id(&surface)
+            .as_deref()
+            .is_some_and(is_nirvana_app_id)
+        {
+            return true;
+        }
+
+        let Ok(client) = self.display_handle.get_client(surface.id()) else {
+            return false;
+        };
+
+        client_command_name(&client, &self.display_handle)
+            .as_deref()
+            .is_some_and(command_looks_like_nirvana)
     }
 
     pub fn toggle_window_fullscreen(&mut self, window: &Window) {
@@ -905,15 +1413,39 @@ impl Yawc {
             let Some(output_geometry) = self.output_geometry_for_window(window) else {
                 return;
             };
+            let uses_server_decoration = self.windows.uses_server_decoration(&surface);
             let restore_rect = if self.windows.is_maximized(&surface) {
-                self.windows.restore_rect(&surface)
+                self.windows
+                    .restore_rect(&surface)
+                    .and_then(|rect| {
+                        Self::usable_restore_rect(
+                            rect,
+                            uses_server_decoration,
+                            Some(output_geometry),
+                        )
+                    })
+                    .or_else(|| {
+                        Some(self.fallback_restore_rect_for_output(
+                            window,
+                            uses_server_decoration,
+                            output_geometry,
+                        ))
+                    })
             } else {
-                self.space
-                    .element_location(window)
-                    .map(|location| window_content_rect(window, location))
+                self.restore_rect_candidate_for_window(
+                    window,
+                    uses_server_decoration,
+                    output_geometry,
+                )
+                .or_else(|| {
+                    Some(self.fallback_restore_rect_for_output(
+                        window,
+                        uses_server_decoration,
+                        output_geometry,
+                    ))
+                })
             };
 
-            let uses_server_decoration = self.windows.uses_server_decoration(&surface);
             let titlebar_height = if uses_server_decoration {
                 crate::window::TITLEBAR_HEIGHT
             } else {
@@ -967,7 +1499,18 @@ impl Yawc {
                 "window entered maximized state"
             );
         } else {
-            if !self.windows.is_maximized(&surface) && self.windows.restore_rect(&surface).is_none()
+            let uses_server_decoration = self.windows.uses_server_decoration(&surface);
+            let output_geometry = self.output_geometry_for_window(window);
+            let current_visual_covers_output = output_geometry
+                .and_then(|geometry| {
+                    self.window_visual_rect(window)
+                        .map(|visual_rect| rect_covers_output(visual_rect, geometry))
+                })
+                .unwrap_or(false);
+
+            if !self.windows.is_maximized(&surface)
+                && self.windows.restore_rect(&surface).is_none()
+                && !current_visual_covers_output
             {
                 self.windows.set_maximized(&surface, false, None, None);
                 toplevel.with_pending_state(|state| {
@@ -983,17 +1526,32 @@ impl Yawc {
             let restore_rect = self
                 .windows
                 .restore_rect(&surface)
+                .and_then(|rect| {
+                    Self::usable_restore_rect(rect, uses_server_decoration, output_geometry)
+                })
                 .or_else(|| {
-                    self.space
-                        .element_location(window)
-                        .map(|location| window_content_rect(window, location))
+                    output_geometry.and_then(|geometry| {
+                        self.restore_rect_candidate_for_window(
+                            window,
+                            uses_server_decoration,
+                            geometry,
+                        )
+                    })
+                })
+                .or_else(|| {
+                    output_geometry.map(|geometry| {
+                        self.fallback_restore_rect_for_output(
+                            window,
+                            uses_server_decoration,
+                            geometry,
+                        )
+                    })
                 })
                 .unwrap_or_else(|| {
                     Rectangle::from_size(non_empty_size(window.geometry().size, window.bbox().size))
                 });
 
             if let Some(from_rect) = self.window_visual_rect(window) {
-                let uses_server_decoration = self.windows.uses_server_decoration(&surface);
                 let to_rect = Self::visual_rect_from_content(restore_rect, uses_server_decoration);
                 self.windows
                     .start_geometry_animation(&surface, from_rect, to_rect);
@@ -1456,11 +2014,199 @@ fn is_transient_toplevel(window: &Window) -> bool {
         .is_some()
 }
 
+fn is_overview_window(window: &Window) -> bool {
+    if window.toplevel().is_some() {
+        return true;
+    }
+
+    #[cfg(feature = "xwayland")]
+    {
+        window.x11_surface().is_some()
+    }
+    #[cfg(not(feature = "xwayland"))]
+    {
+        false
+    }
+}
+
 fn window_content_rect(window: &Window, location: Point<i32, Logical>) -> Rectangle<i32, Logical> {
     Rectangle::new(
         location,
         non_empty_size(window.geometry().size, window.bbox().size),
     )
+}
+
+fn overview_layout(
+    mut windows: Vec<(Window, Rectangle<i32, Logical>)>,
+    output_geometry: Rectangle<i32, Logical>,
+    active_window: Option<Window>,
+    selected_window: Option<&Window>,
+    progress: f64,
+) -> Vec<OverviewWindow> {
+    let count = windows.len();
+    if count == 0 {
+        return Vec::new();
+    }
+
+    windows.sort_by(|(_, left), (_, right)| {
+        let left_center = rect_center(*left);
+        let right_center = rect_center(*right);
+        left_center
+            .y
+            .partial_cmp(&right_center.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left_center
+                    .x
+                    .partial_cmp(&right_center.x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let aspect = output_geometry.size.w.max(1) as f64 / output_geometry.size.h.max(1) as f64;
+    let rows = overview_row_count(count, aspect);
+    let row_lengths = overview_row_lengths(count, rows);
+    let cols = row_lengths.iter().copied().max().unwrap_or(1).max(1);
+    let margin = (output_geometry.size.w.min(output_geometry.size.h) / 16).clamp(48, 120);
+    let gap = 36;
+    let available_w =
+        (output_geometry.size.w - margin * 2 - gap * (cols.saturating_sub(1) as i32)).max(1);
+    let available_h =
+        (output_geometry.size.h - margin * 2 - gap * (rows.saturating_sub(1) as i32)).max(1);
+    let cell_w = (available_w / cols as i32).max(1);
+    let cell_h = (available_h / rows as i32).max(1);
+
+    let mut row_offsets = Vec::with_capacity(row_lengths.len());
+    let mut offset = 0usize;
+    for length in &row_lengths {
+        row_offsets.push(offset);
+        offset += *length;
+    }
+
+    let mut result = Vec::with_capacity(count);
+    for (row, row_len) in row_lengths.into_iter().enumerate() {
+        if row_len == 0 {
+            continue;
+        }
+        let row_width = cell_w * row_len as i32 + gap * row_len.saturating_sub(1) as i32;
+        let row_x = output_geometry.loc.x + margin + ((available_w - row_width).max(0) / 2);
+        let row_y = output_geometry.loc.y + margin + row as i32 * (cell_h + gap);
+        let offset = row_offsets[row];
+        result.extend(windows.iter().skip(offset).take(row_len).enumerate().map(
+            |(col, (window, source))| {
+                overview_layout_item(
+                    window.clone(),
+                    *source,
+                    row_x,
+                    row_y,
+                    col,
+                    cell_w,
+                    cell_h,
+                    gap,
+                    active_window.as_ref(),
+                    selected_window,
+                    progress,
+                )
+            },
+        ));
+    }
+
+    result
+}
+
+fn overview_layout_item(
+    window: Window,
+    source: Rectangle<i32, Logical>,
+    row_x: i32,
+    row_y: i32,
+    col: usize,
+    cell_w: i32,
+    cell_h: i32,
+    gap: i32,
+    active_window: Option<&Window>,
+    selected_window: Option<&Window>,
+    progress: f64,
+) -> OverviewWindow {
+    let scale = (cell_w as f64 / source.size.w.max(1) as f64)
+        .min(cell_h as f64 / source.size.h.max(1) as f64)
+        .min(1.0);
+    let target_size = Size::from((
+        (source.size.w as f64 * scale).round().max(1.0) as i32,
+        (source.size.h as f64 * scale).round().max(1.0) as i32,
+    ));
+    let cell_x = row_x + col as i32 * (cell_w + gap);
+    let target = Rectangle::new(
+        (
+            cell_x + ((cell_w - target_size.w).max(0) / 2),
+            row_y + ((cell_h - target_size.h).max(0) / 2),
+        )
+            .into(),
+        target_size,
+    );
+    let active = active_window
+        .map(|active| active == &window)
+        .unwrap_or(false);
+    let selected = selected_window
+        .map(|selected| selected == &window)
+        .unwrap_or(active);
+
+    OverviewWindow {
+        window,
+        source,
+        target,
+        active,
+        selected,
+        selection_alpha: if selected {
+            0.50
+        } else if active {
+            0.30
+        } else {
+            0.0
+        },
+        progress,
+    }
+}
+
+fn overview_row_count(count: usize, aspect: f64) -> usize {
+    if count <= 2 {
+        return 1;
+    }
+
+    ((count as f64 / aspect.max(1.0)).sqrt().ceil() as usize)
+        .max(1)
+        .min(count)
+}
+
+fn overview_row_lengths(count: usize, rows: usize) -> Vec<usize> {
+    let rows = rows.max(1).min(count.max(1));
+    let base = count / rows;
+    let remainder = count % rows;
+
+    (0..rows)
+        .map(|row| base + usize::from(row < remainder))
+        .collect()
+}
+
+fn rect_center(rect: Rectangle<i32, Logical>) -> Point<f64, Logical> {
+    Point::from((
+        rect.loc.x as f64 + rect.size.w as f64 * 0.5,
+        rect.loc.y as f64 + rect.size.h as f64 * 0.5,
+    ))
+}
+
+fn wrap_overview_index(current_index: usize, len: usize, dx: i32, dy: i32) -> usize {
+    if len <= 1 {
+        return current_index;
+    }
+    if dx > 0 || dy > 0 {
+        (current_index + 1) % len
+    } else {
+        (current_index + len - 1) % len
+    }
+}
+
+fn ease_out_cubic(t: f64) -> f64 {
+    1.0 - (1.0 - t).powi(3)
 }
 
 fn non_empty_size(
@@ -1474,6 +2220,15 @@ fn non_empty_size(
     } else {
         default_initial_window_size()
     }
+}
+
+fn rect_covers_output(rect: Rectangle<i32, Logical>, output: Rectangle<i32, Logical>) -> bool {
+    const TOLERANCE: i32 = 8;
+
+    rect.loc.x <= output.loc.x + TOLERANCE
+        && rect.loc.y <= output.loc.y + TOLERANCE
+        && rect.loc.x + rect.size.w >= output.loc.x + output.size.w - TOLERANCE
+        && rect.loc.y + rect.size.h >= output.loc.y + output.size.h - TOLERANCE
 }
 
 fn kill_pid(pid: u32) {
@@ -1588,6 +2343,46 @@ fn client_command_name(client: &Client, display_handle: &DisplayHandle) -> Optio
     std::fs::read_to_string(comm_path)
         .ok()
         .map(|comm| comm.trim().to_string())
+}
+
+fn pid_command_name(pid: u32) -> Option<String> {
+    if pid <= 1 {
+        return None;
+    }
+
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    if let Ok(cmdline) = std::fs::read(&cmdline_path) {
+        let command = String::from_utf8_lossy(&cmdline)
+            .replace('\0', " ")
+            .trim()
+            .to_string();
+        if !command.is_empty() {
+            return Some(command);
+        }
+    }
+
+    let comm_path = format!("/proc/{pid}/comm");
+    std::fs::read_to_string(comm_path)
+        .ok()
+        .map(|comm| comm.trim().to_string())
+}
+
+fn pid_command_looks_like_nirvana(pid: u32) -> bool {
+    pid_command_name(pid)
+        .as_deref()
+        .is_some_and(command_looks_like_nirvana)
+}
+
+fn is_nirvana_app_id(app_id: &str) -> bool {
+    app_id.trim().eq_ignore_ascii_case("nirvana")
+}
+
+fn command_looks_like_nirvana(command: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase();
+    normalized.contains("/nirvana/")
+        || normalized.contains(" etyos/nirvana/")
+        || normalized.contains("nirvana/src/main/main.js")
+        || normalized.contains("nirvana/scripts/run-electron.sh")
 }
 
 fn env_flag(name: &str) -> bool {

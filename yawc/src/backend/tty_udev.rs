@@ -60,6 +60,7 @@ use tracing::{error, info, warn};
 use crate::{
     config::{OutputConfig, OutputModeConfig},
     render::{dnd_icon_elements, CaptureCursor, RenderState, YawcRenderElements},
+    state::OverviewWindow,
     window::{WindowFrame, WindowStore},
     CalloopData,
 };
@@ -226,13 +227,18 @@ impl TtyRuntime {
             );
         }
         data.state.finish_close_animations();
+        data.state.finish_overview_animation();
         let animation_config = data.state.config.animations();
         let render_requested = data.state.take_render_requested();
         let screencopy_pending = data.state.screencopy_state.has_pending();
         let animation_pending = data.state.windows.needs_animation_frame(animation_config);
+        let overview_pending = data.state.overview_needs_animation_frame();
         let shutdown_pending = data.state.graceful_shutdown_pending();
-        let should_render =
-            render_requested || screencopy_pending || animation_pending || shutdown_pending;
+        let should_render = render_requested
+            || screencopy_pending
+            || animation_pending
+            || overview_pending
+            || shutdown_pending;
         if !should_render {
             return;
         }
@@ -242,7 +248,8 @@ impl TtyRuntime {
             .state
             .windows
             .frames(&data.state.space, animation_config, controls_mode);
-        let drew_display_frame = render_requested || animation_pending;
+        let overview_windows = data.state.overview_windows();
+        let drew_display_frame = render_requested || animation_pending || overview_pending;
         if drew_display_frame {
             for output in &mut self.outputs {
                 if !output.connected || output.frame_pending {
@@ -256,6 +263,7 @@ impl TtyRuntime {
                     &frames,
                     &data.state.windows,
                     animation_config,
+                    &overview_windows,
                     &output.background,
                     &mut self.cursor_theme,
                     &cursor_image,
@@ -313,6 +321,7 @@ impl TtyRuntime {
                         renderer.as_mut(),
                         data,
                         &frames,
+                        &overview_windows,
                         animation_config,
                         capture_cursor,
                     );
@@ -856,9 +865,9 @@ pub fn init(
 
     let reset_buffers_each_frame = std::env::var("YAWC_DRM_RESET_BUFFERS_EACH_FRAME")
         .map(|value| value != "0")
-        .unwrap_or(false);
+        .unwrap_or(true);
     if reset_buffers_each_frame {
-        warn!("resetting drm buffers before each frame as a damage-corruption workaround");
+        warn!("resetting drm buffers before each frame to avoid damage-corruption artifacts");
     }
 
     let runtime = Rc::new(RefCell::new(TtyRuntime {
@@ -1030,6 +1039,7 @@ fn capture_screencopy(
     renderer: &mut GlesRenderer,
     data: &mut CalloopData,
     frames: &[WindowFrame],
+    overview_windows: &[OverviewWindow],
     animation_config: crate::config::AnimationConfig,
     cursor: Option<CaptureCursor>,
 ) {
@@ -1045,6 +1055,7 @@ fn capture_screencopy(
                 frames,
                 &data.state.windows,
                 animation_config,
+                overview_windows,
                 region,
                 &mut dmabuf,
                 cursor,
@@ -1059,6 +1070,7 @@ fn capture_screencopy(
                 frames,
                 &data.state.windows,
                 animation_config,
+                overview_windows,
                 region,
                 cursor,
             )
@@ -1099,6 +1111,7 @@ fn render_elements<'a>(
     frames: &[WindowFrame],
     windows: &WindowStore,
     animation_config: crate::config::AnimationConfig,
+    overview_windows: &[OverviewWindow],
     background: &SolidColorBuffer,
     cursor_theme: &mut TtyCursorTheme,
     cursor_image: &CursorImageStatus,
@@ -1130,6 +1143,7 @@ fn render_elements<'a>(
         frames,
         windows,
         animation_config,
+        overview_windows,
         pointer_location,
     ) {
         Ok(scene) => elements.extend(

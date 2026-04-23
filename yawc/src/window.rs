@@ -233,6 +233,7 @@ impl WindowStore {
             .x11_surface()
             .expect("tracked X11 windows need an X11 surface")
             .clone();
+        let server_decoration = !surface.is_decorated();
         let now = Instant::now();
         self.windows.push(TrackedWindow {
             window,
@@ -241,7 +242,7 @@ impl WindowStore {
             active: false,
             title: title_for_x11(&surface),
             app_id: app_id_for_x11(&surface),
-            server_decoration: true,
+            server_decoration,
             decoration_negotiated: true,
             maximized: false,
             maximized_server_decoration: None,
@@ -416,6 +417,8 @@ impl WindowStore {
             tracked.surface = surface.wl_surface();
             tracked.title = title_for_x11(surface);
             tracked.app_id = app_id_for_x11(surface);
+            tracked.server_decoration = !surface.is_decorated();
+            tracked.decoration_negotiated = true;
         }
     }
 
@@ -853,6 +856,12 @@ impl WindowStore {
             .and_then(|tracked| tracked.minimized_rect)
     }
 
+    pub fn is_window_minimized(&self, window: &Window) -> bool {
+        self.find_window(window)
+            .map(|tracked| tracked.minimized)
+            .unwrap_or(false)
+    }
+
     pub fn uses_server_decoration(&self, surface: &WlSurface) -> bool {
         self.find(surface)
             .map(uses_server_decoration)
@@ -1004,29 +1013,35 @@ impl WindowStore {
                 rect
             };
 
-            let (resize_hitbox, top_resize_hitbox) = if uses_server {
+            let x11_csd = !uses_server && is_x11_tracked(tracked);
+            let (resize_hitbox, top_resize_hitbox) = if uses_server || x11_csd {
                 (RESIZE_HITBOX, TOP_RESIZE_HITBOX)
             } else {
                 (CSD_RESIZE_HITBOX, CSD_TOP_RESIZE_HITBOX)
             };
 
             if !uses_server {
-                if contains(visual_rect, position) {
-                    // Let smart client-side-decorated apps, such as Firefox,
-                    // receive their own border press and issue xdg_toplevel.resize.
-                    return None;
-                }
-
                 if !tracked.maximized {
                     if let Some(edges) =
                         resize_edge_for(visual_rect, position, resize_hitbox, top_resize_hitbox)
                             .and_then(|edges| allowed_resize_edges(&tracked.window, edges))
                     {
-                        return Some(DecorationHit {
-                            window: tracked.window.clone(),
-                            action: DecorationAction::Resize(edges),
-                        });
+                        if x11_csd || !contains(visual_rect, position) {
+                            return Some(DecorationHit {
+                                window: tracked.window.clone(),
+                                action: DecorationAction::Resize(edges),
+                            });
+                        }
                     }
+                }
+
+                if contains(visual_rect, position) {
+                    // Let smart Wayland client-side-decorated apps, such as Firefox,
+                    // receive their own border press and issue xdg_toplevel.resize.
+                    if !x11_csd {
+                        return None;
+                    }
+                    return None;
                 }
 
                 continue;
